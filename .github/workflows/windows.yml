@@ -36,6 +36,8 @@ jobs:
           # Report the GPU in use and any failure as annotations (readable through the GitHub API).
           $gpu = Select-String -Path test.log -Pattern "adapter:" | Select-Object -First 1
           if ($gpu) { Write-Output "::notice title=GPU::$($gpu.Line)" }
+          $diag = (Select-String -Path test.log -Pattern "DIAG" | ForEach-Object { $_.Line }) -join "%0A"
+          if ($diag) { Write-Output "::notice title=Color pipeline::$diag" }
           if ($code -ne 0) {
             $tail = (Get-Content test.log | Select-Object -Last 60) -join "%0A"
             Write-Output "::error title=Tests failed::$tail"
