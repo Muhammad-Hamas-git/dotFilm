@@ -1,161 +1,252 @@
-//! Adjustments panel: transform, color, opacity and volume of the selected clip.
-//! With nothing selected it shows the project settings.
+//! Adjustments panel: every parameter of the selected clip, each with a keyframe
+//! button, plus the easing curve editor. With nothing selected it shows the
+//! project settings.
+//!
+//! Keyframe workflow: click the diamond next to a value to add a keyframe at the
+//! playhead. Once a value has keyframes, changing it adds or updates a keyframe
+//! at the playhead automatically.
 
 use super::app::EditorApp;
 use super::timeline::format_time;
-use crate::core::model::{Adjustments, AssetKind, Clip, Project};
+use crate::core::anim::Ease;
+use crate::core::model::{AssetKind, Clip, ClipId, Param, Project, MAX_FPS, MAX_SIZE};
 use crate::engine::color;
-use egui::{Slider, Ui};
+use egui::{pos2, vec2, Color32, Rect, Sense, Shape, Slider, Stroke, Ui};
 
 /// Resolution presets: (label, width, height).
 const RESOLUTIONS: &[(&str, u32, u32)] = &[
     ("1920 x 1080 (16:9)", 1920, 1080),
     ("1280 x 720 (16:9)", 1280, 720),
+    ("2560 x 1440 (16:9)", 2560, 1440),
     ("3840 x 2160 (4K)", 3840, 2160),
     ("1080 x 1920 (9:16 vertical)", 1080, 1920),
     ("1080 x 1080 (1:1 square)", 1080, 1080),
     ("1080 x 1350 (4:5)", 1080, 1350),
+    ("2560 x 1080 (21:9)", 2560, 1080),
 ];
 const FRAME_RATES: &[u32] = &[24, 25, 30, 50, 60];
+/// Size of the easing curve editor, pixels.
+const CURVE_SIZE: f32 = 190.0;
+/// Visible y range in the curve editor, so overshoot handles stay reachable.
+const CURVE_Y: (f32, f32) = (-0.35, 1.35);
 
 #[derive(Default)]
 pub struct InspectorState {
-    /// True while a slider is being dragged, so one drag = one undo step.
+    /// True while a widget is being dragged, so one drag = one undo step.
     editing: bool,
 }
 
-pub fn show(app: &mut EditorApp, ui: &mut Ui) {
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        // Snapshot before any widget changes, so the first change in an
-        // edit session can be recorded for undo.
-        let before = app.project.clone();
-        let mut changed = false;
-        let mut active = false;
-
-        match app.selected.and_then(|id| app.project.clip(id).map(|c| c.id)) {
-            Some(id) => {
-                let (ch, act) = clip_inspector(ui, &mut app.project, id, app.playhead);
-                changed |= ch;
-                active |= act;
-            }
-            None => {
-                let (ch, act) = project_inspector(ui, &mut app.project);
-                changed |= ch;
-                active |= act;
-            }
-        }
-
-        if changed && !app.inspector.editing {
-            app.history.checkpoint(&before);
-        }
-        app.inspector.editing = active || (changed && ui.input(|i| i.pointer.any_down()));
-    });
-}
-
+/// Collects what the widgets did this frame.
 #[derive(Default)]
 struct Tracker {
     changed: bool,
     active: bool,
+    seek: Option<f64>,
 }
 
 impl Tracker {
-    fn add(&mut self, r: egui::Response) {
+    fn add(&mut self, r: &egui::Response) {
         self.changed |= r.changed();
         self.active |= r.dragged() || r.has_focus();
     }
 }
 
-/// Returns (changed, still interacting).
-fn clip_inspector(ui: &mut Ui, project: &mut Project, id: crate::core::model::ClipId, playhead: f64) -> (bool, bool) {
-    let mut t = Tracker::default();
-    let Some(clip) = project.clip(id).cloned() else { return (false, false) };
-    let Some(asset) = project.asset(clip.asset).cloned() else { return (false, false) };
+pub fn show(app: &mut EditorApp, ui: &mut Ui) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Snapshot before any widget changes, so the first change of an edit
+        // session can be recorded for undo.
+        let before = app.project.clone();
+        let mut t = Tracker::default();
+
+        match app.selected.filter(|id| app.project.clip(*id).is_some()) {
+            Some(id) => clip_inspector(ui, &mut app.project, id, app.playhead, &mut t),
+            None => project_inspector(ui, &mut app.project, &mut t),
+        }
+
+        if t.changed && !app.inspector.editing {
+            app.history.checkpoint(&before);
+        }
+        app.inspector.editing = t.active || (t.changed && ui.input(|i| i.pointer.any_down()));
+        if let Some(s) = t.seek {
+            app.seek(s);
+        }
+    });
+}
+
+/// The diamond-shaped keyframe button.
+fn key_button(ui: &mut Ui, on_key: bool, animated: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+    let c = rect.center();
+    let r = if resp.hovered() { 6.0 } else { 5.0 };
+    let pts = vec![c + vec2(0.0, -r), c + vec2(r, 0.0), c + vec2(0.0, r), c + vec2(-r, 0.0)];
+    let accent = Color32::from_rgb(255, 196, 64);
+    let (fill, stroke) = match (on_key, animated) {
+        (true, _) => (accent, accent),
+        (false, true) => (Color32::TRANSPARENT, accent),
+        _ => (Color32::TRANSPARENT, ui.visuals().weak_text_color()),
+    };
+    ui.painter().add(Shape::convex_polygon(pts, fill, Stroke::new(1.3, stroke)));
+    resp.on_hover_text(if on_key { "Remove keyframe here" } else { "Add keyframe here" })
+}
+
+enum Widget {
+    Drag { speed: f64, suffix: &'static str },
+    Slider { range: std::ops::RangeInclusive<f32>, decimals: usize, log: bool, suffix: &'static str },
+}
+
+fn widget_for(p: Param) -> Widget {
+    let s = |range, decimals| Widget::Slider { range, decimals, log: false, suffix: "" };
+    match p {
+        Param::X | Param::Y => Widget::Drag { speed: 1.0, suffix: " px" },
+        Param::Scale => Widget::Slider { range: 0.05..=5.0, decimals: 2, log: true, suffix: "" },
+        Param::Pitch | Param::Yaw | Param::Roll => Widget::Slider { range: -180.0..=180.0, decimals: 1, log: false, suffix: " deg" },
+        Param::Opacity => s(0.0..=1.0, 2),
+        Param::Brightness => s(color::BRIGHTNESS_RANGE, 2),
+        Param::Contrast => s(color::CONTRAST_RANGE, 2),
+        Param::Saturation => s(color::SATURATION_RANGE, 2),
+        Param::Hue => Widget::Slider { range: color::HUE_RANGE, decimals: 0, log: false, suffix: " deg" },
+        Param::Value => s(color::VALUE_RANGE, 2),
+        Param::Volume => s(0.0..=2.0, 2),
+    }
+}
+
+/// One row: keyframe diamond, name, value widget.
+fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &mut Tracker) {
+    let anim = clip.param(p);
+    let on_key = anim.key_at(local, tol).is_some();
+    if key_button(ui, on_key, anim.is_animated()).clicked() {
+        clip.param_mut(p).toggle_key(local, tol);
+        t.changed = true;
+    }
+    ui.label(p.label());
+    let mut v = clip.param(p).eval(local);
+    let r = match widget_for(p) {
+        Widget::Drag { speed, suffix } => ui.add(egui::DragValue::new(&mut v).speed(speed).suffix(suffix)),
+        Widget::Slider { range, decimals, log, suffix } => ui.add(Slider::new(&mut v, range).fixed_decimals(decimals).logarithmic(log).suffix(suffix)),
+    };
+    t.add(&r);
+    if r.changed() {
+        clip.param_mut(p).set(local, v, tol);
+    }
+    ui.end_row();
+}
+
+fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f64, tol: f64, t: &mut Tracker) {
+    egui::Grid::new(id).num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+        for p in params {
+            param_row(ui, clip, *p, local, tol, t);
+        }
+    });
+}
+
+fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker) {
+    let tol = project.key_tolerance();
     let (pw, ph) = (project.width as f32, project.height as f32);
+    let Some(mut c) = project.clip(id).cloned() else { return };
+    let Some(asset) = project.asset(c.asset).cloned() else { return };
     let fit = project.fit_size(&asset);
-    let mut c: Clip = clip.clone();
+    // Keyframes live in source time; clamp so editing works with the playhead outside the clip.
+    let local = c.local(playhead.clamp(c.start, c.end() - 1e-6));
 
     ui.heading("Adjustments");
     ui.label(egui::RichText::new(&asset.name).strong());
-    ui.label(egui::RichText::new(format!(
-        "On timeline {} to {}  ({:.2}s)",
-        format_time(c.start),
-        format_time(c.end()),
-        c.duration
-    ))
-    .weak());
+    ui.label(egui::RichText::new(format!("On timeline {} to {}  ({:.2}s)", format_time(c.start), format_time(c.end()), c.duration)).weak());
     if !c.contains(playhead) {
-        ui.label(egui::RichText::new("Move the playhead over this clip to see it in the player.").weak().italics());
+        ui.label(egui::RichText::new("The playhead is outside this clip; edits apply at its nearest end.").weak().italics());
     }
-    ui.separator();
 
+    // Keyframe navigation.
+    let times = c.keyframe_times(tol);
+    ui.horizontal(|ui| {
+        ui.label(format!("Keyframes: {}", times.len()));
+        let prev = times.iter().rev().find(|k| **k < local - tol).copied();
+        let next = times.iter().find(|k| **k > local + tol).copied();
+        if ui.add_enabled(prev.is_some(), egui::Button::new("< Prev")).clicked() {
+            t.seek = prev.map(|k| c.timeline(k));
+        }
+        if ui.add_enabled(next.is_some(), egui::Button::new("Next >")).clicked() {
+            t.seek = next.map(|k| c.timeline(k));
+        }
+    });
+    ui.separator();
 
     if asset.kind != AssetKind::Audio {
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
-            egui::Grid::new("transform").num_columns(2).show(ui, |ui| {
-                ui.label("X");
-                t.add(ui.add(egui::DragValue::new(&mut c.transform.x).speed(1.0).suffix(" px")));
-                ui.end_row();
-                ui.label("Y");
-                t.add(ui.add(egui::DragValue::new(&mut c.transform.y).speed(1.0).suffix(" px")));
-                ui.end_row();
-                ui.label("Scale");
-                t.add(ui.add(Slider::new(&mut c.transform.scale, 0.05..=5.0).logarithmic(true).fixed_decimals(2)));
-                ui.end_row();
-            });
+            param_grid(ui, "transform", &mut c, &[Param::X, Param::Y, Param::Scale, Param::Opacity], local, tol, t);
             ui.horizontal(|ui| {
                 if ui.button("Center").clicked() {
-                    c.transform.x = pw / 2.0;
-                    c.transform.y = ph / 2.0;
+                    c.param_mut(Param::X).set(local, pw / 2.0, tol);
+                    c.param_mut(Param::Y).set(local, ph / 2.0, tol);
                     t.changed = true;
                 }
                 if ui.button("Fit").on_hover_text("Whole picture visible").clicked() {
-                    c.transform = crate::core::model::Transform { x: pw / 2.0, y: ph / 2.0, scale: 1.0 };
+                    c.param_mut(Param::Scale).set(local, 1.0, tol);
                     t.changed = true;
                 }
                 if ui.button("Fill").on_hover_text("Cover the whole frame (crops edges)").clicked() {
-                    let cover = (pw / fit.0).max(ph / fit.1);
-                    c.transform = crate::core::model::Transform { x: pw / 2.0, y: ph / 2.0, scale: cover };
+                    c.param_mut(Param::Scale).set(local, (pw / fit.0).max(ph / fit.1), tol);
                     t.changed = true;
                 }
             });
         });
-
-        egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
-            egui::Grid::new("color").num_columns(2).show(ui, |ui| {
-                let a = &mut c.adjust;
-                ui.label("Brightness");
-                t.add(ui.add(Slider::new(&mut a.brightness, color::BRIGHTNESS_RANGE).fixed_decimals(2)));
-                ui.end_row();
-                ui.label("Contrast");
-                t.add(ui.add(Slider::new(&mut a.contrast, color::CONTRAST_RANGE).fixed_decimals(2)));
-                ui.end_row();
-                ui.label("Saturation");
-                t.add(ui.add(Slider::new(&mut a.saturation, color::SATURATION_RANGE).fixed_decimals(2)));
-                ui.end_row();
-                ui.label("Hue");
-                t.add(ui.add(Slider::new(&mut a.hue, color::HUE_RANGE).fixed_decimals(0).suffix(" deg")));
-                ui.end_row();
-                ui.label("Value");
-                t.add(ui.add(Slider::new(&mut a.value, color::VALUE_RANGE).fixed_decimals(2)));
-                ui.end_row();
-            });
-            if ui.button("Reset color").clicked() {
-                c.adjust = Adjustments::default();
+        egui::CollapsingHeader::new("3D rotation").default_open(true).show(ui, |ui| {
+            param_grid(ui, "rotation", &mut c, &[Param::Pitch, Param::Yaw, Param::Roll], local, tol, t);
+            if ui.button("Reset rotation").clicked() {
+                for p in [Param::Pitch, Param::Yaw, Param::Roll] {
+                    c.param_mut(p).set(local, 0.0, tol);
+                }
                 t.changed = true;
             }
         });
-
-        egui::CollapsingHeader::new("Opacity").default_open(true).show(ui, |ui| {
-            t.add(ui.add(Slider::new(&mut c.opacity, 0.0..=1.0).fixed_decimals(2)));
+        egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
+            let params = [Param::Brightness, Param::Contrast, Param::Saturation, Param::Hue, Param::Value];
+            param_grid(ui, "color", &mut c, &params, local, tol, t);
+            if ui.button("Reset color").clicked() {
+                for p in params {
+                    let d = p.default_value(project);
+                    c.param_mut(p).set(local, d, tol);
+                }
+                t.changed = true;
+            }
+        });
+    }
+    if asset.has_audio {
+        egui::CollapsingHeader::new("Audio").default_open(true).show(ui, |ui| {
+            param_grid(ui, "audio", &mut c, &[Param::Volume], local, tol, t);
         });
     }
 
-    if asset.has_audio {
-        egui::CollapsingHeader::new("Audio").default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Volume");
-                t.add(ui.add(Slider::new(&mut c.volume, 0.0..=2.0).fixed_decimals(2)));
+    // Easing for the keyframe under the playhead (applies to all parameters keyed there).
+    let at_key = times.iter().any(|k| (k - local).abs() <= tol);
+    let has_next = times.iter().any(|k| *k > local + tol);
+    if at_key {
+        egui::CollapsingHeader::new("Keyframe easing").default_open(true).show(ui, |ui| {
+            if !has_next {
+                ui.label(egui::RichText::new("This is the last keyframe. Easing shapes the motion towards the next keyframe.").weak());
+                return;
+            }
+            let current = Param::ALL.iter().find_map(|p| c.param(*p).ease_at(local, tol)).unwrap_or_default();
+            let mut ease = current;
+            ui.horizontal_wrapped(|ui| {
+                for (label, preset) in Ease::PRESETS {
+                    if ui.selectable_label(ease == preset, label).clicked() {
+                        ease = preset;
+                    }
+                }
             });
+            if ease != Ease::Hold {
+                let (changed, dragging) = curve_editor(ui, &mut ease);
+                t.active |= dragging;
+                if changed {
+                    t.changed = true;
+                }
+            }
+            if ease != current {
+                for p in Param::ALL {
+                    c.param_mut(p).set_ease_at(local, ease, tol);
+                }
+                t.changed = true;
+            }
         });
     }
 
@@ -164,45 +255,125 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: crate::core::model::Cl
             *target = c;
         }
     }
-    (t.changed, t.active)
 }
 
-fn project_inspector(ui: &mut Ui, project: &mut Project) -> (bool, bool) {
+/// Draggable cubic-bezier editor. Returns (changed, being dragged).
+fn curve_editor(ui: &mut Ui, ease: &mut Ease) -> (bool, bool) {
+    let [mut x1, mut y1, mut x2, mut y2] = ease.control_points();
+    let (rect, _) = ui.allocate_exact_size(vec2(CURVE_SIZE, CURVE_SIZE), Sense::hover());
+    let to_screen = |x: f32, y: f32| {
+        let ny = (y - CURVE_Y.0) / (CURVE_Y.1 - CURVE_Y.0);
+        pos2(rect.left() + x * rect.width(), rect.bottom() - ny * rect.height())
+    };
+    let from_screen = |p: egui::Pos2| {
+        let x = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let ny = (rect.bottom() - p.y) / rect.height();
+        (x, (CURVE_Y.0 + ny * (CURVE_Y.1 - CURVE_Y.0)).clamp(-1.0, 2.0))
+    };
+    let painter = ui.painter_at(rect.expand(8.0));
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    let grid = Stroke::new(1.0, ui.visuals().faint_bg_color);
+    for i in 0..=4 {
+        let f = i as f32 / 4.0;
+        painter.line_segment([to_screen(f, CURVE_Y.0), to_screen(f, CURVE_Y.1)], grid);
+        painter.line_segment([to_screen(0.0, f), to_screen(1.0, f)], grid);
+    }
+    let (start, end) = (to_screen(0.0, 0.0), to_screen(1.0, 1.0));
+
+    // Handles.
     let mut changed = false;
+    let mut dragging = false;
+    for (i, (hx, hy)) in [(&mut x1, &mut y1), (&mut x2, &mut y2)].into_iter().enumerate() {
+        let pos = to_screen(*hx, *hy);
+        let resp = ui.interact(Rect::from_center_size(pos, vec2(16.0, 16.0)), ui.scope_id().with(("bezier-handle", i)), Sense::drag());
+        if resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                (*hx, *hy) = from_screen(p);
+                changed = true;
+            }
+            dragging = true;
+        }
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+    let accent = Color32::from_rgb(255, 196, 64);
+    let h1 = to_screen(x1, y1);
+    let h2 = to_screen(x2, y2);
+    painter.line_segment([start, h1], Stroke::new(1.0, ui.visuals().weak_text_color()));
+    painter.line_segment([end, h2], Stroke::new(1.0, ui.visuals().weak_text_color()));
+    let curve = Ease::Bezier { x1, y1, x2, y2 };
+    let pts: Vec<egui::Pos2> = (0..=48).map(|i| {
+        let u = i as f32 / 48.0;
+        to_screen(u, curve.apply(u))
+    }).collect();
+    painter.add(Shape::line(pts, Stroke::new(2.0, accent)));
+    for h in [h1, h2] {
+        painter.circle_filled(h, 5.0, Color32::WHITE);
+        painter.circle_stroke(h, 5.0, Stroke::new(1.5, accent));
+    }
+    ui.label(egui::RichText::new(format!("cubic-bezier({x1:.2}, {y1:.2}, {x2:.2}, {y2:.2})")).monospace().weak());
+    if changed {
+        *ease = curve;
+    }
+    (changed, dragging)
+}
+
+fn project_inspector(ui: &mut Ui, project: &mut Project, t: &mut Tracker) {
     ui.heading("Project");
     ui.label(egui::RichText::new("Select a clip to adjust it.").weak());
     ui.separator();
 
     egui::Grid::new("project").num_columns(2).show(ui, |ui| {
-        ui.label("Resolution");
+        ui.label("Preset");
         let current = RESOLUTIONS
             .iter()
             .find(|r| r.1 == project.width && r.2 == project.height)
-            .map_or_else(|| format!("{} x {}", project.width, project.height), |r| r.0.to_string());
+            .map_or_else(|| "Custom".to_string(), |r| r.0.to_string());
         egui::ComboBox::from_id_salt("res").selected_text(current).show_ui(ui, |ui| {
             for (label, w, h) in RESOLUTIONS {
                 if ui.selectable_label(project.width == *w && project.height == *h, *label).clicked() {
                     project.set_resolution(*w, *h);
-                    changed = true;
+                    t.changed = true;
                 }
+            }
+        });
+        ui.end_row();
+
+        ui.label("Size");
+        ui.horizontal(|ui| {
+            let (mut w, mut h) = (project.width, project.height);
+            let rw = ui.add(egui::DragValue::new(&mut w).range(16..=MAX_SIZE).suffix(" w"));
+            ui.label("x");
+            let rh = ui.add(egui::DragValue::new(&mut h).range(16..=MAX_SIZE).suffix(" h"));
+            t.add(&rw);
+            t.add(&rh);
+            if (w, h) != (project.width, project.height) {
+                project.set_resolution(w, h);
             }
         });
         ui.end_row();
 
         ui.label("Frame rate");
-        egui::ComboBox::from_id_salt("fps").selected_text(format!("{} fps", project.fps)).show_ui(ui, |ui| {
-            for fps in FRAME_RATES {
-                if ui.selectable_label(project.fps == *fps, format!("{fps} fps")).clicked() {
-                    project.fps = *fps;
-                    changed = true;
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::DragValue::new(&mut project.fps).range(1..=MAX_FPS).suffix(" fps"));
+            t.add(&r);
+            egui::ComboBox::from_id_salt("fps").selected_text("Presets").width(70.0).show_ui(ui, |ui| {
+                for fps in FRAME_RATES {
+                    if ui.selectable_label(project.fps == *fps, format!("{fps} fps")).clicked() {
+                        project.fps = *fps;
+                        t.changed = true;
+                    }
                 }
-            }
+            });
         });
         ui.end_row();
     });
+    if project.width % 2 == 1 || project.height % 2 == 1 {
+        ui.label(egui::RichText::new("Odd sizes: MP4 export adds one black pixel row or column.").weak().italics());
+    }
 
     ui.add_space(12.0);
     ui.label(format!("{} assets, {} clips, {} tracks", project.assets.len(), project.clips.len(), project.tracks.len()));
     ui.label(format!("Length: {}", format_time(project.duration())));
-    (changed, false)
 }

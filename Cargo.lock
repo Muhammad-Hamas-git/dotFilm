@@ -789,20 +789,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "cutroom"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "crossbeam-channel",
- "eframe",
- "egui",
- "image",
- "rfd",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "dasp_sample"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -853,6 +839,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "dotfilm"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cpal",
+ "crossbeam-channel",
+ "eframe",
+ "egui",
+ "image",
+ "pollster 0.4.0",
+ "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

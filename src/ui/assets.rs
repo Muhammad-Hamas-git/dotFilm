@@ -5,6 +5,7 @@
 use super::app::EditorApp;
 use super::timeline::format_time;
 use crate::core::model::{AssetId, AssetKind};
+use crate::media::proxy::{self, ProxyState};
 use egui::{vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, Ui};
 
 /// Size of one tile in the grid.
@@ -82,6 +83,20 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                     FontId::proportional(12.0),
                     ui.visuals().text_color(),
                 );
+                // Proxy status badge.
+                let badge = match app.proxies.state(asset.id) {
+                    Some(ProxyState::Queued) => Some(("Proxy queued".to_string(), Color32::from_gray(160))),
+                    Some(ProxyState::Building(p)) => Some((format!("Proxy {:.0}%", p * 100.0), Color32::from_rgb(240, 200, 120))),
+                    Some(ProxyState::Ready(_)) if app.proxies.enabled => Some(("Proxy".to_string(), Color32::from_rgb(120, 210, 140))),
+                    Some(ProxyState::Failed(_)) => Some(("Proxy failed".to_string(), Color32::LIGHT_RED)),
+                    _ => None,
+                };
+                if let Some((text, color)) = badge {
+                    let pos = thumb_area.left_top() + vec2(4.0, 3.0);
+                    let galley = painter.layout_no_wrap(text, FontId::proportional(10.0), color);
+                    painter.rect_filled(Rect::from_min_size(pos - vec2(2.0, 1.0), galley.size() + vec2(4.0, 2.0)), 3.0, Color32::from_black_alpha(180));
+                    painter.galley(pos, galley, color);
+                }
                 if !asset.path.exists() {
                     painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(2.0, Color32::RED), StrokeKind::Inside);
                 }
@@ -103,6 +118,10 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                 response.context_menu(|ui| {
                     if ui.button("Add at playhead").clicked() {
                         add = Some(asset.id);
+                        ui.close();
+                    }
+                    if proxy::needs_proxy(asset) && ui.button("Rebuild proxy").clicked() {
+                        app.proxies.rebuild(asset);
                         ui.close();
                     }
                     if ui.button("Remove from project").clicked() {

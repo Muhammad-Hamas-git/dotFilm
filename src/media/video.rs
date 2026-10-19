@@ -1,28 +1,91 @@
-//! Streams decoded frames from a video file for the preview.
+//! Streams decoded frames from a video file.
 //!
-//! One ffmpeg process decodes from a start time and writes raw RGBA frames to a pipe.
-//! A reader thread pushes them into a small bounded queue, so ffmpeg runs only slightly
-//! ahead of playback. Seeking backwards or far ahead restarts the process.
+//! One ffmpeg process decodes from a start time and writes raw YUV 4:2:0 frames
+//! (BT.709, limited range) to a pipe. YUV is 1.5 bytes per pixel instead of 4 for
+//! RGBA, and the GPU converts it to RGB for free, so this is much faster.
+//! A reader thread pushes frames into a small bounded queue, so ffmpeg runs only
+//! slightly ahead. Seeking backwards or far ahead restarts the process.
 
 use super::ffmpeg;
-use crossbeam_channel::{bounded, Receiver, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Frames decoded ahead of the playhead. More = smoother, more memory.
-const QUEUE_FRAMES: usize = 6;
+const QUEUE_FRAMES: usize = 8;
 /// Jumping further ahead than this restarts the decoder instead of decoding through.
 const MAX_FORWARD_GAP: f64 = 1.0;
 /// While scrubbing, restart the decoder at most this often.
-const SCRUB_RESTART_INTERVAL: Duration = Duration::from_millis(60);
+const SCRUB_RESTART_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct Frame {
     /// Source time in seconds.
     pub pts: f64,
-    pub rgba: Vec<u8>,
+    /// I420: Y plane, then U, then V.
+    pub data: Vec<u8>,
+}
+
+/// Bytes in one I420 frame.
+pub fn frame_bytes(w: u32, h: u32) -> usize {
+    (w * h + 2 * (w / 2) * (h / 2)) as usize
+}
+
+/// Starts ffmpeg decoding `path` from `start` seconds at `fps`, scaled to w x h (even).
+fn spawn_decoder(path: &Path, start: f64, w: u32, h: u32, fps: f64, hwaccel: bool) -> Option<Child> {
+    let mut cmd = ffmpeg::command("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if hwaccel {
+        cmd.args(["-hwaccel", "auto"]);
+    }
+    cmd.args(["-ss", &format!("{:.4}", start.max(0.0)), "-i"])
+        .arg(path)
+        .args([
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &format!("fps={fps},scale={w}:{h}:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p"),
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Reads frames from a decoder into a bounded channel. Stops when the receiver is dropped.
+fn reader_thread(mut child: Child, start: f64, w: u32, h: u32, fps: f64) -> (Receiver<Frame>, Arc<Mutex<Child>>) {
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let child = Arc::new(Mutex::new(child));
+    let (tx, rx) = bounded::<Frame>(QUEUE_FRAMES);
+    let size = frame_bytes(w, h);
+    std::thread::spawn(move || {
+        let mut n: u64 = 0;
+        loop {
+            let mut buf = vec![0u8; size];
+            if stdout.read_exact(&mut buf).is_err() {
+                break; // End of file or process killed.
+            }
+            let frame = Frame { pts: start + n as f64 / fps, data: buf };
+            n += 1;
+            if tx.send(frame).is_err() {
+                break; // Stream was restarted or dropped.
+            }
+        }
+    });
+    (rx, child)
+}
+
+fn kill(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
 }
 
 struct Running {
@@ -34,13 +97,11 @@ struct Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        kill(&self.child);
     }
 }
 
+/// Random-access stream for the preview: follows the playhead, seeks when needed.
 pub struct VideoStream {
     path: PathBuf,
     pub width: u32,
@@ -58,8 +119,8 @@ impl VideoStream {
     pub fn new(path: PathBuf, width: u32, height: u32, fps: u32) -> Self {
         Self {
             path,
-            width: width.max(2),
-            height: height.max(2),
+            width: (width / 2 * 2).max(2),
+            height: (height / 2 * 2).max(2),
             fps: fps.max(1) as f64,
             running: None,
             current: None,
@@ -69,8 +130,17 @@ impl VideoStream {
         }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn current(&self) -> Option<&Frame> {
         self.current.as_ref()
+    }
+
+    /// True while waiting for the first frame after a seek.
+    pub fn is_stale(&self) -> bool {
+        self.stale || self.current.is_none()
     }
 
     /// Advances the stream to source time `t`. Returns true if a new frame became current.
@@ -127,45 +197,46 @@ impl VideoStream {
         self.stale = true;
         self.last_restart = Some(Instant::now());
         let t = t.max(0.0);
+        let Some(child) = spawn_decoder(&self.path, t, self.width, self.height, self.fps, false) else { return };
+        let (rx, child) = reader_thread(child, t, self.width, self.height, self.fps);
+        self.running = Some(Running { rx, child, start: t, eof: false });
+    }
+}
 
-        let spawn = ffmpeg::command("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.3}"), "-i"])
-            .arg(&self.path)
-            .args([
-                "-an",
-                "-sn",
-                "-dn",
-                "-vf",
-                &format!("fps={},scale={}:{}:flags=fast_bilinear", self.fps, self.width, self.height),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = spawn else { return };
-        let Some(mut stdout) = child.stdout.take() else { return };
+/// Sequential stream for export: frame N is source time start + N / fps.
+pub struct SequentialStream {
+    rx: Receiver<Frame>,
+    child: Arc<Mutex<Child>>,
+    next_index: u64,
+    current: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+}
 
-        let (tx, rx) = bounded::<Frame>(QUEUE_FRAMES);
-        let frame_bytes = (self.width * self.height * 4) as usize;
-        let fps = self.fps;
-        std::thread::spawn(move || {
-            let mut n: u64 = 0;
-            loop {
-                let mut buf = vec![0u8; frame_bytes];
-                if stdout.read_exact(&mut buf).is_err() {
-                    break; // End of file or process killed.
-                }
-                let frame = Frame { pts: t + n as f64 / fps, rgba: buf };
-                n += 1;
-                if tx.send(frame).is_err() {
-                    break; // Stream was restarted or dropped.
-                }
+impl SequentialStream {
+    pub fn open(path: &Path, start: f64, width: u32, height: u32, fps: u32, hwaccel: bool) -> Result<Self, String> {
+        let (w, h) = ((width / 2 * 2).max(2), (height / 2 * 2).max(2));
+        let child = spawn_decoder(path, start, w, h, fps as f64, hwaccel).ok_or("Can't start ffmpeg decoder")?;
+        let (rx, child) = reader_thread(child, start, w, h, fps as f64);
+        Ok(Self { rx, child, next_index: 0, current: None, width: w, height: h })
+    }
+
+    /// The frame with this index (counted from the start time). Past the end of the
+    /// file, the last frame is repeated.
+    pub fn frame(&mut self, index: u64) -> Option<&[u8]> {
+        while self.next_index <= index {
+            match self.rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(f) => self.current = Some(f.data),
+                Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => break,
             }
-        });
-        self.running = Some(Running { rx, child: Arc::new(Mutex::new(child)), start: t, eof: false });
+            self.next_index += 1;
+        }
+        self.current.as_deref()
+    }
+}
+
+impl Drop for SequentialStream {
+    fn drop(&mut self) {
+        kill(&self.child);
     }
 }

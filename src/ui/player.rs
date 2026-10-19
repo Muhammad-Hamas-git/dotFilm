@@ -1,10 +1,14 @@
-//! The player: shows the composed frame at the playhead.
-//! Click a picture to select it, drag to move it, drag a corner handle to resize it.
+//! The player: shows the GPU-rendered frame at the playhead.
+//! Click a picture to select it, drag to move it, drag a corner to resize it.
+//! Hit-testing uses the layer's real (rotated, perspective) outline.
+//! If a value is animated, dragging adds or updates a keyframe at the playhead.
 
 use super::app::EditorApp;
 use super::timeline::format_time;
-use crate::core::model::ClipId;
-use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui};
+use crate::core::geometry::Quad;
+use crate::core::model::{ClipId, Param};
+use crate::engine::preview::QUALITIES;
+use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 // ----- Values you can tune -----
 const HANDLE_SIZE: f32 = 10.0; // corner handle size, screen pixels
@@ -23,30 +27,15 @@ pub struct PlayerState {
     guides: (bool, bool),
 }
 
+/// A visible clip's outline on screen.
+struct OnScreen {
+    clip: ClipId,
+    corners: [Pos2; 4],
+    quad: Quad,
+}
+
 pub fn show(app: &mut EditorApp, ui: &mut Ui) {
-    // Transport bar.
-    ui.horizontal(|ui| {
-        if ui.button("|<").on_hover_text("Go to start (Home)").clicked() {
-            app.seek(0.0);
-        }
-        if ui.button("<").on_hover_text("Previous frame (Left)").clicked() {
-            app.frame_step(-1);
-        }
-        if ui.button(if app.playing { "  Pause  " } else { "  Play  " }).on_hover_text("Space").clicked() {
-            app.toggle_play();
-        }
-        if ui.button(">").on_hover_text("Next frame (Right)").clicked() {
-            app.frame_step(1);
-        }
-        if ui.button(">|").on_hover_text("Go to end (End)").clicked() {
-            app.seek(app.project.duration());
-        }
-        ui.separator();
-        ui.monospace(format!("{} / {}", format_time(app.playhead), format_time(app.project.duration())));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(format!("{} x {}  {} fps", app.project.width, app.project.height, app.project.fps)).weak());
-        });
-    });
+    transport(app, ui);
 
     let area = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(area, Sense::click_and_drag());
@@ -58,52 +47,61 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     let to_screen = |x: f32, y: f32| pos2(frame.left() + x * k, frame.top() + y * k);
 
     let ctx = ui.ctx().clone();
-    let layers = app.preview.update(&ctx, &app.project, &app.media, app.playhead, app.playing);
+    let texture = app.preview.update(&app.project, &app.media, &app.proxies, app.playhead, app.playing);
     if app.preview.waiting && !app.playing {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     let painter = ui.painter_at(area);
     painter.rect_filled(area, 0.0, Color32::from_gray(14));
-    painter.rect_filled(frame, 0.0, Color32::BLACK);
-    let framed = painter.with_clip_rect(frame);
-    for layer in &layers {
-        let (x, y, w, h) = layer.rect;
-        let r = Rect::from_min_max(to_screen(x, y), to_screen(x + w, y + h));
-        let tint = Color32::from_white_alpha((layer.opacity.clamp(0.0, 1.0) * 255.0) as u8);
-        framed.image(layer.texture, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+    match texture {
+        Some(tex) => {
+            painter.image(tex, frame, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            painter.rect_filled(frame, 0.0, Color32::BLACK);
+            painter.text(frame.center(), Align2::CENTER_CENTER, "No GPU available for the preview", FontId::proportional(15.0), Color32::LIGHT_RED);
+        }
     }
-
     if app.project.clips.is_empty() {
         painter.text(frame.center(), Align2::CENTER_CENTER, "Drag media onto the timeline or here", FontId::proportional(16.0), Color32::from_gray(120));
     }
 
-    // Screen rect of a visible clip.
-    let screen_rect = |app: &EditorApp, id: ClipId| -> Option<Rect> {
-        let clip = app.project.clip(id)?;
-        if !layers.iter().any(|l| l.clip == id) {
-            return None;
-        }
-        let (x, y, w, h) = app.project.clip_rect(clip)?;
-        Some(Rect::from_min_max(to_screen(x, y), to_screen(x + w, y + h)))
+    // Outlines of visible pictures, bottom first.
+    let t = app.playhead;
+    let shown: Vec<OnScreen> = app
+        .project
+        .visible_clips_at(t)
+        .iter()
+        .filter_map(|c| {
+            let quad = app.project.clip_quad(c, t)?;
+            let corners = quad.pts.map(|[x, y]| to_screen(x, y));
+            Some(OnScreen { clip: c.id, corners, quad })
+        })
+        .collect();
+    let to_project = |p: Pos2| ((p.x - frame.left()) / k, (p.y - frame.top()) / k);
+    let topmost_at = |p: Pos2| {
+        let (x, y) = to_project(p);
+        shown.iter().rev().find(|s| s.quad.contains(x, y)).map(|s| s.clip)
     };
-    let corner_hit = |r: Rect, p: Pos2| [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().any(|c| c.distance(p) <= HANDLE_SIZE);
+    let selected_shape = app.selected.and_then(|id| shown.iter().find(|s| s.clip == id));
+    let corner_hit = |s: &OnScreen, p: Pos2| s.corners.iter().any(|c| c.distance(p) <= HANDLE_SIZE);
+
+    let tol = app.project.key_tolerance();
 
     // --- start drag: corner of the selected clip, or the topmost picture under the cursor ---
     if response.drag_started() {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
-        let selected_rect = app.selected.and_then(|id| screen_rect(app, id).map(|r| (id, r)));
-        app.player.drag = match selected_rect {
-            Some((id, r)) if corner_hit(r, origin) => {
-                let scale = app.project.clip(id).map_or(1.0, |c| c.transform.scale);
-                Some(Drag::Resize { clip: id, center: r.center(), start_dist: r.center().distance(origin).max(1.0), start_scale: scale })
+        app.player.drag = match selected_shape {
+            Some(s) if corner_hit(s, origin) => {
+                let c = app.project.clip(s.clip).unwrap();
+                let center = s.quad.center();
+                let center = to_screen(center[0], center[1]);
+                Some(Drag::Resize { clip: s.clip, center, start_dist: center.distance(origin).max(1.0), start_scale: c.values_at(t).scale })
             }
-            _ => layers.iter().rev().find_map(|l| {
-                let r = screen_rect(app, l.clip)?;
-                r.contains(origin).then(|| {
-                    let c = app.project.clip(l.clip).unwrap();
-                    Drag::Move { clip: l.clip, press: origin, start_x: c.transform.x, start_y: c.transform.y }
-                })
+            _ => topmost_at(origin).and_then(|id| {
+                let v = app.project.clip(id)?.values_at(t);
+                Some(Drag::Move { clip: id, press: origin, start_x: v.x, start_y: v.y })
             }),
         };
         if let Some(Drag::Move { clip, .. } | Drag::Resize { clip, .. }) = app.player.drag {
@@ -130,14 +128,16 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                     }
                     app.player.guides = (snap_x, snap_y);
                     if let Some(c) = app.project.clip_mut(clip) {
-                        c.transform.x = x;
-                        c.transform.y = y;
+                        let l = c.local(t);
+                        c.param_mut(Param::X).set(l, x, tol);
+                        c.param_mut(Param::Y).set(l, y, tol);
                     }
                 }
                 Drag::Resize { clip, center, start_dist, start_scale } => {
                     let scale = (start_scale * center.distance(p) / start_dist).clamp(0.05, 10.0);
                     if let Some(c) = app.project.clip_mut(clip) {
-                        c.transform.scale = scale;
+                        let l = c.local(t);
+                        c.param_mut(Param::Scale).set(l, scale, tol);
                     }
                 }
             }
@@ -151,27 +151,26 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     // --- click selects / deselects ---
     if response.clicked() {
         if let Some(p) = response.interact_pointer_pos() {
-            app.selected = layers.iter().rev().find(|l| screen_rect(app, l.clip).is_some_and(|r| r.contains(p))).map(|l| l.clip);
+            app.selected = topmost_at(p);
         }
     }
 
     // --- cursor ---
     if let Some(p) = response.hover_pos() {
-        let sel = app.selected.and_then(|id| screen_rect(app, id));
-        if matches!(app.player.drag, Some(Drag::Resize { .. })) || sel.is_some_and(|r| corner_hit(r, p)) {
+        if matches!(app.player.drag, Some(Drag::Resize { .. })) || selected_shape.is_some_and(|s| corner_hit(s, p)) {
             ctx.set_cursor_icon(CursorIcon::ResizeNwSe);
         } else if app.player.drag.is_some() {
             ctx.set_cursor_icon(CursorIcon::Grabbing);
-        } else if layers.iter().any(|l| screen_rect(app, l.clip).is_some_and(|r| r.contains(p))) {
+        } else if topmost_at(p).is_some() {
             ctx.set_cursor_icon(CursorIcon::Grab);
         }
     }
 
     // --- selection outline and handles ---
-    if let Some(r) = app.selected.and_then(|id| screen_rect(app, id)) {
+    if let Some(s) = selected_shape {
         let accent = ui.visuals().selection.bg_fill;
-        painter.rect_stroke(r, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
-        for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
+        painter.add(Shape::closed_line(s.corners.to_vec(), Stroke::new(1.5, accent)));
+        for c in s.corners {
             let h = Rect::from_center_size(c, vec2(HANDLE_SIZE, HANDLE_SIZE));
             painter.rect_filled(h, 1.0, Color32::WHITE);
             painter.rect_stroke(h, 1.0, Stroke::new(1.0, accent), StrokeKind::Inside);
@@ -187,13 +186,53 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     // --- asset dropped onto the player: add at playhead ---
     if let Some(asset) = app.dragged_asset {
-        if let Some(p) = ctx.pointer_latest_pos().filter(|p| area.contains(*p)) {
+        if ctx.pointer_latest_pos().is_some_and(|p| area.contains(p)) {
             painter.rect_stroke(frame, 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
             if ui.input(|i| i.pointer.any_released()) {
-                let _ = p;
-                app.add_asset_to_timeline(asset, 0, app.playhead);
+                let top = app.project.tracks.len().saturating_sub(1);
+                app.add_asset_to_timeline(asset, top, app.playhead);
                 app.dragged_asset = None;
             }
         }
     }
+}
+
+fn transport(app: &mut EditorApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        if ui.button("|<").on_hover_text("Go to start (Home)").clicked() {
+            app.seek(0.0);
+        }
+        if ui.button("<").on_hover_text("Previous frame (Left)").clicked() {
+            app.frame_step(-1);
+        }
+        if ui.button(if app.playing { "  Pause  " } else { "  Play  " }).on_hover_text("Space").clicked() {
+            app.toggle_play();
+        }
+        if ui.button(">").on_hover_text("Next frame (Right)").clicked() {
+            app.frame_step(1);
+        }
+        if ui.button(">|").on_hover_text("Go to end (End)").clicked() {
+            app.seek(app.last_frame());
+        }
+        ui.separator();
+        ui.monospace(format!("{} / {}", format_time(app.playhead), format_time(app.project.duration())));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format!("{} x {}  {} fps", app.project.width, app.project.height, app.project.fps)).weak());
+            ui.separator();
+            egui::ComboBox::from_id_salt("preview-quality")
+                .selected_text(format!("Preview {}", QUALITIES[app.preview.quality].0))
+                .show_ui(ui, |ui| {
+                    for (i, (label, _)) in QUALITIES.iter().enumerate() {
+                        ui.selectable_value(&mut app.preview.quality, i, *label);
+                    }
+                })
+                .response
+                .on_hover_text("Lower preview resolution plays smoother. Export always uses full quality.");
+            let pending = app.proxies.pending();
+            let label = if pending > 0 { format!("Proxies ({pending} building)") } else { "Proxies".to_string() };
+            ui.toggle_value(&mut app.proxies.enabled, label)
+                .on_hover_text("Edit with small, fast copies of heavy videos. Export always uses the originals.");
+        });
+    });
 }

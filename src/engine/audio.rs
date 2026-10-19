@@ -2,6 +2,7 @@
 //! audible clips there. While playing, the number of samples played is the
 //! master clock, so picture follows sound and they can't drift apart.
 
+use crate::core::anim::Anim;
 use crate::media::probe::AUDIO_RATE;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -14,7 +15,8 @@ pub struct AudioClip {
     pub start: f64,
     pub source_in: f64,
     pub duration: f64,
-    pub volume: f32,
+    /// Keyframes are in source time, like everything else on a clip.
+    pub volume: Anim,
     /// Stereo interleaved, AUDIO_RATE.
     pub pcm: Arc<Vec<i16>>,
 }
@@ -143,13 +145,14 @@ where
 }
 
 /// Mixes clips into `mix` (stereo f32) for the frames starting at `pos`.
-fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
+/// Also used by export, so preview and export sound the same.
+pub fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
     let frames = mix.len() / 2;
     let t0 = pos as f64 / rate;
     let t1 = (pos + frames as u64) as f64 / rate;
     let src_rate = AUDIO_RATE as f64;
     for clip in clips {
-        if clip.start >= t1 || clip.start + clip.duration <= t0 || clip.volume <= 0.0 {
+        if clip.start >= t1 || clip.start + clip.duration <= t0 {
             continue;
         }
         let total = clip.pcm.len() / 2;
@@ -159,7 +162,12 @@ fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
                 continue;
             }
             // Linear interpolation handles devices that don't run at 48 kHz.
-            let src = (t - clip.start + clip.source_in) * src_rate;
+            let local = t - clip.start + clip.source_in;
+            let gain = if clip.volume.is_animated() { clip.volume.eval(local) } else { clip.volume.value }.max(0.0);
+            if gain <= 0.0 {
+                continue;
+            }
+            let src = local * src_rate;
             let idx = src as usize;
             if idx + 1 >= total {
                 continue;
@@ -168,7 +176,7 @@ fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
             for ch in 0..2 {
                 let a = clip.pcm[idx * 2 + ch] as f32;
                 let b = clip.pcm[(idx + 1) * 2 + ch] as f32;
-                mix[i * 2 + ch] += (a + (b - a) * frac) / 32768.0 * clip.volume;
+                mix[i * 2 + ch] += (a + (b - a) * frac) / 32768.0 * gain;
             }
         }
     }

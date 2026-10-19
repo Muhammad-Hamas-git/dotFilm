@@ -3,14 +3,17 @@
 //! click the ruler or empty space to move the playhead, drop assets to add clips.
 
 use super::app::EditorApp;
-use crate::core::model::{AssetKind, ClipId, MIN_CLIP};
+use crate::core::anim::Ease;
+use crate::core::model::{AssetKind, BlendMode, ClipId, Param, MIN_CLIP};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui};
 
 // ----- Layout values you can tune -----
 const HEADER_W: f32 = 132.0; // width of the track name column
 const RULER_H: f32 = 26.0;
-const TRACK_H: f32 = 54.0;
+const TRACK_H: f32 = 66.0;
 const HANDLE_W: f32 = 8.0; // grab zone for trimming at clip edges
+const KEY_RADIUS: f32 = 5.0; // keyframe diamond size on clips
+const COLOR_KEY: Color32 = Color32::from_rgb(255, 196, 64);
 const SNAP_PX: f32 = 8.0; // snapping distance in screen pixels
 const MIN_PPS: f32 = 4.0; // most zoomed out (pixels per second)
 const MAX_PPS: f32 = 600.0; // most zoomed in
@@ -26,6 +29,8 @@ enum DragKind {
     TrimLeft,
     TrimRight,
     Scrub,
+    /// Dragging a keyframe of the selected clip. Times are source time.
+    Keyframe { current: f64 },
 }
 
 pub struct TimelineState {
@@ -37,11 +42,13 @@ pub struct TimelineState {
     drag: Option<(Option<ClipId>, DragKind)>,
     /// True while a moved clip overlaps another one (it will snap back on release).
     move_blocked: bool,
+    /// Keyframe that was right-clicked (clip, source time), for the context menu.
+    menu_key: Option<(ClipId, f64)>,
 }
 
 impl Default for TimelineState {
     fn default() -> Self {
-        Self { pps: 60.0, scroll: 0.0, snapping: true, drag: None, move_blocked: false }
+        Self { pps: 60.0, scroll: 0.0, snapping: true, drag: None, move_blocked: false, menu_key: None }
     }
 }
 
@@ -173,8 +180,11 @@ fn ruler(app: &mut EditorApp, ui: &mut Ui, rect: Rect, view: View) {
 fn headers(app: &mut EditorApp, ui: &mut Ui, rect: Rect) {
     let mut remove: Option<usize> = None;
     let can_remove = app.project.tracks.len() > 1;
-    for i in 0..app.project.tracks.len() {
-        let row = Rect::from_min_size(pos2(rect.left(), rect.top() + i as f32 * TRACK_H), vec2(rect.width(), TRACK_H));
+    let n = app.project.tracks.len();
+    let mut blend_changed = None;
+    for i in 0..n {
+        // Track 0 is the bottom row.
+        let row = Rect::from_min_size(pos2(rect.left(), rect.top() + (n - 1 - i) as f32 * TRACK_H), vec2(rect.width(), TRACK_H));
         ui.painter().rect_filled(row.shrink(1.0), 2.0, ui.visuals().faint_bg_color);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(row.shrink2(vec2(6.0, 4.0))));
         let track = &mut app.project.tracks[i];
@@ -184,10 +194,23 @@ fn headers(app: &mut EditorApp, ui: &mut Ui, rect: Rect) {
                 remove = Some(i);
             }
         });
+        let mut blend = track.blend;
+        egui::ComboBox::from_id_salt(("blend", i)).selected_text(blend.label()).width(110.0).show_ui(&mut child, |ui| {
+            for m in BlendMode::ALL {
+                ui.selectable_value(&mut blend, m, m.label());
+            }
+        });
+        if blend != track.blend {
+            blend_changed = Some((i, blend));
+        }
         child.horizontal(|ui| {
             ui.toggle_value(&mut track.hidden, "Hide").on_hover_text("Hide this track's picture");
             ui.toggle_value(&mut track.muted, "Mute").on_hover_text("Mute this track's sound");
         });
+    }
+    if let Some((i, blend)) = blend_changed {
+        app.history.checkpoint(&app.project);
+        app.project.tracks[i].blend = blend;
     }
     if let Some(i) = remove {
         app.history.checkpoint(&app.project);
@@ -196,19 +219,42 @@ fn headers(app: &mut EditorApp, ui: &mut Ui, rect: Rect) {
     }
 }
 
-fn clip_rect(view: View, lanes: Rect, track: usize, start: f64, end: f64) -> Rect {
-    let top = lanes.top() + track as f32 * TRACK_H;
+/// Screen rectangle of a clip. `n` is the number of tracks (track 0 is the bottom row).
+fn clip_rect(view: View, lanes: Rect, n: usize, track: usize, start: f64, end: f64) -> Rect {
+    let row = n.saturating_sub(1).saturating_sub(track);
+    let top = lanes.top() + row as f32 * TRACK_H;
     Rect::from_min_max(pos2(view.x(start), top + 3.0), pos2(view.x(end), top + TRACK_H - 3.0))
 }
 
 fn track_at(lanes: Rect, y: f32, count: usize) -> usize {
-    (((y - lanes.top()) / TRACK_H).floor().max(0.0) as usize).min(count.saturating_sub(1))
+    let row = (((y - lanes.top()) / TRACK_H).floor().max(0.0) as usize).min(count.saturating_sub(1));
+    count.saturating_sub(1) - row
+}
+
+/// Centers of the selected clip's keyframe diamonds: (source time, screen position).
+fn key_positions(app: &EditorApp, view: View, lanes: Rect, id: ClipId) -> Vec<(f64, Pos2)> {
+    let Some(clip) = app.project.clip(id) else { return Vec::new() };
+    let r = clip_rect(view, lanes, app.project.tracks.len(), clip.track, clip.start, clip.end());
+    clip.keyframe_times(app.project.key_tolerance())
+        .into_iter()
+        .map(|k| (k, pos2(view.x(clip.timeline(k)), r.bottom() - KEY_RADIUS - 3.0)))
+        .collect()
+}
+
+/// A keyframe diamond of the selected clip under the point.
+fn key_hit(app: &EditorApp, view: View, lanes: Rect, p: Pos2) -> Option<(ClipId, f64)> {
+    let id = app.selected?;
+    key_positions(app, view, lanes, id).into_iter().find(|(_, c)| c.distance(p) <= KEY_RADIUS + 3.0).map(|(k, _)| (id, k))
 }
 
 /// Finds which clip (and which part of it) is under a point.
 fn hit_test(app: &EditorApp, view: View, lanes: Rect, p: Pos2) -> Option<(ClipId, DragKind)> {
+    if let Some((id, k)) = key_hit(app, view, lanes, p) {
+        return Some((id, DragKind::Keyframe { current: k }));
+    }
+    let n = app.project.tracks.len();
     for clip in app.project.clips.iter().rev() {
-        let r = clip_rect(view, lanes, clip.track, clip.start, clip.end());
+        let r = clip_rect(view, lanes, n, clip.track, clip.start, clip.end());
         if !r.contains(p) {
             continue;
         }
@@ -310,7 +356,16 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
     // --- clicks ---
     if response.clicked() || response.secondary_clicked() {
         if let Some(p) = pointer {
+            app.timeline.menu_key = if response.secondary_clicked() { key_hit(app, view, lanes, p) } else { None };
             match hit_test(app, view, lanes, p) {
+                Some((id, DragKind::Keyframe { current })) => {
+                    if response.clicked() {
+                        let t = app.project.clip(id).map(|c| c.timeline(current));
+                        if let Some(t) = t {
+                            app.seek(t);
+                        }
+                    }
+                }
                 Some((id, _)) => app.selected = Some(id),
                 None if response.clicked() => {
                     app.selected = None;
@@ -321,6 +376,33 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
         }
     }
     response.context_menu(|ui| {
+        if let Some((id, k)) = app.timeline.menu_key {
+            ui.label(egui::RichText::new("Keyframe").strong());
+            for (label, ease) in Ease::PRESETS {
+                if ui.button(label).clicked() {
+                    app.history.checkpoint(&app.project);
+                    let tol = app.project.key_tolerance();
+                    if let Some(c) = app.project.clip_mut(id) {
+                        for p in Param::ALL {
+                            c.param_mut(p).set_ease_at(k, ease, tol);
+                        }
+                    }
+                    ui.close();
+                }
+            }
+            if ui.button("Delete keyframe").clicked() {
+                app.history.checkpoint(&app.project);
+                let tol = app.project.key_tolerance();
+                if let Some(c) = app.project.clip_mut(id) {
+                    for p in Param::ALL {
+                        c.param_mut(p).remove_key_at(k, tol);
+                    }
+                }
+                app.timeline.menu_key = None;
+                ui.close();
+            }
+            ui.separator();
+        }
         if ui.button("Split at playhead").clicked() {
             app.split_at_playhead();
             ui.close();
@@ -337,6 +419,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
             match hit_test(app, view, lanes, p) {
                 Some((_, DragKind::TrimLeft | DragKind::TrimRight)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
                 Some((_, DragKind::Move { .. })) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
+                Some((_, DragKind::Keyframe { .. })) => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
                 _ => {}
             }
         }
@@ -353,7 +436,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                 start = s;
             }
             let dur = app.project.asset(asset_id).map_or(5.0, |a| if a.kind == AssetKind::Image { 5.0 } else { a.duration });
-            let ghost = clip_rect(view, lanes, track, start, start + dur);
+            let ghost = clip_rect(view, lanes, track_count, track, start, start + dur);
             painter.rect_stroke(ghost, 4.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
             if ui.input(|i| i.pointer.any_released()) {
                 app.add_asset_to_timeline(asset_id, track, start);
@@ -396,6 +479,22 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
                 c.track = track;
             }
         }
+        DragKind::Keyframe { current } => {
+            let mut t = view.t(p.x);
+            if let Some(s) = snap_target(app, t, Some(id), view.pps) {
+                t = s;
+            }
+            let to = clip.local(t.clamp(clip.start, clip.end()));
+            let tol = app.project.key_tolerance();
+            if (to - current).abs() > 1e-9 {
+                if let Some(c) = app.project.clip_mut(id) {
+                    for p in Param::ALL {
+                        c.param_mut(p).move_key(current, to, tol);
+                    }
+                }
+                app.timeline.drag = Some((Some(id), DragKind::Keyframe { current: to }));
+            }
+        }
         DragKind::TrimLeft => {
             let mut t = view.t(p.x);
             if let Some(s) = snap_target(app, t, Some(id), view.pps) {
@@ -407,8 +506,11 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
             if let Some(c) = app.project.clip_mut(id) {
                 c.start = new_start;
                 c.duration -= delta;
+                // Source time moves with the left edge so keyframes stay put.
+                // Images have no real source time, so it may go negative there.
+                c.source_in += delta;
                 if !is_image {
-                    c.source_in = (c.source_in + delta).max(0.0);
+                    c.source_in = c.source_in.max(0.0);
                 }
             }
         }
@@ -428,9 +530,11 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
 }
 
 fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, view: View) {
+    let n = app.project.tracks.len();
+    let tol = app.project.key_tolerance();
     for clip in &app.project.clips {
         let Some(asset) = app.project.asset(clip.asset) else { continue };
-        let r = clip_rect(view, lanes, clip.track, clip.start, clip.end());
+        let r = clip_rect(view, lanes, n, clip.track, clip.start, clip.end());
         if !r.intersects(lanes) {
             continue;
         }
@@ -474,6 +578,18 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             let hw = HANDLE_W.min(r.width() / 3.0) * 0.5;
             painter.rect_filled(Rect::from_min_max(r.left_top(), pos2(r.left() + hw, r.bottom())), 2.0, handle);
             painter.rect_filled(Rect::from_min_max(pos2(r.right() - hw, r.top()), r.right_bottom()), 2.0, handle);
+        }
+
+        // Keyframe diamonds (bright on the selected clip).
+        let clipped = painter.with_clip_rect(r.intersect(lanes));
+        for k in clip.keyframe_times(tol) {
+            let c = pos2(view.x(clip.timeline(k)), r.bottom() - KEY_RADIUS - 3.0);
+            let rad = KEY_RADIUS;
+            let pts = vec![c + vec2(0.0, -rad), c + vec2(rad, 0.0), c + vec2(0.0, rad), c + vec2(-rad, 0.0)];
+            let fill = if selected { COLOR_KEY } else { COLOR_KEY.gamma_multiply(0.45) };
+            let on_playhead = (clip.timeline(k) - app.playhead).abs() <= tol;
+            let stroke = if on_playhead { Stroke::new(1.5, Color32::WHITE) } else { Stroke::new(1.0, Color32::from_black_alpha(160)) };
+            clipped.add(egui::Shape::convex_polygon(pts, fill, stroke));
         }
     }
     let _ = ui;

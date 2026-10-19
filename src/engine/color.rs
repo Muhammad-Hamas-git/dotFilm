@@ -1,8 +1,8 @@
 //! Color adjustments as a chain of 3x4 color matrices.
 //!
-//! The same stages run in the preview (on the CPU, below) and in export
-//! (as ffmpeg `colorchannelmixer` filters), so what you see is what you export.
-//! Each stage clamps to 0..1, exactly like ffmpeg does between filters.
+//! The stages are sent to the GPU shader (see engine/gpu), which renders both the
+//! preview and the export. `apply` below is a CPU reference used by the tests to
+//! check the GPU result. Each stage clamps to 0..1.
 
 use crate::core::model::Adjustments;
 
@@ -13,8 +13,7 @@ const IDENTITY: Stage = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 
 /// Luma weights used for saturation (Rec. 601).
 const LUMA: [f32; 3] = [0.299, 0.587, 0.114];
 
-/// Ranges shown in the UI. ffmpeg's colorchannelmixer only accepts
-/// coefficients within -2..2, which is why saturation tops out at 2.
+/// Ranges shown in the UI.
 pub const BRIGHTNESS_RANGE: std::ops::RangeInclusive<f32> = -1.0..=1.0;
 pub const CONTRAST_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 pub const SATURATION_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
@@ -55,7 +54,8 @@ pub fn stages(adj: &Adjustments) -> Vec<Stage> {
     out
 }
 
-/// Applies the adjustments to an RGBA buffer. Uses all CPU cores.
+/// CPU reference implementation: applies the adjustments to an RGBA buffer.
+#[cfg(test)]
 pub fn apply(src: &[u8], dst: &mut Vec<u8>, adj: &Adjustments) {
     dst.clear();
     dst.extend_from_slice(src);
@@ -98,29 +98,6 @@ pub fn apply(src: &[u8], dst: &mut Vec<u8>, adj: &Adjustments) {
     });
 }
 
-/// The same adjustments as an ffmpeg filter chain (input must be rgba).
-/// The alpha column carries the offset: with alpha = 1, `ra * a` adds a constant.
-pub fn ffmpeg_filters(adj: &Adjustments, opacity: f32) -> Vec<String> {
-    let mut filters: Vec<String> = stages(adj)
-        .iter()
-        .map(|m| {
-            let ch = ["r", "g", "b"];
-            let mut parts = Vec::new();
-            for (o, row) in m.iter().enumerate() {
-                for (i, v) in row.iter().take(3).enumerate() {
-                    parts.push(format!("{}{}={:.6}", ch[o], ch[i], v));
-                }
-                parts.push(format!("{}a={:.6}", ch[o], row[3]));
-            }
-            format!("colorchannelmixer={}", parts.join(":"))
-        })
-        .collect();
-    if opacity < 0.999 {
-        filters.push(format!("colorchannelmixer=aa={:.4}", opacity.clamp(0.0, 1.0)));
-    }
-    filters
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +108,7 @@ mod tests {
         let mut dst = Vec::new();
         apply(&src, &mut dst, &Adjustments::default());
         assert_eq!(src, dst);
-        assert!(ffmpeg_filters(&Adjustments::default(), 1.0).is_empty());
+        assert!(stages(&Adjustments::default()).is_empty());
     }
 
     #[test]
@@ -143,13 +120,4 @@ mod tests {
         assert_eq!(dst[1], dst[2]);
     }
 
-    #[test]
-    fn coefficients_fit_ffmpeg_limits() {
-        let adj = Adjustments { brightness: 1.0, contrast: 2.0, saturation: 2.0, hue: 90.0, value: 2.0 };
-        for m in stages(&adj) {
-            for row in m {
-                assert!(row.iter().all(|v| (-2.0..=2.0).contains(v)), "{row:?}");
-            }
-        }
-    }
 }

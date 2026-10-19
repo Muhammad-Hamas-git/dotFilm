@@ -7,19 +7,27 @@ use crate::engine::audio::{AudioClip, AudioOut};
 use crate::engine::preview::PreviewRenderer;
 use crate::media::cache::{Loaded, MediaCache};
 use crate::media::ffmpeg;
+use crate::media::proxy::Proxies;
+use crate::engine::export::{self, Encoder};
+use std::sync::{Arc, Mutex};
 use egui::{Key, Modifiers};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub const PROJECT_EXT: &str = "cutroom";
+pub const PROJECT_EXT: &str = "dotfilm";
+/// Project files from before the rename still open.
+pub const OLD_PROJECT_EXT: &str = "cutroom";
 
 pub struct EditorApp {
     pub project: Project,
     pub history: History,
     pub media: MediaCache,
     pub preview: PreviewRenderer,
+    pub proxies: Proxies,
+    /// Encoders that work on this PC (filled in by a background check at startup).
+    pub encoders: Arc<Mutex<Vec<Encoder>>>,
     pub audio: AudioOut,
     pub playhead: f64,
     pub playing: bool,
@@ -45,8 +53,10 @@ impl EditorApp {
         let mut app = Self {
             project: Project::default(),
             history: History::default(),
-            media: MediaCache::new(ctx),
-            preview: PreviewRenderer::default(),
+            media: MediaCache::new(ctx.clone()),
+            preview: PreviewRenderer::new(cc.wgpu_render_state.as_ref()),
+            proxies: Proxies::new(ctx.clone()),
+            encoders: Arc::new(Mutex::new(vec![Encoder::X264])),
             audio: AudioOut::new(),
             playhead: 0.0,
             playing: false,
@@ -63,8 +73,13 @@ impl EditorApp {
             audio_signature: 0,
             window_title: String::new(),
         };
+        // Check for hardware encoders without blocking startup.
+        {
+            let enc = app.encoders.clone();
+            std::thread::spawn(move || *enc.lock().unwrap() = export::detect_encoders());
+        }
         for f in files {
-            if f.extension().is_some_and(|e| e == PROJECT_EXT) {
+            if is_project_file(&f) {
                 match Project::load(&f) {
                     Ok(p) => app.replace_project(p, Some(f)),
                     Err(e) => app.set_status(format!("Can't open project: {e}")),
@@ -93,12 +108,17 @@ impl EditorApp {
             self.playing = false;
             self.playhead = self.audio.time();
         } else {
-            if self.playhead >= self.project.duration() - 0.01 {
+            if self.playhead >= self.last_frame() - 0.5 / self.project.fps as f64 {
                 self.seek(0.0);
             }
             self.audio.play(self.playhead);
             self.playing = true;
         }
+    }
+
+    /// Time of the last frame (the end itself shows nothing, since clips end there).
+    pub fn last_frame(&self) -> f64 {
+        (self.project.duration() - 1.0 / self.project.fps.max(1) as f64).max(0.0)
     }
 
     pub fn frame_step(&mut self, frames: i32) {
@@ -183,6 +203,7 @@ impl EditorApp {
         self.project_path = path;
         self.history.clear();
         self.media.clear();
+        self.proxies.clear();
         self.preview.reset();
         self.selected = None;
         self.seek(0.0);
@@ -190,6 +211,7 @@ impl EditorApp {
         for asset in self.project.assets.clone() {
             if asset.path.exists() {
                 self.media.load(&asset);
+                self.proxies.request(&asset);
             } else {
                 missing += 1;
             }
@@ -204,7 +226,7 @@ impl EditorApp {
     }
 
     fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("Cutroom project", &[PROJECT_EXT]).pick_file() {
+        if let Some(path) = rfd::FileDialog::new().add_filter("dotFilm project", &[PROJECT_EXT, OLD_PROJECT_EXT]).pick_file() {
             match Project::load(&path) {
                 Ok(p) => self.replace_project(p, Some(path)),
                 Err(e) => self.set_status(format!("Can't open project: {e}")),
@@ -216,7 +238,7 @@ impl EditorApp {
         let path = match (&self.project_path, save_as) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new()
-                .add_filter("Cutroom project", &[PROJECT_EXT])
+                .add_filter("dotFilm project", &[PROJECT_EXT])
                 .set_file_name(format!("project.{PROJECT_EXT}"))
                 .save_file(),
         };
@@ -248,8 +270,10 @@ impl EditorApp {
                         width: info.width,
                         height: info.height,
                         has_audio: info.has_audio,
+                        codec: info.codec,
                     };
                     self.media.load(&asset);
+                    self.proxies.request(&asset);
                     self.project.assets.push(asset);
                 }
                 Loaded::Probed { path, result: Err(e) } => {
@@ -322,7 +346,7 @@ impl EditorApp {
             self.seek(0.0);
         }
         if pressed(Modifiers::NONE, Key::End) {
-            self.seek(self.project.duration());
+            self.seek(self.last_frame());
         }
         if pressed(Modifiers::NONE, Key::Escape) {
             self.selected = None;
@@ -345,7 +369,7 @@ impl EditorApp {
         if self.playhead >= end {
             self.audio.pause();
             self.playing = false;
-            self.seek(end);
+            self.seek(self.last_frame());
         }
         ctx.request_repaint();
     }
@@ -354,7 +378,10 @@ impl EditorApp {
     fn sync_audio(&mut self) {
         let mut h = DefaultHasher::new();
         for c in &self.project.clips {
-            (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.volume.to_bits()).hash(&mut h);
+            (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.volume.value.to_bits()).hash(&mut h);
+            for k in &c.volume.keys {
+                (k.t.to_bits(), k.v.to_bits()).hash(&mut h);
+            }
         }
         for t in &self.project.tracks {
             t.muted.hash(&mut h);
@@ -375,7 +402,7 @@ impl EditorApp {
                     start: c.start,
                     source_in: c.source_in,
                     duration: c.duration,
-                    volume: c.volume,
+                    volume: c.volume.clone(),
                     pcm: self.media.audio.get(&c.asset)?.clone(),
                 })
             })
@@ -390,7 +417,7 @@ impl EditorApp {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".into());
-        let title = format!("{name} - Cutroom");
+        let title = format!("{name} - dotFilm");
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;
@@ -482,15 +509,19 @@ impl EditorApp {
 
     fn ffmpeg_warning(&mut self, ctx: &egui::Context) {
         egui::Window::new("FFmpeg not found").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Cutroom needs ffmpeg.exe and ffprobe.exe to read and export video.");
-            ui.label("Install it with this command in a terminal, then restart Cutroom:");
+            ui.label("dotFilm needs ffmpeg.exe and ffprobe.exe to read and export video.");
+            ui.label("Install it with this command in a terminal, then restart dotFilm:");
             ui.code("winget install Gyan.FFmpeg");
-            ui.label("Or copy ffmpeg.exe and ffprobe.exe into the same folder as cutroom.exe.");
+            ui.label("Or copy ffmpeg.exe and ffprobe.exe into the same folder as dotfilm.exe.");
             if ui.button("Check again").clicked() {
                 self.ffmpeg_ok = ffmpeg::available();
             }
         });
     }
+}
+
+fn is_project_file(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e == PROJECT_EXT || e == OLD_PROJECT_EXT)
 }
 
 impl eframe::App for EditorApp {
@@ -532,7 +563,8 @@ impl eframe::App for EditorApp {
             }
         }
 
-        if let Some(msg) = self.export.show(&ctx, &self.project) {
+        let encoders = self.encoders.lock().unwrap().clone();
+        if let Some(msg) = self.export.show(&ctx, &self.project, &self.media.audio, &encoders) {
             self.set_status(msg);
         }
         self.shortcuts_window(&ctx);

@@ -27,18 +27,20 @@ jobs:
         run: cargo build --release
 
       - name: Test
-        run: cargo test --release
+        env:
+          DOTFILM_REQUIRE_GPU: "1"
+        run: cargo test --release -- --nocapture
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/cutroom.exe dist/
+          Copy-Item target/release/dotfilm.exe dist/
           Copy-Item "$env:FFMPEG_BIN/ffmpeg.exe" dist/
           Copy-Item "$env:FFMPEG_BIN/ffprobe.exe" dist/
           Copy-Item README.md dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cutroom-windows
+          name: dotfilm-windows
           path: dist/

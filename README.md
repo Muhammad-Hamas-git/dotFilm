@@ -1,12 +1,21 @@
-# Cutroom
+# dotFilm
 
-A small desktop video editor written in Rust.
+A desktop video editor written in Rust, rendered on the GPU.
 
 - **Assets panel**: import video, images and audio (Import button, or drag files onto the window).
-- **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize. Snaps to the frame center.
-- **Adjustments panel**: position, scale, brightness, contrast, saturation, hue, value, opacity, volume. With nothing selected: project resolution and frame rate.
-- **Timeline**: multiple tracks, drag clips (also between tracks), trim by dragging clip edges, split, delete, snapping, zoom, hide/mute tracks.
-- Undo/redo, save/open projects (`.cutroom` files), export to MP4.
+  Heavy videos (4K, HEVC, ProRes...) automatically get a fast **proxy** for editing.
+- **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize it.
+  Hit-testing follows the real 3D outline of rotated layers. Snaps to the frame center.
+- **Adjustments panel**: position, scale, opacity, **3D rotation (pitch, yaw, roll)**, brightness, contrast,
+  saturation, hue, value, volume. **Every value can be keyframed**, with an easing curve editor
+  (linear, ease in/out, hold, or a custom bezier with overshoot).
+- **Timeline**: multiple tracks (Track 1 is the bottom layer), **blend mode per track** (18 modes: multiply,
+  screen, overlay, soft light, difference, hue, color, luminosity...), drag/trim/split clips, snapping, zoom,
+  hide/mute tracks, keyframe diamonds you can drag, click or right-click.
+- **Project**: any resolution up to 8192 x 8192 and any frame rate from 1 to 240 fps.
+- **Export**: MP4 rendered by the same GPU code as the preview. Constant quality or target bitrate.
+  Uses your GPU's video encoder (NVIDIA, AMD, Intel) when available.
+- Undo/redo, save/open projects (`.dotfilm` files; old `.cutroom` files still open).
 
 ## Setup on Windows (one time)
 
@@ -17,28 +26,23 @@ A small desktop video editor written in Rust.
    winget install Gyan.FFmpeg
    ```
    Close and reopen the terminal afterwards so `ffmpeg` is found.
-3. Check both work:
-   ```
-   cargo --version
-   ffmpeg -version
-   ```
+
+Or skip building: every push to GitHub builds `dotfilm.exe` with FFmpeg included.
+Open the repo's **Actions** tab, pick the latest "Windows build" run, and download `dotfilm-windows`.
 
 ## Run it
-
-In this folder:
 
 ```
 cargo run --release
 ```
 
-The first build downloads and compiles all libraries and takes several minutes. After that it's fast.
-Use `--release` for testing playback: debug builds are noticeably slower.
-
-Run the tests (includes a real export through FFmpeg):
+The first build takes several minutes. Use `--release` for testing playback.
 
 ```
 cargo test
 ```
+
+runs the tests, including GPU rendering checks and real exports through FFmpeg.
 
 ## Make a shareable app
 
@@ -46,8 +50,20 @@ cargo test
 cargo build --release
 ```
 
-The program is `target\release\cutroom.exe`. To run it on a PC without FFmpeg installed,
-put `ffmpeg.exe` and `ffprobe.exe` in the same folder as `cutroom.exe` (the app checks there first).
+The program is `target\release\dotfilm.exe`. Put `ffmpeg.exe` and `ffprobe.exe` next to it to run it
+on a PC without FFmpeg installed.
+
+## Keyframes
+
+1. Select a clip and move the playhead.
+2. Click the diamond next to a value: it turns gold, there's now a keyframe here.
+3. Move the playhead and change the value: a new keyframe is added automatically.
+4. On a keyframe, the **Keyframe easing** section shapes the motion to the next keyframe.
+   Drag the two white handles for a custom curve.
+5. On the timeline, the selected clip's keyframes show as diamonds:
+   drag to retime, click to jump there, right-click for easing presets or delete.
+
+Keyframes are stored in the clip's source time, so they stay with the footage when you move, trim or split.
 
 ## Shortcuts
 
@@ -55,7 +71,7 @@ put `ffmpeg.exe` and `ffprobe.exe` in the same folder as `cutroom.exe` (the app 
 |---|---|
 | Space | Play / pause |
 | Left / Right | Previous / next frame (Shift: one second) |
-| Home / End | Start / end |
+| Home / End | Start / last frame |
 | S | Split at playhead (selected clip, or all clips under the playhead) |
 | Delete | Delete selected clip |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
@@ -68,55 +84,70 @@ put `ffmpeg.exe` and `ffprobe.exe` in the same folder as `cutroom.exe` (the app 
 ```
 src/
   main.rs            window setup
-  core/              the project as plain data (no UI, no video)
-    model.rs           assets, tracks, clips, split/add/remove, save/load
-    history.rs         undo/redo (snapshots)
+  core/              the project as plain data (no UI, no video, no GPU)
+    model.rs           assets, tracks, clips, blend modes, parameters, save/load
+    anim.rs            keyframes and easing curves
+    geometry.rs        3D rotation and perspective of a layer
+    history.rs         undo/redo
   media/             reading files
     ffmpeg.rs          finds and launches ffmpeg/ffprobe
     probe.rs           file info, thumbnails, images, audio decoding
-    video.rs           streams decoded frames for playback
-    cache.rs           background loading (thumbnails, images, audio)
+    video.rs           decoding video frames (YUV) for preview and export
+    proxy.rs           building and caching proxy files
+    cache.rs           background loading
   engine/            turning the project into picture and sound
-    color.rs           the color adjustments (shared by preview AND export)
-    preview.rs         builds the player picture for the playhead time
-    audio.rs           mixes and plays audio, master clock during playback
-    export.rs          builds the ffmpeg export command, runs it with progress
-  ui/                the window
-    app.rs             main state, menus, shortcuts
-    assets.rs  player.rs  inspector.rs  timeline.rs  export_dialog.rs
+    scene.rs           what to draw at a given time (shared by preview and export)
+    gpu/shaders.wgsl   all per-pixel work: YUV to RGB, color, blend modes, YUV packing
+    gpu/compositor.rs  runs the shaders, manages GPU textures
+    color.rs           color adjustments as matrices
+    preview.rs         the player picture
+    audio.rs           audio mixing and playback (also used for export)
+    export.rs          renders every frame and streams it into the encoder
+  ui/                the window: app.rs, assets, player, inspector, timeline, export_dialog
 ```
 
-The key rule: **the UI only edits the project data, and the engine only reads it.**
-Preview and export are two separate renderers of the same data.
+The key rule: **the UI only edits the project data; preview and export both render it through
+`engine/scene.rs` and the same GPU compositor.** That's why what you see is exactly what you export.
 
-### Adding a feature (the usual 3 steps)
+### Speed tricks
 
-Example: a "rotation" control.
-1. `core/model.rs`: add `rotation: f32` to `Transform`.
-2. `ui/inspector.rs`: add a slider for it.
-3. `engine/preview.rs` + `ui/player.rs` (draw it rotated) and `engine/export.rs` (add ffmpeg's `rotate` filter).
+- Video decodes as YUV (1.5 bytes per pixel instead of 4), and the GPU converts it to RGB.
+- The preview decodes each video only at the size it appears on screen.
+- Proxies: heavy files get a small H.264 copy with frequent keyframes, so scrubbing is instant.
+  They're cached in `%LOCALAPPDATA%\dotFilm\proxies` and reused next time.
+- Clips start decoding one second before they appear.
+- When nothing on screen changed, the preview does no GPU work at all.
+- Export converts frames to YUV on the GPU before handing them to the encoder, and uses
+  hardware video encoders and decoders when available.
 
-Old project files need the new field to have a default: add `#[serde(default)]` above it.
+### Adding a feature (the usual steps)
+
+Example: a new animatable parameter "blur radius".
+1. `core/model.rs`: add an `Anim` field with `#[serde(default)]`, a `Param` variant, and wire it into
+   `param`, `param_mut` and `values_at`. It's keyframeable from then on.
+2. `ui/inspector.rs`: add the `Param` to a `param_grid` call and give it a range in `widget_for`.
+3. `engine/scene.rs` + `engine/gpu/`: pass the value to the shader and use it there.
+   Preview and export both pick it up automatically.
 
 ### Values you can tune
 
 | What | Where |
 |---|---|
-| Preview sharpness vs. CPU use | `PREVIEW_MAX_SIDE` in `engine/preview.rs` |
-| Frames decoded ahead (smoothness vs. memory) | `QUEUE_FRAMES` in `media/video.rs` |
-| Scrub responsiveness | `SCRUB_RESTART_INTERVAL` in `media/video.rs` |
-| Timeline track height, snap distance, zoom limits, clip colors | top of `ui/timeline.rs` |
+| Preview resolution options | `QUALITIES` in `engine/preview.rs` (also a dropdown in the player) |
+| Proxy size, keyframe interval, quality | `PROXY_MAX`, `PROXY_GOP`, `PROXY_CRF` in `media/proxy.rs` |
+| Which files get proxies | `needs_proxy` and `LIGHT_CODECS` in `media/proxy.rs` |
+| Frames decoded ahead / scrub responsiveness | `QUEUE_FRAMES`, `SCRUB_RESTART_INTERVAL` in `media/video.rs` |
+| 3D perspective strength | `CAMERA_DISTANCE` in `core/geometry.rs` |
+| Timeline track height, snap distance, zoom, colors | top of `ui/timeline.rs` |
+| Easing editor size and range | `CURVE_SIZE`, `CURVE_Y` in `ui/inspector.rs` |
 | Player handle size, center snap | top of `ui/player.rs` |
-| Asset tile size | `TILE` in `ui/assets.rs` |
-| Default image clip length | `DEFAULT_IMAGE_DURATION` in `core/model.rs` |
-| Undo steps | `MAX_UNDO` in `core/history.rs` |
-| Export quality presets | `QUALITIES` and `SPEEDS` in `ui/export_dialog.rs` |
+| Export defaults (quality, bitrate) | top of `ui/export_dialog.rs` |
+| Hardware decoding on export, audio bitrate | top of `engine/export.rs` |
 | Resolution / fps presets | `RESOLUTIONS` and `FRAME_RATES` in `ui/inspector.rs` |
+| Undo steps | `MAX_UNDO` in `core/history.rs` |
 
-## Known limits of this first version
+## Known limits
 
 - Audio of each file is decoded fully into memory (about 11 MB per minute of audio).
-- Each video layer runs its own ffmpeg process during playback. Many stacked 4K layers will stutter;
-  proxies (low-res copies for editing) are the standard fix.
-- No waveforms on audio clips, no text, transitions or keyframes yet.
-- Very long timelines (hundreds of clips) can hit the Windows command-line length limit on export.
+- The first proxy of a long 4K file takes a while to build; you can edit meanwhile (from the original).
+- Odd frame sizes get one black pixel row/column on MP4 export (H.264 requires even sizes).

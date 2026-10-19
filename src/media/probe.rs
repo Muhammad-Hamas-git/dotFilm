@@ -14,6 +14,8 @@ pub struct ProbeInfo {
     pub width: u32,
     pub height: u32,
     pub has_audio: bool,
+    /// Video codec name, e.g. "h264". Empty for images and audio.
+    pub codec: String,
 }
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif"];
@@ -27,7 +29,7 @@ pub fn is_image(path: &Path) -> bool {
 pub fn probe(path: &Path) -> Result<ProbeInfo, String> {
     if is_image(path) {
         let (w, h) = image::image_dimensions(path).map_err(|e| format!("Can't read image: {e}"))?;
-        return Ok(ProbeInfo { kind: AssetKind::Image, duration: 0.0, width: w, height: h, has_audio: false });
+        return Ok(ProbeInfo { kind: AssetKind::Image, duration: 0.0, width: w, height: h, has_audio: false, codec: String::new() });
     }
 
     let out = ffmpeg::command("ffprobe")
@@ -72,9 +74,10 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, String> {
             if duration <= 0.0 {
                 return Err("Video has no duration".into());
             }
-            Ok(ProbeInfo { kind: AssetKind::Video, duration, width: w, height: h, has_audio })
+            let codec = v["codec_name"].as_str().unwrap_or_default().to_string();
+            Ok(ProbeInfo { kind: AssetKind::Video, duration, width: w, height: h, has_audio, codec })
         }
-        None if has_audio => Ok(ProbeInfo { kind: AssetKind::Audio, duration, width: 0, height: 0, has_audio }),
+        None if has_audio => Ok(ProbeInfo { kind: AssetKind::Audio, duration, width: 0, height: 0, has_audio, codec: String::new() }),
         None => Err("No video or audio found".into()),
     }
 }

@@ -1,8 +1,13 @@
 //! The project model: plain data, no UI and no video code.
 //! Everything the user edits lives here, and the whole thing saves to JSON.
 
+use super::anim::Anim;
+use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Current project file version. Older files are upgraded in `Project::load`.
+pub const PROJECT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AssetId(pub u64);
@@ -30,21 +35,18 @@ pub struct Asset {
     pub width: u32,
     pub height: u32,
     pub has_audio: bool,
+    /// Video codec name from ffprobe, e.g. "h264", "hevc".
+    #[serde(default)]
+    pub codec: String,
 }
 
-/// Color adjustments. All of them combine into one affine color matrix
-/// (see engine::color), which is applied identically in preview and export.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Plain (evaluated) color adjustments, used by the color math.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Adjustments {
-    /// -1..1, added to every channel.
     pub brightness: f32,
-    /// 0..2, 1 = unchanged. Stretches colors away from mid gray.
     pub contrast: f32,
-    /// 0..3, 1 = unchanged, 0 = grayscale.
     pub saturation: f32,
-    /// -180..180 degrees of hue rotation.
     pub hue: f32,
-    /// 0..2, 1 = unchanged. Multiplies all channels (the V in HSV).
     pub value: f32,
 }
 
@@ -54,32 +56,222 @@ impl Default for Adjustments {
     }
 }
 
-/// Where the clip sits inside the output frame.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Animatable color adjustments.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorAnim {
+    /// -1..1, added to every channel.
+    pub brightness: Anim,
+    /// 0..2, 1 = unchanged.
+    pub contrast: Anim,
+    /// 0..2, 1 = unchanged, 0 = grayscale.
+    pub saturation: Anim,
+    /// -180..180 degrees.
+    pub hue: Anim,
+    /// 0..2, 1 = unchanged. Multiplies all channels (the V in HSV).
+    pub value: Anim,
+}
+
+impl Default for ColorAnim {
+    fn default() -> Self {
+        Self { brightness: Anim::new(0.0), contrast: Anim::new(1.0), saturation: Anim::new(1.0), hue: Anim::new(0.0), value: Anim::new(1.0) }
+    }
+}
+
+fn one() -> Anim {
+    Anim::new(1.0)
+}
+
+/// Where the clip sits in the frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     /// Center of the clip, in project pixels.
-    pub x: f32,
-    pub y: f32,
+    pub x: Anim,
+    pub y: Anim,
     /// 1.0 = fitted to the frame.
-    pub scale: f32,
+    #[serde(default = "one")]
+    pub scale: Anim,
+    /// Degrees. Tilt forward/back.
+    #[serde(default)]
+    pub pitch: Anim,
+    /// Degrees. Turn left/right.
+    #[serde(default)]
+    pub yaw: Anim,
+    /// Degrees. Spin in the image plane.
+    #[serde(default)]
+    pub roll: Anim,
+}
+
+/// How a track's picture combines with the tracks below it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    Add,
+    Subtract,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 18] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::ColorDodge,
+        BlendMode::ColorBurn,
+        BlendMode::Add,
+        BlendMode::Subtract,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::SoftLight => "Soft light",
+            BlendMode::HardLight => "Hard light",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::ColorDodge => "Color dodge",
+            BlendMode::ColorBurn => "Color burn",
+            BlendMode::Add => "Add",
+            BlendMode::Subtract => "Subtract",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+            BlendMode::Hue => "Hue",
+            BlendMode::Saturation => "Saturation",
+            BlendMode::Color => "Color",
+            BlendMode::Luminosity => "Luminosity",
+        }
+    }
+
+    /// Number passed to the shader. Must match `blend()` in shaders.wgsl.
+    pub fn shader_id(self) -> u32 {
+        BlendMode::ALL.iter().position(|m| *m == self).unwrap_or(0) as u32
+    }
+}
+
+/// Every animatable parameter of a clip, so UI code can treat them uniformly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Param {
+    X,
+    Y,
+    Scale,
+    Pitch,
+    Yaw,
+    Roll,
+    Opacity,
+    Brightness,
+    Contrast,
+    Saturation,
+    Hue,
+    Value,
+    Volume,
+}
+
+impl Param {
+    pub const ALL: [Param; 13] = [
+        Param::X,
+        Param::Y,
+        Param::Scale,
+        Param::Pitch,
+        Param::Yaw,
+        Param::Roll,
+        Param::Opacity,
+        Param::Brightness,
+        Param::Contrast,
+        Param::Saturation,
+        Param::Hue,
+        Param::Value,
+        Param::Volume,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Param::X => "X",
+            Param::Y => "Y",
+            Param::Scale => "Scale",
+            Param::Pitch => "Pitch",
+            Param::Yaw => "Yaw",
+            Param::Roll => "Roll",
+            Param::Opacity => "Opacity",
+            Param::Brightness => "Brightness",
+            Param::Contrast => "Contrast",
+            Param::Saturation => "Saturation",
+            Param::Hue => "Hue",
+            Param::Value => "Value",
+            Param::Volume => "Volume",
+        }
+    }
+
+    /// Value after "reset".
+    pub fn default_value(self, project: &Project) -> f32 {
+        match self {
+            Param::X => project.width as f32 / 2.0,
+            Param::Y => project.height as f32 / 2.0,
+            Param::Scale | Param::Opacity | Param::Contrast | Param::Saturation | Param::Value | Param::Volume => 1.0,
+            _ => 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub asset: AssetId,
-    /// Index into Project::tracks. Track 0 is the top row and is drawn on top.
+    /// Index into Project::tracks. Track 0 is the bottom layer.
     pub track: usize,
     /// Position on the timeline, seconds.
     pub start: f64,
-    /// Where in the source file the clip begins, seconds.
+    /// Source time at the clip's first frame, seconds. Keyframes use source time.
+    /// For images this is just an offset and may be negative.
     pub source_in: f64,
     /// Length on the timeline, seconds.
     pub duration: f64,
     pub transform: Transform,
-    pub adjust: Adjustments,
+    pub adjust: ColorAnim,
+    #[serde(default = "one")]
+    pub opacity: Anim,
+    #[serde(default = "one")]
+    pub volume: Anim,
+}
+
+/// All of a clip's parameters evaluated at one moment.
+#[derive(Clone, Copy, Debug)]
+pub struct ClipValues {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub roll: f32,
     pub opacity: f32,
-    pub volume: f32,
+    pub adjust: Adjustments,
 }
 
 impl Clip {
@@ -89,6 +281,80 @@ impl Clip {
     pub fn contains(&self, t: f64) -> bool {
         t >= self.start && t < self.end()
     }
+    /// Timeline time -> source time.
+    pub fn local(&self, t: f64) -> f64 {
+        self.source_in + (t - self.start)
+    }
+    /// Source time -> timeline time.
+    pub fn timeline(&self, local: f64) -> f64 {
+        self.start + (local - self.source_in)
+    }
+
+    pub fn param(&self, p: Param) -> &Anim {
+        match p {
+            Param::X => &self.transform.x,
+            Param::Y => &self.transform.y,
+            Param::Scale => &self.transform.scale,
+            Param::Pitch => &self.transform.pitch,
+            Param::Yaw => &self.transform.yaw,
+            Param::Roll => &self.transform.roll,
+            Param::Opacity => &self.opacity,
+            Param::Brightness => &self.adjust.brightness,
+            Param::Contrast => &self.adjust.contrast,
+            Param::Saturation => &self.adjust.saturation,
+            Param::Hue => &self.adjust.hue,
+            Param::Value => &self.adjust.value,
+            Param::Volume => &self.volume,
+        }
+    }
+
+    pub fn param_mut(&mut self, p: Param) -> &mut Anim {
+        match p {
+            Param::X => &mut self.transform.x,
+            Param::Y => &mut self.transform.y,
+            Param::Scale => &mut self.transform.scale,
+            Param::Pitch => &mut self.transform.pitch,
+            Param::Yaw => &mut self.transform.yaw,
+            Param::Roll => &mut self.transform.roll,
+            Param::Opacity => &mut self.opacity,
+            Param::Brightness => &mut self.adjust.brightness,
+            Param::Contrast => &mut self.adjust.contrast,
+            Param::Saturation => &mut self.adjust.saturation,
+            Param::Hue => &mut self.adjust.hue,
+            Param::Value => &mut self.adjust.value,
+            Param::Volume => &mut self.volume,
+        }
+    }
+
+    /// Evaluates every parameter at timeline time `t`.
+    pub fn values_at(&self, t: f64) -> ClipValues {
+        let l = self.local(t);
+        let a = &self.adjust;
+        ClipValues {
+            x: self.transform.x.eval(l),
+            y: self.transform.y.eval(l),
+            scale: self.transform.scale.eval(l),
+            pitch: self.transform.pitch.eval(l),
+            yaw: self.transform.yaw.eval(l),
+            roll: self.transform.roll.eval(l),
+            opacity: self.opacity.eval(l).clamp(0.0, 1.0),
+            adjust: Adjustments {
+                brightness: a.brightness.eval(l),
+                contrast: a.contrast.eval(l),
+                saturation: a.saturation.eval(l),
+                hue: a.hue.eval(l),
+                value: a.value.eval(l),
+            },
+        }
+    }
+
+    /// Source times of all keyframes on any parameter, sorted, without duplicates.
+    pub fn keyframe_times(&self, tol: f64) -> Vec<f64> {
+        let mut times: Vec<f64> = Param::ALL.iter().flat_map(|p| self.param(*p).keys.iter().map(|k| k.t)).collect();
+        times.sort_by(f64::total_cmp);
+        times.dedup_by(|a, b| (*a - *b).abs() <= tol);
+        times
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +362,14 @@ pub struct Track {
     pub name: String,
     pub hidden: bool,
     pub muted: bool,
+    #[serde(default)]
+    pub blend: BlendMode,
+}
+
+impl Track {
+    fn named(n: usize) -> Self {
+        Self { name: format!("Track {n}"), hidden: false, muted: false, blend: BlendMode::Normal }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,16 +388,19 @@ pub struct Project {
 pub const MIN_CLIP: f64 = 0.1;
 /// Default length of an image dropped on the timeline, seconds.
 pub const DEFAULT_IMAGE_DURATION: f64 = 5.0;
+/// Limits for custom project settings.
+pub const MAX_SIZE: u32 = 8192;
+pub const MAX_FPS: u32 = 240;
 
 impl Default for Project {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: PROJECT_VERSION,
             width: 1920,
             height: 1080,
             fps: 30,
             assets: Vec::new(),
-            tracks: (1..=3).map(|i| Track { name: format!("Track {i}"), hidden: false, muted: false }).collect(),
+            tracks: (1..=3).map(Track::named).collect(),
             clips: Vec::new(),
             next_id: 1,
         }
@@ -135,6 +412,11 @@ impl Project {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Half a frame, the tolerance for "is there a keyframe here".
+    pub fn key_tolerance(&self) -> f64 {
+        0.5 / self.fps.max(1) as f64
     }
 
     pub fn asset(&self, id: AssetId) -> Option<&Asset> {
@@ -168,20 +450,22 @@ impl Project {
         (aw * k, ah * k)
     }
 
-    /// Rectangle (min_x, min_y, w, h) of a clip in project pixels.
-    pub fn clip_rect(&self, clip: &Clip) -> Option<(f32, f32, f32, f32)> {
+    /// Where a clip's corners land in the frame at timeline time `t`.
+    pub fn clip_quad(&self, clip: &Clip, t: f64) -> Option<Quad> {
         let asset = self.asset(clip.asset)?;
+        if asset.kind == AssetKind::Audio {
+            return None;
+        }
+        let v = clip.values_at(t);
         let (fw, fh) = self.fit_size(asset);
-        let (w, h) = (fw * clip.transform.scale, fh * clip.transform.scale);
-        Some((clip.transform.x - w / 2.0, clip.transform.y - h / 2.0, w, h))
+        let placement = Placement { cx: v.x, cy: v.y, width: fw * v.scale, height: fh * v.scale, pitch: v.pitch, yaw: v.yaw, roll: v.roll };
+        Some(geometry::project(&placement, self.width as f32, self.height as f32))
     }
 
     /// Would a clip with this span overlap anything else on the track?
     pub fn is_free(&self, track: usize, start: f64, end: f64, ignore: Option<ClipId>) -> bool {
         const EPS: f64 = 1e-6;
-        !self.clips.iter().any(|c| {
-            Some(c.id) != ignore && c.track == track && c.start < end - EPS && c.end() > start + EPS
-        })
+        !self.clips.iter().any(|c| Some(c.id) != ignore && c.track == track && c.start < end - EPS && c.end() > start + EPS)
     }
 
     /// Visual clips under the playhead, bottom track first (draw order).
@@ -193,12 +477,12 @@ impl Project {
             .filter(|c| self.tracks.get(c.track).is_some_and(|tr| !tr.hidden))
             .filter(|c| self.asset(c.asset).is_some_and(|a| a.kind != AssetKind::Audio))
             .collect();
-        v.sort_by(|a, b| b.track.cmp(&a.track));
+        v.sort_by_key(|c| c.track);
         v
     }
 
-    /// Creates a clip for an asset. Finds a free track starting at `track`,
-    /// adding a new track if none fits.
+    /// Creates a clip for an asset. Uses `track` if it's free there, otherwise the
+    /// next free track above it, adding a new track if none fits.
     pub fn add_clip(&mut self, asset_id: AssetId, track: usize, start: f64) -> Option<ClipId> {
         let asset = self.asset(asset_id)?.clone();
         let duration = match asset.kind {
@@ -222,17 +506,25 @@ impl Project {
             start,
             source_in: 0.0,
             duration,
-            transform: Transform { x: self.width as f32 / 2.0, y: self.height as f32 / 2.0, scale: 1.0 },
-            adjust: Adjustments::default(),
-            opacity: 1.0,
-            volume: 1.0,
+            transform: Transform {
+                x: Anim::new(self.width as f32 / 2.0),
+                y: Anim::new(self.height as f32 / 2.0),
+                scale: Anim::new(1.0),
+                pitch: Anim::default(),
+                yaw: Anim::default(),
+                roll: Anim::default(),
+            },
+            adjust: ColorAnim::default(),
+            opacity: Anim::new(1.0),
+            volume: Anim::new(1.0),
         });
         Some(id)
     }
 
+    /// Adds a track on top.
     pub fn add_track(&mut self) {
         let n = self.tracks.len() + 1;
-        self.tracks.push(Track { name: format!("Track {n}"), hidden: false, muted: false });
+        self.tracks.push(Track::named(n));
     }
 
     /// Removes a track and its clips. Keeps at least one track.
@@ -250,6 +542,7 @@ impl Project {
     }
 
     /// Splits a clip at timeline time `t`. Returns the id of the new right half.
+    /// Keyframes are in source time, so both halves keep the right animation.
     pub fn split(&mut self, id: ClipId, t: f64) -> Option<ClipId> {
         let clip = self.clip(id)?.clone();
         if t <= clip.start + MIN_CLIP || t >= clip.end() - MIN_CLIP {
@@ -279,10 +572,11 @@ impl Project {
 
     /// Changes the frame size and moves clips so they stay in the same relative spot.
     pub fn set_resolution(&mut self, w: u32, h: u32) {
+        let (w, h) = (w.clamp(16, MAX_SIZE), h.clamp(16, MAX_SIZE));
         let (sx, sy) = (w as f32 / self.width as f32, h as f32 / self.height as f32);
         for c in &mut self.clips {
-            c.transform.x *= sx;
-            c.transform.y *= sy;
+            scale_anim(&mut c.transform.x, sx);
+            scale_anim(&mut c.transform.y, sy);
         }
         self.width = w;
         self.height = h;
@@ -290,12 +584,37 @@ impl Project {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())
+        // Write to a temp file first so a crash never leaves a half-written project.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).map_err(|e| e.to_string())
+        let mut p: Project = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        p.upgrade();
+        Ok(p)
+    }
+
+    /// Brings older project files up to date.
+    fn upgrade(&mut self) {
+        if self.version < 2 {
+            // Version 1 drew track 0 on top; now track 0 is the bottom layer.
+            let n = self.tracks.len();
+            self.tracks.reverse();
+            for c in &mut self.clips {
+                c.track = n - 1 - c.track.min(n - 1);
+            }
+        }
+        self.version = PROJECT_VERSION;
+    }
+}
+
+fn scale_anim(a: &mut Anim, k: f32) {
+    a.value *= k;
+    for key in &mut a.keys {
+        key.v *= k;
     }
 }
 
@@ -315,6 +634,7 @@ mod tests {
             width: 1280,
             height: 720,
             has_audio: true,
+            codec: "h264".into(),
         });
         (p, id)
     }
@@ -332,6 +652,18 @@ mod tests {
     }
 
     #[test]
+    fn split_keeps_animation() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        let clip = p.clip_mut(c).unwrap();
+        clip.opacity.insert(crate::core::anim::Key { t: 0.0, v: 0.0, ease: Default::default() });
+        clip.opacity.insert(crate::core::anim::Key { t: 4.0, v: 1.0, ease: Default::default() });
+        let before = p.clip(c).unwrap().values_at(3.0).opacity;
+        let r = p.split(c, 2.0).unwrap();
+        assert!((p.clip(r).unwrap().values_at(3.0).opacity - before).abs() < 1e-6);
+    }
+
+    #[test]
     fn add_clip_avoids_overlap() {
         let (mut p, a) = project_with_video();
         let c1 = p.add_clip(a, 0, 0.0).unwrap();
@@ -341,13 +673,43 @@ mod tests {
     }
 
     #[test]
+    fn draw_order_is_bottom_track_first() {
+        let (mut p, a) = project_with_video();
+        p.add_clip(a, 2, 0.0);
+        p.add_clip(a, 0, 0.0);
+        let tracks: Vec<usize> = p.visible_clips_at(1.0).iter().map(|c| c.track).collect();
+        assert_eq!(tracks, vec![0, 2]);
+    }
+
+    #[test]
     fn save_and_load_roundtrip() {
         let (mut p, a) = project_with_video();
-        p.add_clip(a, 0, 1.0);
-        let path = std::env::temp_dir().join("cutroom_roundtrip.json");
+        let c = p.add_clip(a, 0, 1.0).unwrap();
+        p.clip_mut(c).unwrap().transform.yaw.insert(crate::core::anim::Key { t: 0.5, v: 30.0, ease: crate::core::anim::Ease::EASE_OUT });
+        p.tracks[1].blend = BlendMode::Screen;
+        let path = std::env::temp_dir().join("dotfilm_roundtrip.dotfilm");
         p.save(&path).unwrap();
         let q = Project::load(&path).unwrap();
         assert_eq!(q.clips.len(), 1);
         assert_eq!(q.clips[0].start, 1.0);
+        assert_eq!(q.clips[0].transform.yaw, p.clips[0].transform.yaw);
+        assert_eq!(q.tracks[1].blend, BlendMode::Screen);
+    }
+
+    #[test]
+    fn version_1_files_open_with_tracks_flipped() {
+        let v1 = r#"{"version":1,"width":1920,"height":1080,"fps":30,
+            "assets":[{"id":1,"path":"a.mp4","name":"a","kind":"Video","duration":5.0,"width":1920,"height":1080,"has_audio":false}],
+            "tracks":[{"name":"Top","hidden":false,"muted":false},{"name":"Bottom","hidden":false,"muted":false}],
+            "clips":[{"id":2,"asset":1,"track":0,"start":0.0,"source_in":0.0,"duration":5.0,
+              "transform":{"x":960,"y":540,"scale":1.0},
+              "adjust":{"brightness":0,"contrast":1,"saturation":1,"hue":0,"value":1},"opacity":1,"volume":1}],
+            "next_id":3}"#;
+        let path = std::env::temp_dir().join("dotfilm_v1.cutroom");
+        std::fs::write(&path, v1).unwrap();
+        let p = Project::load(&path).unwrap();
+        assert_eq!(p.version, PROJECT_VERSION);
+        assert_eq!(p.tracks[1].name, "Top");
+        assert_eq!(p.clips[0].track, 1);
     }
 }
