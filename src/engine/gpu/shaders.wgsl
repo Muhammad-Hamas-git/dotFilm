@@ -27,6 +27,10 @@ struct Layer {
     //   text:     [0] fill color, [1] outline color
     //   effects:  [0] effect settings, [1] (canvas scale, frame seed, output width, output height)
     gen: array<vec4<f32>, 6>,
+    // Color grading, packed by core::grade::Grade::frame:
+    //   [0] (temperature, tint, key similarity, key softness), [1] (key r, g, b, spill)
+    //   [2..5] wheels (hue rad, strength, luminance, _), [5..12] HSL colors (hue rad, sat, lum, _)
+    grade: array<vec4<f32>, 12>,
     stage_count: u32,
     // Layers: 0 = RGBA texture, 1 = YUV 4:2:0 planes, 2 = gradient, 3 = text mask.
     // Effects: the effect id (see EffectKind::shader_id).
@@ -34,6 +38,11 @@ struct Layer {
     // Blend mode id, see blend() below and BlendMode::shader_id().
     blend: u32,
     opacity: f32,
+    // Which grading parts are active: 1 white balance, 2 wheels, 4 HSL, 8 chroma key.
+    grade_flags: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> L: Layer;
@@ -99,6 +108,145 @@ fn grade(c: vec3<f32>) -> vec3<f32> {
     return x;
 }
 
+// ---------------------------------------------------------------- color grading
+
+const LUMA: vec3<f32> = vec3(0.2126, 0.7152, 0.0722);
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, LUMA);
+}
+
+// Fully saturated color for a hue in radians.
+fn hue_color(h: f32) -> vec3<f32> {
+    let x = fract(h / 6.2831853);
+    return clamp(abs(fract(vec3(x) + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3(0.0), vec3(1.0));
+}
+
+fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let l = (mx + mn) * 0.5;
+    let d = mx - mn;
+    if (d < 1e-5) {
+        return vec3(0.0, 0.0, l);
+    }
+    let s = d / (1.0 - abs(2.0 * l - 1.0) + 1e-6);
+    var h = 0.0;
+    if (mx == c.r) {
+        h = (c.g - c.b) / d;
+        if (h < 0.0) {
+            h = h + 6.0;
+        }
+    } else if (mx == c.g) {
+        h = (c.b - c.r) / d + 2.0;
+    } else {
+        h = (c.r - c.g) / d + 4.0;
+    }
+    return vec3(h * 60.0, clamp(s, 0.0, 1.0), l);
+}
+
+fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
+    let c = (1.0 - abs(2.0 * hsl.z - 1.0)) * hsl.y;
+    let rgb = hue_color(radians(hsl.x));
+    return clamp((rgb - 0.5) * c + hsl.z, vec3(0.0), vec3(1.0));
+}
+
+// Chroma direction of a color (blue-difference, red-difference).
+fn cbcr(c: vec3<f32>) -> vec2<f32> {
+    let y = luma(c);
+    return vec2(c.b - y, c.r - y);
+}
+
+fn from_luma_cbcr(y: f32, d: vec2<f32>) -> vec3<f32> {
+    let r = y + d.y;
+    let b = y + d.x;
+    let g = (y - LUMA.r * r - LUMA.b * b) / LUMA.g;
+    return vec3(r, g, b);
+}
+
+// Chroma distance that similarity 1.0 corresponds to.
+const KEY_REACH: f32 = 0.6;
+
+// Returns the spill-suppressed color and the key alpha (0 = keyed out).
+fn chroma_key(rgb: vec3<f32>) -> vec4<f32> {
+    let key = L.grade[1].xyz;
+    // Similarity and softness are scaled so 1.0 reaches about as far as skin tones are
+    // from a green screen (tune KEY_REACH).
+    let sim = L.grade[0].z * KEY_REACH;
+    let soft = L.grade[0].w * KEY_REACH;
+    let spill = L.grade[1].w;
+    let pc = cbcr(rgb);
+    let kc = cbcr(key);
+    let a = smoothstep(sim, sim + soft + 1e-4, distance(pc, kc));
+    // Spill: remove the key's color cast from what remains.
+    var out = rgb;
+    let klen = length(kc);
+    if (klen > 1e-4) {
+        let dir = kc / klen;
+        let proj = max(dot(pc, dir), 0.0);
+        out = clamp(from_luma_cbcr(luma(rgb), pc - dir * proj * spill), vec3(0.0), vec3(1.0));
+    }
+    return vec4(out, a);
+}
+
+fn white_balance(c: vec3<f32>) -> vec3<f32> {
+    let t = L.grade[0].x;
+    let ti = L.grade[0].y;
+    var out = c * vec3(1.0 + 0.3 * t + 0.1 * ti, 1.0 - 0.2 * ti, 1.0 - 0.3 * t + 0.1 * ti);
+    // Keep brightness the same.
+    let before = luma(c);
+    let after = luma(out);
+    if (after > 1e-4) {
+        out = out * (before / after);
+    }
+    return clamp(out, vec3(0.0), vec3(1.0));
+}
+
+// How strong a color wheel at full strength tints its zone, and how far luminance moves it.
+const WHEEL_TINT: f32 = 0.45;
+const WHEEL_LUM: f32 = 0.3;
+
+fn wheels(c: vec3<f32>) -> vec3<f32> {
+    let l = clamp(luma(c), 0.0, 1.0);
+    // Smooth zone weights that always add up to 1.
+    let w = vec3((1.0 - l) * (1.0 - l), 2.0 * l * (1.0 - l), l * l);
+    var out = c;
+    for (var z = 0u; z < 3u; z = z + 1u) {
+        let g = L.grade[2u + z];
+        let hc = hue_color(g.x);
+        let tint = (hc - luma(hc)) * g.y * WHEEL_TINT;
+        out = out + w[z] * (tint + vec3(g.z * WHEEL_LUM));
+    }
+    return clamp(out, vec3(0.0), vec3(1.0));
+}
+
+// Hue centers of the HSL colors, in degrees (must match core::grade::COLORS).
+const HSL_CENTERS = array<f32, 8>(0.0, 30.0, 60.0, 120.0, 205.0, 245.0, 285.0, 360.0);
+
+fn hsl_adjust(c: vec3<f32>) -> vec3<f32> {
+    var hsl = rgb_to_hsl(c);
+    // Grays have no hue; fade the effect in with saturation.
+    let fade = smoothstep(0.02, 0.15, hsl.y);
+    if (fade <= 0.0) {
+        return c;
+    }
+    // Blend the settings of the two neighboring colors around the hue circle.
+    var k = 0u;
+    for (var i = 0u; i < 7u; i = i + 1u) {
+        if (hsl.x >= HSL_CENTERS[i]) {
+            k = i;
+        }
+    }
+    let f = smoothstep(0.0, 1.0, (hsl.x - HSL_CENTERS[k]) / (HSL_CENTERS[k + 1u] - HSL_CENTERS[k]));
+    let a = L.grade[5u + k];
+    let b = L.grade[5u + (k + 1u) % 7u];
+    let p = mix(a.xyz, b.xyz, f) * fade;
+    hsl.x = fract((hsl.x + degrees(p.x)) / 360.0) * 360.0;
+    hsl.y = clamp(hsl.y * (1.0 + p.y), 0.0, 1.0);
+    hsl.z = clamp(hsl.z + p.z * 0.25, 0.0, 1.0);
+    return hsl_to_rgb(hsl);
+}
+
 @fragment
 fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     // Sample all planes unconditionally (keeps sampling in uniform control flow).
@@ -123,14 +271,30 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
         }
         src = vec4(rgb, a);
     }
-    let rgb = grade(src.rgb);
+    var key_alpha = 1.0;
+    var base = src.rgb;
+    if ((L.grade_flags & 8u) != 0u) {
+        let k = chroma_key(base);
+        base = k.rgb;
+        key_alpha = k.a;
+    }
+    if ((L.grade_flags & 1u) != 0u) {
+        base = white_balance(base);
+    }
+    var rgb = grade(base);
+    if ((L.grade_flags & 2u) != 0u) {
+        rgb = wheels(rgb);
+    }
+    if ((L.grade_flags & 4u) != 0u) {
+        rgb = hsl_adjust(rgb);
+    }
 
     // Soft 1-pixel edge so rotated layers don't look jagged.
     let fw = max(fwidth(in.uv), vec2(1e-6));
     let edge = min(in.uv, vec2(1.0) - in.uv) / fw;
     let aa = clamp(min(edge.x, edge.y) + 0.5, 0.0, 1.0);
 
-    let a = src.a * L.opacity * aa;
+    let a = src.a * key_alpha * L.opacity * aa;
     return vec4(rgb * a, a);
 }
 

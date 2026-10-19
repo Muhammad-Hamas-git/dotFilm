@@ -319,7 +319,7 @@ pub fn run(
                     _ => continue,
                 },
             };
-            draws.push(DrawItem::Layer(LayerDraw { paint, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
+            draws.push(DrawItem::Layer(LayerDraw { paint, grade: l.grade, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
         }
 
         comp.render(&draws);

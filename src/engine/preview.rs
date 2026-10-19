@@ -36,6 +36,9 @@ struct Gpu {
     registered: (u32, u32),
 }
 
+/// Color picker averages (2r+1)^2 preview pixels.
+const PICK_RADIUS: u32 = 2;
+
 pub struct PreviewRenderer {
     gpu: Option<Gpu>,
     streams: HashMap<ClipId, VideoStream>,
@@ -49,6 +52,8 @@ pub struct PreviewRenderer {
     pub waiting: bool,
     /// Index into QUALITIES.
     pub quality: usize,
+    /// Clip whose chroma key is switched off in the preview while its key color is picked.
+    pub picking_key: Option<ClipId>,
 }
 
 impl PreviewRenderer {
@@ -68,6 +73,7 @@ impl PreviewRenderer {
             text: TextEngine::default(),
             last_signature: 0,
             waiting: false,
+            picking_key: None,
             quality: DEFAULT_QUALITY,
         }
     }
@@ -84,6 +90,28 @@ impl PreviewRenderer {
     }
 
     /// Preview size / project size.
+    /// The color of the last preview frame at (u, v) in 0..1 (reads the frame back from the GPU).
+    pub fn pixel(&self, u: f32, v: f32) -> Option<[u8; 3]> {
+        let gpu = self.gpu.as_ref()?;
+        let (w, h) = gpu.compositor.size();
+        let x = ((u * w as f32) as u32).min(w.saturating_sub(1));
+        let y = ((v * h as f32) as u32).min(h.saturating_sub(1));
+        let px = gpu.compositor.read_rgba();
+        // Average a small square so noise and compression blocks don't skew the pick.
+        let mut sum = [0u32; 3];
+        let mut n = 0;
+        for yy in y.saturating_sub(PICK_RADIUS)..=(y + PICK_RADIUS).min(h - 1) {
+            for xx in x.saturating_sub(PICK_RADIUS)..=(x + PICK_RADIUS).min(w - 1) {
+                let i = ((yy * w + xx) * 4) as usize;
+                for c in 0..3 {
+                    sum[c] += px[i + c] as u32;
+                }
+                n += 1;
+            }
+        }
+        (n > 0).then(|| sum.map(|s| (s / n) as u8))
+    }
+
     pub fn frame_scale(&self, project: &Project) -> f32 {
         self.preview_size(project).0 as f32 / project.width as f32
     }
@@ -199,7 +227,20 @@ impl PreviewRenderer {
             }
             l.opacity.to_bits().hash(&mut sig);
             l.blend.hash(&mut sig);
-            draws.push(DrawItem::Layer(LayerDraw { paint, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
+            let mut grade = l.grade;
+            let mut stages = l.stages.clone();
+            // While picking a key color, show that clip as the keyer sees it: no key and
+            // no color changes, so the picked pixel is the real source color.
+            if self.picking_key == Some(l.clip.id) {
+                grade.flags = 0;
+                stages.clear();
+            }
+            stages.len().hash(&mut sig);
+            grade.flags.hash(&mut sig);
+            for v in grade.data.iter().flatten() {
+                v.to_bits().hash(&mut sig);
+            }
+            draws.push(DrawItem::Layer(LayerDraw { paint, grade, quad: l.quad, stages, opacity: l.opacity, blend: l.blend }));
         }
 
         // Free decoders, video textures, text masks and images that are gone.

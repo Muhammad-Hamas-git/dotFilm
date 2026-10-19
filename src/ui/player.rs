@@ -92,6 +92,35 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     let tol = app.project.key_tolerance();
 
+    // --- picking a chroma key color: a click samples the preview there ---
+    if let Some(id) = app.preview.picking_key {
+        if app.selected != Some(id) || app.project.clip(id).is_none() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.preview.picking_key = None;
+        } else {
+            if response.hover_pos().is_some_and(|p| frame.contains(p)) {
+                ctx.set_cursor_icon(CursorIcon::Crosshair);
+            }
+            painter.text(frame.center_top() + vec2(0.0, 14.0), Align2::CENTER_TOP, "Click the background color to remove (Esc cancels)", FontId::proportional(14.0), Color32::WHITE);
+            if response.clicked() {
+                if let Some(p) = response.interact_pointer_pos().filter(|p| frame.contains(*p)) {
+                    let (u, v) = ((p.x - frame.left()) / frame.width(), (p.y - frame.top()) / frame.height());
+                    if let Some(rgb) = app.preview.pixel(u, v) {
+                        app.history.checkpoint(&app.project);
+                        if let Some(c) = app.project.clip_mut(id) {
+                            let l = c.local(t.clamp(c.start, c.end() - 1e-6));
+                            for (k, v) in rgb.iter().enumerate() {
+                                c.param_mut(Param::Grade(crate::core::grade::idx::KEY_COLOR + k as u8)).set(l, *v as f32 / 255.0, tol);
+                            }
+                            c.grade.chroma_key = true;
+                        }
+                    }
+                }
+                app.preview.picking_key = None;
+            }
+            return;
+        }
+    }
+
     // --- start drag: corner of the selected clip, or the topmost picture under the cursor ---
     if response.drag_started() {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();

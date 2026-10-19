@@ -2,5 +2,6 @@
 pub mod anim;
 pub mod content;
 pub mod geometry;
+pub mod grade;
 pub mod history;
 pub mod model;

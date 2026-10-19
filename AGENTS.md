@@ -20,6 +20,10 @@ Read README.md first for the folder layout.
   there is an `Anim` addressed as `Param::Content(i)` (see `core/content.rs` `index`). Text is drawn as a
   coverage mask and colored in the shader. Effects are `DrawItem::Effect` passes that read the frame so
   far and write the other accumulation texture. Get on-screen outlines from `engine::scene::clip_quad`.
+- Grading (white balance, wheels, HSL, chroma key) lives in `clip.grade` (`core/grade.rs`), addressed as
+  `Param::Grade(i)` (see `grade::idx`). `Grade::frame` packs it for the shader; flag bits skip unused
+  parts. Shader order: source, chroma key, white balance, basic color stages, wheels, HSL.
+  Layer uniforms are padded to `UNIFORM_STRIDE` (768); grow it if `LayerUniform` grows past that.
 - Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when
   they merely round a displayed value, which during playback would create a keyframe every frame.
 - The UI changes the project only through `core::model::Project` methods or direct field edits.

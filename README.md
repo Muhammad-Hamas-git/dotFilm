@@ -15,6 +15,11 @@ A desktop video editor written in Rust, rendered on the GPU.
   saturation, hue, value, volume, **speed** (0.1x to 10x, with or without changing audio pitch).
   **Every value can be keyframed**, with an easing curve editor (linear, ease in/out, hold, or a
   custom bezier with overshoot). Exact start and length fields.
+- **Color grading** on every picture clip: white balance (temperature, tint), three **color wheels**
+  (shadows, midtones, highlights: tint plus luminance), and **HSL by color** (hue, saturation and
+  luminance for red, orange, yellow, green, blue, indigo, violet). All keyframeable.
+- **Chroma key**: remove a green (or any) screen. Click **Pick** and then the background in the player,
+  or set the color by hand. Similarity, softness and spill removal. Runs on the GPU like everything else.
 - **Copy and paste clips** (Ctrl+C / Ctrl+V or right-click): pastes at the playhead with all its
   settings and keyframes, on a track above if the spot is taken.
 - **Timeline**: multiple tracks (Track 1 is the bottom layer), **blend mode per track** (18 modes: multiply,
@@ -98,6 +103,7 @@ src/
     model.rs           assets, tracks, clips, blend modes, parameters, save/load
     anim.rs            keyframes and easing curves
     content.rs         colors, gradients, text and effect settings of generated layers
+    grade.rs           white balance, color wheels, HSL per color, chroma key settings
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -116,7 +122,7 @@ src/
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector, timeline, export_dialog
+  ui/                the window: app.rs, assets, player, inspector (+ grading), timeline, export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -158,6 +164,11 @@ Example: a new animatable parameter "blur radius".
 | Hardware decoding on export, audio bitrate | top of `engine/export.rs` |
 | Resolution / fps presets | `RESOLUTIONS` and `FRAME_RATES` in `ui/inspector.rs` |
 | Undo steps | `MAX_UNDO` in `core/history.rs` |
+| Grading ranges and defaults (temperature, wheels, HSL, key) | `info` in `core/grade.rs` |
+| HSL color centers | `COLORS` in `core/grade.rs` and `HSL_CENTERS` in `gpu/shaders.wgsl` (keep in step) |
+| Color wheel strength | `WHEEL_TINT`, `WHEEL_LUM` in `gpu/shaders.wgsl` |
+| Chroma key reach (how far similarity 1.0 goes) | `KEY_REACH` in `gpu/shaders.wgsl` |
+| Color wheel size, key color picker area | `WHEEL_SIZE` in `ui/grading.rs`, `PICK_RADIUS` in `engine/preview.rs` |
 | Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
 | Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |

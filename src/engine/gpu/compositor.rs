@@ -3,6 +3,7 @@
 
 use super::wgpu;
 use crate::core::geometry::Quad;
+use crate::core::grade::GradeFrame;
 use crate::core::model::BlendMode;
 use crate::engine::color::Stage;
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ pub const MAX_LAYERS: usize = 64;
 /// Max color stages per layer (must match shaders.wgsl).
 const MAX_STAGES: usize = 4;
 /// Uniform slots are this far apart (dynamic offsets must be 256-aligned).
-const UNIFORM_STRIDE: u64 = 512;
+const UNIFORM_STRIDE: u64 = 768;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -27,10 +28,13 @@ struct LayerUniform {
     yuv: [[f32; 4]; 3],
     stages: [[f32; 4]; 12],
     extra: [[f32; 4]; 6],
+    grade: [[f32; 4]; 12],
     stage_count: u32,
     kind: u32,
     blend: u32,
     opacity: f32,
+    grade_flags: u32,
+    pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -100,6 +104,8 @@ const BLUR_ID: u32 = 0;
 /// One layer to draw.
 pub struct LayerDraw {
     pub paint: Paint,
+    /// Color grading (white balance, wheels, HSL, chroma key).
+    pub grade: GradeFrame,
     pub quad: Quad,
     pub stages: Vec<Stage>,
     pub opacity: f32,
@@ -581,10 +587,13 @@ impl Compositor {
             yuv,
             stages,
             extra,
+            grade: layer.grade.data,
             stage_count: count as u32,
             kind,
             blend: layer.blend.shader_id(),
             opacity: layer.opacity,
+            grade_flags: layer.grade.flags,
+            pad: [0; 3],
         }
     }
 
@@ -594,7 +603,19 @@ impl Compositor {
         extra[0] = e.params;
         // Effect sizes are in project pixels; scale them to this output.
         extra[1] = [ow as f32 / self.canvas.0, e.seed as f32, ow as f32, oh as f32];
-        LayerUniform { pos: [[0.0; 4]; 4], yuv: [[0.0; 4]; 3], stages: [[0.0; 4]; 12], extra, stage_count: 0, kind: e.kind, blend: 0, opacity: e.opacity }
+        LayerUniform {
+            pos: [[0.0; 4]; 4],
+            yuv: [[0.0; 4]; 3],
+            stages: [[0.0; 4]; 12],
+            extra,
+            grade: [[0.0; 4]; 12],
+            stage_count: 0,
+            kind: e.kind,
+            blend: 0,
+            opacity: e.opacity,
+            grade_flags: 0,
+            pad: [0; 3],
+        }
     }
 
     /// Draws the stack (bottom first) and fills the 8-bit output texture.

@@ -45,7 +45,10 @@ pub mod tests {
     use super::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey};
     use crate::core::geometry::{self, Placement};
     use crate::core::model::{Adjustments, BlendMode};
+    use crate::core::grade::GradeFrame;
     use crate::engine::color;
+
+    const NO_GRADE: GradeFrame = GradeFrame { data: [[0.0; 4]; 12], flags: 0 };
 
     /// Set DOTFILM_REQUIRE_GPU=1 (CI does) to fail instead of skipping without a GPU.
     pub fn gpu() -> Option<super::Gpu> {
@@ -72,7 +75,7 @@ pub mod tests {
     }
 
     fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> DrawItem {
-        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), quad, stages: vec![], opacity, blend })
+        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, quad, stages: vec![], opacity, blend })
     }
 
     fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
@@ -138,7 +141,7 @@ pub mod tests {
         let src = [180u8, 90, 40, 255];
         solid(&mut c, k, src);
         let adj = Adjustments { brightness: 0.05, contrast: 1.3, saturation: 1.4, hue: 35.0, value: 0.9 };
-        let d = LayerDraw { paint: Paint::Source(k), quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
+        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
         c.render(&[DrawItem::Layer(d)]);
         let px = c.read_rgba();
         let mut cpu = Vec::new();
@@ -214,7 +217,7 @@ pub mod tests {
             angle_deg: 90.0,
             size: (w as f32, h as f32),
         };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
         let img = c.read_rgba();
         let (l, m, r) = (px(&img, w, 1, 10), px(&img, w, 50, 10), px(&img, w, 98, 10));
         assert!(l[0] > 240 && l[2] < 15, "left {l:?}");
@@ -236,7 +239,7 @@ pub mod tests {
         let k = SourceKey::Clip(9);
         c.upload_rgba(k, 4, 4, &mask);
         let paint = Paint::Text { mask: k, fill: [1.0, 1.0, 0.0, 1.0], outline: [0.0, 0.0, 1.0, 1.0] };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
         let img = c.read_rgba();
         assert!(close(&px(&img, 4, 0, 1), [255, 255, 0], 3), "fill {:?}", px(&img, 4, 0, 1));
         assert!(close(&px(&img, 4, 3, 1), [0, 0, 255], 3), "outline {:?}", px(&img, 4, 3, 1));
@@ -279,5 +282,110 @@ pub mod tests {
         let differs = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x[0] != y[0]).count();
         assert!(varied > 500, "grain should vary pixels: {varied}");
         assert!(differs > 500, "grain should change per frame: {differs}");
+    }
+
+    /// Draws a solid color with grading and returns the resulting pixel (RGBA).
+    fn graded(c: &mut Compositor, rgba: [u8; 4], grade: &crate::core::grade::Grade) -> [u8; 4] {
+        let k = SourceKey::Asset(77);
+        solid(c, k, rgba);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        let px = c.read_rgba();
+        let i = (4 * 8 + 4) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    }
+
+    fn luma8(p: [u8; 4]) -> f32 {
+        0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+    }
+
+    #[test]
+    fn white_balance_warms_and_keeps_brightness() {
+        use crate::core::grade::{idx, Grade};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let gray = [128, 128, 128, 255];
+        let mut gr = Grade::default();
+        assert_eq!(graded(&mut c, gray, &gr)[..3], [128, 128, 128]);
+        gr.values[idx::TEMPERATURE as usize].value = 0.8;
+        let warm = graded(&mut c, gray, &gr);
+        assert!(warm[0] > warm[2] + 30, "warmer means more red than blue: {warm:?}");
+        assert!((luma8(warm) - 128.0).abs() < 3.0, "brightness kept: {warm:?}");
+        gr.values[idx::TEMPERATURE as usize].value = 0.0;
+        gr.values[idx::TINT as usize].value = 0.8;
+        let magenta = graded(&mut c, gray, &gr);
+        assert!(magenta[1] < magenta[0] && magenta[1] < magenta[2], "tint pulls green out: {magenta:?}");
+    }
+
+    #[test]
+    fn hsl_changes_only_the_chosen_color() {
+        use crate::core::grade::{idx, Grade};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let red = [220, 30, 30, 255];
+        let blue = [30, 80, 220, 255];
+        let mut gr = Grade::default();
+        // Red: shift hue toward yellow and drop saturation.
+        gr.values[idx::hsl(0, 0) as usize].value = 40.0;
+        gr.values[idx::hsl(0, 1) as usize].value = -0.5;
+        let r = graded(&mut c, red, &gr);
+        assert!(r[1] > 80, "red moved toward orange/yellow: {r:?}");
+        assert!((r[0] as i32 - r[2] as i32) < 190 - 40, "red less saturated: {r:?}");
+        let b = graded(&mut c, blue, &gr);
+        assert!(close(&b, [30, 80, 220], 2), "blue untouched: {b:?}");
+        let gray = graded(&mut c, [100, 100, 100, 255], &gr);
+        assert!(close(&gray, [100, 100, 100], 1), "gray untouched: {gray:?}");
+    }
+
+    #[test]
+    fn chroma_key_removes_green_and_keeps_skin() {
+        use crate::core::grade::{idx, Grade};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let mut gr = Grade::default();
+        gr.chroma_key = true;
+        for (i, v) in [0.1f32, 0.8, 0.2].iter().enumerate() {
+            gr.values[idx::KEY_COLOR as usize + i].value = *v;
+        }
+        // Draw over a magenta background: keyed pixels show it.
+        let (bg, k) = (SourceKey::Asset(1), SourceKey::Asset(2));
+        solid(&mut c, bg, [255, 0, 255, 255]);
+        let mut over = |rgba: [u8; 4]| {
+            solid(&mut c, k, rgba);
+            let q = full_frame(8.0, 8.0);
+            c.render(&[
+                layer(bg, q, BlendMode::Normal, 1.0),
+                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+            ]);
+            px(&c.read_rgba(), 8, 4, 4)
+        };
+        let screen = over([30, 200, 60, 255]);
+        assert!(close(&screen, [255, 0, 255], 4), "green screen keyed out: {screen:?}");
+        let skin = over([210, 160, 130, 255]);
+        assert!(close(&skin, [210, 160, 130], 3), "skin kept: {skin:?}");
+        // A greenish edge stays but loses the green cast.
+        let spill = over([150, 190, 140, 255]);
+        assert!(spill[0] < 200 && spill[2] < 200, "mostly kept: {spill:?}");
+        // Spill removal keeps brightness, so green's lead over red/blue shrinks (it was 40).
+        let lead = spill[1] as i32 - spill[0].max(spill[2]) as i32;
+        assert!(lead < 15, "spill suppressed: {spill:?}");
+    }
+
+    #[test]
+    fn wheels_lift_shadows_more_than_highlights() {
+        use crate::core::grade::{idx, Grade};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let mut gr = Grade::default();
+        gr.values[idx::wheel(0, 2) as usize].value = 0.5;
+        let dark = graded(&mut c, [30, 30, 30, 255], &gr);
+        let bright = graded(&mut c, [220, 220, 220, 255], &gr);
+        assert!(dark[0] as i32 - 30 > 20, "shadows lifted: {dark:?}");
+        assert!((bright[0] as i32 - 220) < 5, "highlights barely move: {bright:?}");
+        // A blue tint in the highlights.
+        let mut gr = Grade::default();
+        gr.values[idx::wheel(2, 0) as usize].value = 220.0;
+        gr.values[idx::wheel(2, 1) as usize].value = 0.8;
+        let hi = graded(&mut c, [200, 200, 200, 255], &gr);
+        assert!(hi[2] > hi[0] + 20, "highlights tinted blue: {hi:?}");
     }
 }

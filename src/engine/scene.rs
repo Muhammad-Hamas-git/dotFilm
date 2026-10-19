@@ -2,6 +2,7 @@
 
 use super::color::{self, Stage};
 use super::text::{self, TextEngine, TextMask};
+use crate::core::grade::GradeFrame;
 use crate::core::content::{Content, EffectKind, TextParams};
 use crate::core::geometry::Quad;
 use crate::core::model::{Asset, AssetKind, BlendMode, Clip, Project};
@@ -23,6 +24,8 @@ pub struct SceneLayer<'a> {
     pub stages: Vec<Stage>,
     pub opacity: f32,
     pub blend: BlendMode,
+    /// White balance, wheels, HSL and chroma key at this moment.
+    pub grade: GradeFrame,
     /// Seconds into the source file for this frame (media only).
     pub source_time: f64,
     pub paint: ScenePaint,
@@ -121,6 +124,7 @@ pub fn items_at<'a>(project: &'a Project, t: f64, engine: &mut TextEngine, frame
             stages: color::stages(&v.adjust),
             opacity: v.opacity,
             blend: project.tracks.get(clip.track).map(|tr| tr.blend).unwrap_or_default(),
+            grade: clip.grade.frame(l),
             source_time: clip.source_time(t),
             paint,
         }));

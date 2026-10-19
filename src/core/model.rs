@@ -3,6 +3,7 @@
 
 use super::anim::Anim;
 use super::content::Content;
+use super::grade::{self, Grade};
 use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -240,6 +241,8 @@ pub enum Param {
     Speed,
     /// The i-th number of the clip's content (color channels, text size, effect settings...).
     Content(u8),
+    /// The i-th color grading value (see core::grade::idx).
+    Grade(u8),
 }
 
 impl Param {
@@ -277,6 +280,7 @@ impl Param {
             Param::Volume => "Volume",
             Param::Speed => "Speed",
             Param::Content(_) => "Value",
+            Param::Grade(i) => grade::info(i).label,
         }
     }
 
@@ -319,6 +323,9 @@ pub struct Clip {
     /// Color, gradient, text or effect settings for generated clips.
     #[serde(default)]
     pub content: Option<Content>,
+    /// White balance, color wheels, HSL per color, chroma key.
+    #[serde(default, skip_serializing_if = "Grade::is_default")]
+    pub grade: Grade,
 }
 
 /// Slowest allowed speed (keeps the time math well behaved).
@@ -352,6 +359,7 @@ impl Clip {
         if let Some(c) = &self.content {
             v.extend((0..c.anims().len()).map(|i| Param::Content(i as u8)));
         }
+        v.extend((0..grade::COUNT).map(|i| Param::Grade(i as u8)));
         v
     }
 
@@ -443,6 +451,7 @@ impl Clip {
             Param::Volume => &self.volume,
             Param::Speed => &self.speed,
             Param::Content(i) => self.content.as_ref().and_then(|c| c.anims().get(i as usize).copied()).expect("content param exists"),
+            Param::Grade(i) => &self.grade.values[i as usize],
         }
     }
 
@@ -463,6 +472,7 @@ impl Clip {
             Param::Volume => &mut self.volume,
             Param::Speed => &mut self.speed,
             Param::Content(i) => self.content.as_mut().and_then(|c| c.anims_mut().into_iter().nth(i as usize)).expect("content param exists"),
+            Param::Grade(i) => &mut self.grade.values[i as usize],
         }
     }
 
@@ -718,6 +728,7 @@ impl Project {
             speed: Anim::new(1.0),
             speed_affects_pitch: false,
             content: asset.generator.clone(),
+            grade: Grade::default(),
         });
         Some(id)
     }

@@ -38,18 +38,19 @@ pub struct InspectorState {
     editing: bool,
     /// Filter typed into the font list.
     font_search: String,
+    grading: super::grading::GradingState,
 }
 
 /// Collects what the widgets did this frame.
 #[derive(Default)]
-struct Tracker {
-    changed: bool,
-    active: bool,
+pub(super) struct Tracker {
+    pub(super) changed: bool,
+    pub(super) active: bool,
     seek: Option<f64>,
 }
 
 impl Tracker {
-    fn add(&mut self, r: &egui::Response) {
+    pub(super) fn add(&mut self, r: &egui::Response) {
         self.changed |= user_edit(r);
         self.active |= r.dragged() || r.has_focus();
     }
@@ -58,7 +59,7 @@ impl Tracker {
 /// True only when the person actually changed the widget. Sliders also report
 /// "changed" when they merely round the value they display (e.g. 0.4567 -> 0.46),
 /// which during playback happened every frame and created a keyframe each time.
-fn user_edit(r: &egui::Response) -> bool {
+pub(super) fn user_edit(r: &egui::Response) -> bool {
     r.changed() && (r.dragged() || r.drag_stopped() || r.clicked() || r.has_focus() || r.lost_focus() || r.is_pointer_button_down_on())
 }
 
@@ -70,7 +71,15 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
         let mut t = Tracker::default();
 
         match app.selected.filter(|id| app.project.clip(*id).is_some()) {
-            Some(id) => clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, &mut app.preview.text, &mut app.inspector.font_search),
+            Some(id) => {
+                let ctx = ClipCtx {
+                    text: &mut app.preview.text,
+                    font_search: &mut app.inspector.font_search,
+                    grading: &mut app.inspector.grading,
+                    picking: &mut app.preview.picking_key,
+                };
+                clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, ctx)
+            }
             None => project_inspector(ui, &mut app.project, &mut t),
         }
 
@@ -85,7 +94,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 }
 
 /// The diamond-shaped keyframe button.
-fn key_button(ui: &mut Ui, on_key: bool, animated: bool) -> egui::Response {
+pub(super) fn key_button(ui: &mut Ui, on_key: bool, animated: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
     let c = rect.center();
     let r = if resp.hovered() { 6.0 } else { 5.0 };
@@ -120,6 +129,7 @@ fn widget_for(p: Param) -> Widget {
         Param::Volume => s(0.0..=2.0, 2),
         Param::Speed => Widget::Slider { range: crate::core::model::SPEED_RANGE, decimals: 2, log: true, suffix: "x" },
         Param::Content(_) => s(0.0..=1.0, 2),
+        Param::Grade(i) => info_widget(&crate::core::grade::info(i)),
     }
 }
 
@@ -145,7 +155,7 @@ fn content_param(content: Option<&Content>, i: u8) -> (&'static str, Widget) {
 }
 
 /// One row: keyframe diamond, name, value widget.
-fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &mut Tracker) {
+pub(super) fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &mut Tracker) {
     let anim = clip.param(p);
     let on_key = anim.key_at(local, tol).is_some();
     if key_button(ui, on_key, anim.is_animated()).clicked() {
@@ -312,7 +322,15 @@ fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f
     });
 }
 
-fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, text: &mut TextEngine, font_search: &mut String) {
+/// Editor state the clip inspector needs besides the project.
+struct ClipCtx<'a> {
+    text: &'a mut TextEngine,
+    font_search: &'a mut String,
+    grading: &'a mut super::grading::GradingState,
+    picking: &'a mut Option<ClipId>,
+}
+
+fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, ctx: ClipCtx) {
     let tol = project.key_tolerance();
     let (pw, ph) = (project.width as f32, project.height as f32);
     let Some(mut c) = project.clip(id).cloned() else { return };
@@ -375,7 +393,7 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
     t.changed |= timing_changed;
 
     let is_effect = c.content.as_ref().is_some_and(|x| x.is_effect());
-    content_section(ui, &mut c, local, tol, t, text, font_search);
+    content_section(ui, &mut c, local, tol, t, ctx.text, ctx.font_search);
 
     if asset.kind != AssetKind::Audio && !is_effect {
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
@@ -416,6 +434,7 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
                 t.changed = true;
             }
         });
+        super::grading::section(ui, &mut c, local, tol, t, ctx.grading, ctx.picking);
     }
     if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
         egui::CollapsingHeader::new("Speed").default_open(true).show(ui, |ui| {

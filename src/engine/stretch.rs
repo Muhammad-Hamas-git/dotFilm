@@ -181,6 +181,7 @@ mod tests {
             speed: Anim::new(speed),
             speed_affects_pitch: false,
             content: None,
+            grade: Default::default(),
         }
     }
 

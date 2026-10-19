@@ -2,6 +2,7 @@
 pub mod app;
 pub mod assets;
 pub mod export_dialog;
+pub mod grading;
 pub mod inspector;
 pub mod player;
 pub mod timeline;
