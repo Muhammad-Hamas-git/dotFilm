@@ -436,6 +436,7 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
         });
         super::grading::section(ui, &mut c, local, tol, t, ctx.grading, ctx.picking);
     }
+    super::transitions::section(ui, project, &mut c, t);
     if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
         egui::CollapsingHeader::new("Speed").default_open(true).show(ui, |ui| {
             let before = c.speed.clone();

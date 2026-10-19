@@ -75,10 +75,32 @@ pub enum EffectKind {
     Vignette,
     Grain,
     ChromaticAberration,
+    Bloom,
+    /// Out-of-focus blur with round bokeh highlights ("unfocus").
+    LensBlur,
+    /// Zoom blur streaking out from a center.
+    RadialBlur,
+    /// Rotational blur around a center.
+    SpinBlur,
+    /// A second, shifted and scaled copy of the picture, screen-blended on top.
+    DoubleExposure,
+    /// Blurs movement of everything below (re-rendered at several moments per frame).
+    MotionBlur,
 }
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 4] = [EffectKind::GaussianBlur, EffectKind::Vignette, EffectKind::Grain, EffectKind::ChromaticAberration];
+    pub const ALL: [EffectKind; 10] = [
+        EffectKind::GaussianBlur,
+        EffectKind::LensBlur,
+        EffectKind::RadialBlur,
+        EffectKind::SpinBlur,
+        EffectKind::MotionBlur,
+        EffectKind::Bloom,
+        EffectKind::Vignette,
+        EffectKind::Grain,
+        EffectKind::ChromaticAberration,
+        EffectKind::DoubleExposure,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -86,6 +108,12 @@ impl EffectKind {
             EffectKind::Vignette => "Vignette",
             EffectKind::Grain => "Film grain",
             EffectKind::ChromaticAberration => "Chromatic aberration",
+            EffectKind::Bloom => "Bloom",
+            EffectKind::LensBlur => "Lens blur",
+            EffectKind::RadialBlur => "Radial blur",
+            EffectKind::SpinBlur => "Spin blur",
+            EffectKind::DoubleExposure => "Double exposure",
+            EffectKind::MotionBlur => "Motion blur",
         }
     }
 
@@ -96,6 +124,13 @@ impl EffectKind {
             EffectKind::Vignette => 1,
             EffectKind::Grain => 2,
             EffectKind::ChromaticAberration => 3,
+            EffectKind::Bloom => 4,
+            EffectKind::LensBlur => 5,
+            EffectKind::RadialBlur => 6,
+            EffectKind::SpinBlur => 7,
+            EffectKind::DoubleExposure => 8,
+            // Never reaches the shader: the scene re-renders the layers below instead.
+            EffectKind::MotionBlur => 9,
         }
     }
 
@@ -120,6 +155,42 @@ impl EffectKind {
                 p("Amount", 0.0, 60.0, 6.0, 1, " px"),
                 p("Angle", -180.0, 180.0, 0.0, 0, " deg"),
                 p("Radial", 0.0, 1.0, 1.0, 2, ""),
+                None,
+            ],
+            EffectKind::Bloom => [
+                p("Threshold", 0.0, 1.0, 0.7, 2, ""),
+                p("Intensity", 0.0, 3.0, 0.6, 2, ""),
+                p("Radius", 1.0, 400.0, 60.0, 0, " px"),
+                p("Softness", 0.0, 1.0, 0.3, 2, ""),
+            ],
+            EffectKind::LensBlur => [
+                p("Radius", 0.0, 120.0, 16.0, 1, " px"),
+                p("Bokeh", 0.0, 1.0, 0.5, 2, ""),
+                None,
+                None,
+            ],
+            EffectKind::RadialBlur => [
+                p("Amount", 0.0, 1.0, 0.25, 2, ""),
+                p("Center X", 0.0, 1.0, 0.5, 2, ""),
+                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
+                None,
+            ],
+            EffectKind::SpinBlur => [
+                p("Angle", 0.0, 90.0, 10.0, 1, " deg"),
+                p("Center X", 0.0, 1.0, 0.5, 2, ""),
+                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
+                None,
+            ],
+            EffectKind::DoubleExposure => [
+                p("Offset X", -1000.0, 1000.0, 80.0, 0, " px"),
+                p("Offset Y", -1000.0, 1000.0, 0.0, 0, " px"),
+                p("Zoom", 0.5, 2.0, 1.1, 2, ""),
+                p("Amount", 0.0, 1.0, 0.6, 2, ""),
+            ],
+            EffectKind::MotionBlur => [
+                p("Shutter", 0.0, 720.0, 180.0, 0, " deg"),
+                p("Samples", 2.0, 32.0, 12.0, 0, ""),
+                None,
                 None,
             ],
         }

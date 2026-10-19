@@ -470,22 +470,47 @@ fn out_size() -> vec2<f32> {
     return L.gen[1].zw;
 }
 
+// Bloom only spreads what's brighter than the threshold, with a soft knee
+// (e = threshold, intensity, radius, softness).
+fn bloom_prefilter(c: vec3<f32>) -> vec3<f32> {
+    let e = L.gen[0];
+    // Brightness as the eye sees it, so saturated colors don't glow like white.
+    let bright = dot(c, LUMA);
+    let knee = max(e.x * e.w, 1e-4);
+    var soft = clamp(bright - e.x + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    // Scaled so pure white glows at full strength whatever the threshold.
+    return c * (max(soft, bright - e.x) / max(bright, 1e-4) / max(1.0 - e.x, 0.05));
+}
+
+// Max taps on each side of a separable blur (Gaussian blur and bloom).
+const BLUR_TAPS: f32 = 32.0;
+const BLOOM_TAPS: f32 = 48.0;
+
 // Gaussian blur along one direction. Radius is in project pixels, scaled to the
 // output so preview and export look the same. Large radii use spaced-out taps.
-fn blur_dir(tex: texture_2d<f32>, uv: vec2<f32>, dir: vec2<f32>) -> vec4<f32> {
-    let radius = L.gen[0].x * L.gen[1].x;
+// For bloom (kind 4) the kernel is wider and softer, and `prefilter` thresholds
+// every tap first (only the first of the two passes does that).
+fn blur_dir(tex: texture_2d<f32>, uv: vec2<f32>, dir: vec2<f32>, prefilter: bool) -> vec4<f32> {
+    let bloom = L.kind == 4u;
+    let radius = select(L.gen[0].x, L.gen[0].z, bloom) * L.gen[1].x;
     if (radius < 0.5) {
-        return textureSampleLevel(tex, lin, uv, 0.0);
+        let c = textureSampleLevel(tex, lin, uv, 0.0);
+        return select(c, vec4(bloom_prefilter(c.rgb), 1.0), prefilter);
     }
-    let n = i32(min(ceil(radius), 32.0));
+    let n = i32(min(ceil(radius), select(BLUR_TAPS, BLOOM_TAPS, bloom)));
     let step = radius / f32(n);
-    let sigma = radius * 0.5;
+    let sigma = radius * select(0.5, 0.4, bloom);
     var sum = vec4(0.0);
     var wsum = 0.0;
     for (var i = -n; i <= n; i = i + 1) {
         let x = f32(i) * step;
         let w = exp(-(x * x) / (2.0 * sigma * sigma));
-        sum = sum + textureSampleLevel(tex, lin, uv + dir * x, 0.0) * w;
+        var c = textureSampleLevel(tex, lin, uv + dir * x, 0.0);
+        if (prefilter) {
+            c = vec4(bloom_prefilter(c.rgb), 1.0);
+        }
+        sum = sum + c * w;
         wsum = wsum + w;
     }
     return sum / wsum;
@@ -494,16 +519,112 @@ fn blur_dir(tex: texture_2d<f32>, uv: vec2<f32>, dir: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_blur_h(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let size = out_size();
-    return blur_dir(backdrop, p.xy / size, vec2(1.0 / size.x, 0.0));
+    return blur_dir(backdrop, p.xy / size, vec2(1.0 / size.x, 0.0), L.kind == 4u);
 }
 
 @fragment
 fn fs_blur_v(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let size = out_size();
-    let blurred = blur_dir(layer_tex, p.xy / size, vec2(0.0, 1.0 / size.y));
+    // The vertical pass reads values that are already thresholded: no second prefilter.
+    let blurred = blur_dir(layer_tex, p.xy / size, vec2(0.0, 1.0 / size.y), false);
     let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0);
+    if (L.kind == 4u) {
+        // Bloom adds the glow on top.
+        return vec4(orig.rgb + blurred.rgb * L.gen[0].y * L.opacity, 1.0);
+    }
     return vec4(mix(orig.rgb, blurred.rgb, L.opacity), 1.0);
 }
+
+// ---------------------------------------------------------------- motion blur samples
+
+// Copies the input scaled by L.opacity (added up into the motion blur sum, or copied back).
+@fragment
+fn fs_weighted(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(backdrop, vec2<i32>(p.xy), 0) * L.opacity;
+}
+
+// ---------------------------------------------------------------- transitions
+// backdrop = outgoing clip, layer_tex = incoming clip (premultiplied, transparent
+// where empty). L.opacity = eased progress, L.gen[0] = (angle rad, softness, edge, _),
+// edge: 0 between clips, 1 fading in, 2 fading out.
+
+fn side_at(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0))) {
+        return vec4(0.0);
+    }
+    return textureSampleLevel(tex, lin, uv, 0.0);
+}
+
+fn over(top: vec4<f32>, bottom: vec4<f32>) -> vec4<f32> {
+    return top + bottom * (1.0 - top.a);
+}
+
+// How much bigger the outgoing picture gets during a zoom transition.
+const ZOOM_AMOUNT: f32 = 1.5;
+
+@fragment
+fn fs_transition(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = out_size();
+    let xy = vec2<i32>(p.xy);
+    let uv = p.xy / size;
+    let t = clamp(L.opacity, 0.0, 1.0);
+    let e = L.gen[0];
+    let edge = u32(e.z + 0.5);
+    let a = textureLoad(backdrop, xy, 0);
+    let b = textureLoad(layer_tex, xy, 0);
+    let d = vec2(cos(e.x), sin(e.x));
+    switch L.kind {
+        case 1u, 2u: {
+            // Fade through black or white: the outgoing clip fades to the color,
+            // then the incoming one fades in from it.
+            let c = select(vec3(0.0), vec3(1.0), L.kind == 2u);
+            var src = a;
+            var k = 1.0 - 2.0 * t;
+            if (edge == 1u) {
+                src = b;
+                k = t;
+            } else if (edge == 2u) {
+                k = 1.0 - t;
+            } else if (t >= 0.5) {
+                src = b;
+                k = 2.0 * t - 1.0;
+            }
+            return vec4(src.rgb * k + c * src.a * (1.0 - k), src.a);
+        }
+        case 3u: {
+            // Wipe: a soft edge sweeps across in direction d.
+            let s = dot(uv - 0.5, d) / (abs(d.x) + abs(d.y)) + 0.5;
+            let w = max(e.y, 1e-4);
+            let front = t * (1.0 + w);
+            let m = 1.0 - smoothstep(front - w, front, s);
+            return mix(a, b, m);
+        }
+        case 4u: {
+            // Push: the incoming clip slides in and pushes the outgoing one out.
+            let mv = d / max(abs(d.x), abs(d.y));
+            let pa = side_at(backdrop, uv - mv * t);
+            let pb = side_at(layer_tex, uv + mv * (1.0 - t));
+            return over(pb, pa);
+        }
+        case 5u: {
+            // Zoom: the outgoing clip zooms in and fades, the incoming one settles from zoomed in.
+            let sa = 1.0 + ZOOM_AMOUNT * t;
+            let sb = 1.0 + ZOOM_AMOUNT * (1.0 - t);
+            let za = side_at(backdrop, 0.5 + (uv - 0.5) / sa);
+            let zb = side_at(layer_tex, 0.5 + (uv - 0.5) / sb);
+            return mix(za, zb, smoothstep(0.0, 1.0, t));
+        }
+        default: {
+            // Crossfade.
+            return mix(a, b, t);
+        }
+    }
+}
+
+// Taps for the single-pass blurs.
+const LENS_MIN_TAPS: f32 = 24.0;
+const LENS_MAX_TAPS: f32 = 256.0;
+const RADIAL_TAPS: u32 = 64u;
 
 fn hash3(p: vec3<u32>) -> f32 {
     var x = p.x * 1664525u + p.y * 1013904223u + p.z * 2654435761u;
@@ -577,6 +698,60 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             let r = textureSampleLevel(backdrop, lin, uv + off, 0.0).r;
             let b = textureSampleLevel(backdrop, lin, uv - off, 0.0).b;
             rgb = vec3(r, orig.g, b);
+        }
+        case 5u: {
+            // Lens blur: average over a disc (golden-angle spiral). Bright spots weigh
+            // more, so highlights turn into round bokeh. e = (radius px, bokeh, _, _).
+            let r = e.x * k;
+            if (r >= 0.5) {
+                let n = u32(clamp(r * r * 0.8, LENS_MIN_TAPS, LENS_MAX_TAPS));
+                // A per-pixel turn of the spiral trades visible patterns for fine noise.
+                let turn = hash3(vec3(u32(p.x), u32(p.y), 17u)) * 6.2831853;
+                var sum = vec3(0.0);
+                var wsum = 0.0;
+                for (var i = 0u; i < n; i = i + 1u) {
+                    let fi = f32(i) + 0.5;
+                    let rad = sqrt(fi / f32(n)) * r;
+                    let ang = fi * 2.3999632 + turn;
+                    let c = textureSampleLevel(backdrop, lin, uv + vec2(cos(ang), sin(ang)) * rad / size, 0.0).rgb;
+                    let w = 1.0 + e.y * 12.0 * smoothstep(0.55, 1.0, dot(c, LUMA));
+                    sum = sum + c * w;
+                    wsum = wsum + w;
+                }
+                rgb = sum / wsum;
+            }
+        }
+        case 6u, 7u: {
+            // Radial (zoom) blur, or spin blur, around center e.yz (0..1 of the frame).
+            // Radial: e.x = amount 0..1. Spin: e.x = total angle in degrees.
+            let c = e.yz;
+            let dpx = (uv - c) * size;
+            let jit = hash3(vec3(u32(p.x), u32(p.y), 29u));
+            var sum = vec3(0.0);
+            for (var i = 0u; i < RADIAL_TAPS; i = i + 1u) {
+                let f = (f32(i) + jit) / f32(RADIAL_TAPS);
+                var q = dpx;
+                if (L.kind == 6u) {
+                    q = dpx * (1.0 - e.x * f);
+                } else {
+                    let ang = radians(e.x) * (f - 0.5);
+                    q = vec2(dpx.x * cos(ang) - dpx.y * sin(ang), dpx.x * sin(ang) + dpx.y * cos(ang));
+                }
+                sum = sum + textureSampleLevel(backdrop, lin, c + q / size, 0.0).rgb;
+            }
+            rgb = sum / f32(RADIAL_TAPS);
+        }
+        case 8u: {
+            // Double exposure: a shifted, scaled copy screen-blended on top.
+            // e = (offset x px, offset y px, zoom, amount).
+            let off = e.xy * k / size;
+            let uv2 = 0.5 + (uv - 0.5 - off) / max(e.z, 0.05);
+            if (all(uv2 >= vec2(0.0)) && all(uv2 <= vec2(1.0))) {
+                let ghost = clamp(textureSampleLevel(backdrop, lin, uv2, 0.0).rgb, vec3(0.0), vec3(1.0));
+                let base = clamp(orig, vec3(0.0), vec3(1.0));
+                let screen = 1.0 - (1.0 - base) * (1.0 - ghost);
+                rgb = mix(orig, screen, e.w);
+            }
         }
         default: {}
     }

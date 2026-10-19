@@ -4,10 +4,11 @@
 
 use super::audio::{audio_clip, mix_clips};
 use super::stretch;
-use super::gpu::{self, compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey}};
+use super::gpu::{self, compositor::{Compositor, Paint, SourceKey}};
 use super::text::TextEngine;
 use super::scene;
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
+use crate::core::transition;
 use crate::media::{ffmpeg, probe, video::SequentialStream};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -251,7 +252,9 @@ pub fn run(
         if detail.is_empty() { msg } else { format!("{msg}\n{detail}") }
     };
 
-    let mut streams: HashMap<ClipId, (SequentialStream, f64)> = HashMap::new();
+    // Per clip: decoder, frames per source second, source time of its first frame,
+    // and the last frame index uploaded (motion blur draws a clip several times).
+    let mut streams: HashMap<ClipId, (SequentialStream, f64, f64, Option<u64>)> = HashMap::new();
     let mut images: HashSet<AssetId> = HashSet::new();
     let mut text_engine = TextEngine::default();
     let mut uploaded_text: HashMap<ClipId, u64> = HashMap::new();
@@ -261,9 +264,11 @@ pub fn run(
         let t = i as f64 / fps as f64;
 
         // Open decoders for clips that are visible now or start soon; close finished ones.
-        streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < c.end()));
+        // Transitions can show a clip a little before its start and after its end.
+        streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < transition::clip_span(project, c).1));
         for clip in &project.clips {
-            let soon = clip.start <= t + PREROLL && t < clip.end();
+            let (first, last) = transition::clip_span(project, clip);
+            let soon = first <= t + PREROLL && t < last;
             let shown = project.tracks.get(clip.track).is_some_and(|tr| !tr.hidden);
             if !soon || !shown || streams.contains_key(&clip.id) {
                 continue;
@@ -271,21 +276,15 @@ pub fn run(
             let Some(asset) = project.asset(clip.asset).filter(|a| a.kind == AssetKind::Video) else { continue };
             let (dw, dh) = scene::decode_size(project, asset, clip, 1.0, (asset.width.max(2), asset.height.max(2)));
             let rate = clip.decode_rate(fps);
-            let s = SequentialStream::open(&asset.path, clip.source_in, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
-            streams.insert(clip.id, (s, rate));
+            let from = clip.source_time(first).max(0.0);
+            let s = SequentialStream::open(&asset.path, from, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
+            streams.insert(clip.id, (s, rate, from, None));
         }
 
         let items = scene::items_at(project, t, &mut text_engine, 1.0);
         let seed = scene::frame_seed(project, t);
-        let mut draws = Vec::with_capacity(items.len());
-        for item in &items {
-            let l = match item {
-                scene::SceneItem::Effect(e) => {
-                    draws.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed }));
-                    continue;
-                }
-                scene::SceneItem::Layer(l) => l,
-            };
+        let mut error: Option<String> = None;
+        let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
             let paint = match &l.paint {
                 scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
                     Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
@@ -300,26 +299,37 @@ pub fn run(
                 }
                 scene::ScenePaint::Media => match l.asset.kind {
                     AssetKind::Video => {
-                        let Some((stream, rate)) = streams.get_mut(&l.clip.id) else { continue };
-                        let index = ((l.source_time - l.clip.source_in) * *rate).round().max(0.0) as u64;
-                        let (sw, sh) = (stream.width, stream.height);
-                        let Some(frame) = stream.frame(index) else { continue };
+                        let (stream, rate, from, uploaded) = streams.get_mut(&l.clip.id)?;
+                        let index = ((l.source_time - *from) * *rate).round().max(0.0) as u64;
                         let key = SourceKey::Clip(l.clip.id.0);
-                        comp.upload_yuv420(key, sw, sh, frame, super::color::yuv_to_rgb(l.asset.color, l.asset.height));
+                        if *uploaded != Some(index) {
+                            let (sw, sh) = (stream.width, stream.height);
+                            let frame = stream.frame(index)?;
+                            comp.upload_yuv420(key, sw, sh, frame, super::color::yuv_to_rgb(l.asset.color, l.asset.height));
+                            *uploaded = Some(index);
+                        }
                         Paint::Source(key)
                     }
                     AssetKind::Image => {
                         let key = SourceKey::Asset(l.asset.id.0);
                         if images.insert(l.asset.id) {
-                            let (iw, ih, px) = probe::load_image(&l.asset.path, IMAGE_MAX_SIDE, IMAGE_MAX_SIDE).map_err(|e| fail(e, &mut enc))?;
-                            comp.upload_rgba(key, iw, ih, &px);
+                            match probe::load_image(&l.asset.path, IMAGE_MAX_SIDE, IMAGE_MAX_SIDE) {
+                                Ok((iw, ih, px)) => comp.upload_rgba(key, iw, ih, &px),
+                                Err(e) => {
+                                    error = Some(e);
+                                    return None;
+                                }
+                            }
                         }
                         Paint::Source(key)
                     }
-                    _ => continue,
+                    _ => return None,
                 },
             };
-            draws.push(DrawItem::Layer(LayerDraw { paint, grade: l.grade, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
+            Some(scene::layer_draw(l, paint))
+        });
+        if let Some(e) = error {
+            return Err(fail(e, &mut enc));
         }
 
         comp.render(&draws);

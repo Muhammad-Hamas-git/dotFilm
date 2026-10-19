@@ -6,11 +6,12 @@
 //! - upcoming clips start decoding a second early (pre-roll);
 //! - if nothing changed since the last frame, no GPU work is done at all.
 
-use super::gpu::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey};
+use super::gpu::compositor::{Compositor, Paint, SourceKey};
 use super::text::TextEngine;
 use super::gpu::wgpu;
 use super::{color, scene};
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
+use crate::core::transition;
 use crate::media::cache::MediaCache;
 use crate::media::proxy::{self, Proxies};
 use crate::media::video::VideoStream;
@@ -139,11 +140,14 @@ impl PreviewRenderer {
         // Pre-roll upcoming video clips so they start without a gap.
         if playing {
             for clip in &project.clips {
-                if clip.start > t && clip.start <= t + PREROLL {
+                // Transitions can show a clip a little before its start.
+                let first = transition::clip_span(project, clip).0;
+                if first > t && first <= t + PREROLL {
                     if let Some(asset) = project.asset(clip.asset).filter(|a| scene::is_video(a)) {
                         let (path, native) = source_for(asset, proxies);
                         let (w, h) = scene::decode_size(project, asset, clip, frame_scale, native);
-                        ensure_stream(&mut self.streams, clip.id, path, w, h, clip.decode_rate(project.fps), asset.color.full_range).update(clip.source_in);
+                        let at = clip.source_time(first).max(0.0);
+                        ensure_stream(&mut self.streams, clip.id, path, w, h, clip.decode_rate(project.fps), asset.color.full_range).update(at);
                         keep_streams.insert(clip.id);
                     }
                 }
@@ -152,95 +156,74 @@ impl PreviewRenderer {
 
         let items = scene::items_at(project, t, &mut self.text, frame_scale);
         let seed = scene::frame_seed(project, t);
-        let mut draws = Vec::with_capacity(items.len());
         let mut sig = DefaultHasher::new();
         size.hash(&mut sig);
         let mut keep_text: HashSet<ClipId> = HashSet::new();
+        let picking = self.picking_key;
+        let streams = &mut self.streams;
+        let uploaded_text = &mut self.uploaded_text;
+        let uploaded_images = &mut self.uploaded_images;
+        let compositor = &mut gpu.compositor;
+        let mut waiting = false;
 
-        for item in &items {
-            let l = match item {
-                scene::SceneItem::Effect(e) => {
-                    (e.kind, e.params.map(f32::to_bits), e.opacity.to_bits(), seed).hash(&mut sig);
-                    draws.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed }));
-                    continue;
-                }
-                scene::SceneItem::Layer(l) => l,
-            };
+        let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
             let paint = match &l.paint {
                 scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
-                    (colors.iter().flatten().chain(positions.iter()).map(|v| v.to_bits()).collect::<Vec<_>>(), count, angle_deg.to_bits()).hash(&mut sig);
                     Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
                 }
                 scene::ScenePaint::Text { mask, fill, outline } => {
                     let key = SourceKey::Clip(l.clip.id.0);
                     keep_text.insert(l.clip.id);
-                    if self.uploaded_text.get(&l.clip.id) != Some(&mask.key) || !gpu.compositor.has_source(key) {
-                        gpu.compositor.upload_rgba(key, mask.width, mask.height, &mask.rgba);
-                        self.uploaded_text.insert(l.clip.id, mask.key);
+                    if uploaded_text.get(&l.clip.id) != Some(&mask.key) || !compositor.has_source(key) {
+                        compositor.upload_rgba(key, mask.width, mask.height, &mask.rgba);
+                        uploaded_text.insert(l.clip.id, mask.key);
                     }
-                    (mask.key, fill.map(f32::to_bits), outline.map(f32::to_bits)).hash(&mut sig);
+                    mask.key.hash(&mut sig);
                     Paint::Text { mask: key, fill: *fill, outline: *outline }
                 }
                 scene::ScenePaint::Media => match l.asset.kind {
                     AssetKind::Video => {
                         let (path, native) = source_for(l.asset, proxies);
                         let (w, h) = scene::decode_size(project, l.asset, l.clip, frame_scale, native);
-                        let stream = ensure_stream(&mut self.streams, l.clip.id, path, w, h, l.clip.decode_rate(project.fps), l.asset.color.full_range);
+                        let stream = ensure_stream(streams, l.clip.id, path, w, h, l.clip.decode_rate(project.fps), l.asset.color.full_range);
                         keep_streams.insert(l.clip.id);
                         let changed = stream.update(l.source_time);
                         if stream.is_stale() {
-                            self.waiting = true;
+                            waiting = true;
                         }
                         let key = SourceKey::Clip(l.clip.id.0);
-                        match stream.current() {
-                            Some(f) => {
-                                if changed || !gpu.compositor.has_source(key) {
-                                    let yuv = color::yuv_to_rgb(l.asset.color, l.asset.height);
-                                    gpu.compositor.upload_yuv420(key, stream.width, stream.height, &f.data, yuv);
-                                }
-                                f.pts.to_bits().hash(&mut sig);
-                                (stream.width, stream.height).hash(&mut sig);
-                            }
-                            None => continue,
+                        let f = stream.current()?;
+                        if changed || !compositor.has_source(key) {
+                            let yuv = color::yuv_to_rgb(l.asset.color, l.asset.height);
+                            compositor.upload_yuv420(key, stream.width, stream.height, &f.data, yuv);
                         }
+                        (l.clip.id, f.pts.to_bits(), stream.width, stream.height).hash(&mut sig);
                         Paint::Source(key)
                     }
                     AssetKind::Image => {
                         let key = SourceKey::Asset(l.asset.id.0);
-                        if !self.uploaded_images.contains(&l.asset.id) {
-                            let Some(img) = media.images.get(&l.asset.id) else { continue };
-                            gpu.compositor.upload_rgba(key, img.width, img.height, &img.rgba);
-                            self.uploaded_images.insert(l.asset.id);
+                        if !uploaded_images.contains(&l.asset.id) {
+                            let img = media.images.get(&l.asset.id)?;
+                            compositor.upload_rgba(key, img.width, img.height, &img.rgba);
+                            uploaded_images.insert(l.asset.id);
                         }
-                        key.hash(&mut sig);
                         Paint::Source(key)
                     }
-                    _ => continue,
+                    _ => return None,
                 },
             };
-            l.clip.id.hash(&mut sig);
-            for p in l.quad.pts.iter().flatten().chain(l.quad.w.iter()) {
-                p.to_bits().hash(&mut sig);
-            }
-            for v in l.stages.iter().flatten().flatten() {
-                v.to_bits().hash(&mut sig);
-            }
-            l.opacity.to_bits().hash(&mut sig);
-            l.blend.hash(&mut sig);
-            let mut grade = l.grade;
-            let mut stages = l.stages.clone();
+            let mut d = scene::layer_draw(l, paint);
             // While picking a key color, show that clip as the keyer sees it: no key and
             // no color changes, so the picked pixel is the real source color.
-            if self.picking_key == Some(l.clip.id) {
-                grade.flags = 0;
-                stages.clear();
+            if picking == Some(l.clip.id) {
+                d.grade.flags = 0;
+                d.stages.clear();
             }
-            stages.len().hash(&mut sig);
-            grade.flags.hash(&mut sig);
-            for v in grade.data.iter().flatten() {
-                v.to_bits().hash(&mut sig);
-            }
-            draws.push(DrawItem::Layer(LayerDraw { paint, grade, quad: l.quad, stages, opacity: l.opacity, blend: l.blend }));
+            Some(d)
+        });
+        self.waiting |= waiting;
+        for d in &draws {
+            d.hash_into(&mut sig);
         }
 
         // Free decoders, video textures, text masks and images that are gone.

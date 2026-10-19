@@ -24,6 +24,16 @@ Read README.md first for the folder layout.
   `Param::Grade(i)` (see `grade::idx`). `Grade::frame` packs it for the shader; flag bits skip unused
   parts. Shader order: source, chroma key, white balance, basic color stages, wheels, HSL.
   Layer uniforms are padded to `UNIFORM_STRIDE` (768); grow it if `LayerUniform` grows past that.
+- Transitions live on clip edges (`transition_in`, `transition_out`, see `core/transition.rs`).
+  `transition::track_at` decides what a track shows at a time; `transition::clip_span` is the range a clip
+  is drawn in (wider than the clip at cuts), so decoders must be opened for that range, not just the clip.
+  The compositor draws each side into its own texture and mixes them in `fs_transition`.
+- Motion blur is not a shader effect: `engine/scene.rs` rebuilds the stack below it at several times
+  (`SceneItem::Samples`). Video frames and text masks stay at the frame's own time; items identical in every
+  sample become the `prefix`, drawn once. Preview and export convert scenes with `scene::to_draws`, whose
+  callback can run several times per clip in one frame, so it must not re-decode or re-upload needlessly.
+- The preview skips rendering when `DrawItem::hash_into` (plus video frame times) is unchanged. New draw
+  settings must be hashed there.
 - Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when
   they merely round a displayed value, which during playback would create a keyframe every frame.
 - The UI changes the project only through `core::model::Project` methods or direct field edits.

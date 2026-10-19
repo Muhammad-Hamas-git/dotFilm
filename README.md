@@ -7,8 +7,15 @@ A desktop video editor written in Rust, rendered on the GPU.
   **New** makes solid colors, gradients (2 or 3 colors, any angle), text and effects.
 - **Text**: any installed font, bold/italic, alignment, size, line spacing, fill and outline color,
   outline width. Proper shaping for Arabic, Urdu and other complex scripts. All keyframeable.
-- **Effect layers**: Gaussian blur, vignette, film grain (new pattern every frame), chromatic aberration.
+- **Effect layers**: Gaussian blur, lens blur (round bokeh), radial (zoom) blur, spin blur, **motion blur**,
+  bloom, vignette, film grain (new pattern every frame), chromatic aberration, double exposure.
   An effect clip is its own layer on a track and changes everything on the tracks below it.
+  Motion blur blurs anything that moves by keyframes (position, scale, rotation...): it draws the layers
+  below at several moments within the shutter and averages them. Shutter angle and sample count are adjustable.
+- **Transitions**: crossfade, fade through black or white, wipe (any direction, soft edge), push and zoom,
+  with adjustable length and easing. Set them on a clip's start or end (Adjustments panel, or right-click
+  the clip). Between two touching clips the transition plays across the cut; on a free edge the clip
+  fades, wipes or pushes in from (or out to) what's below.
 - **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize it.
   Hit-testing follows the real 3D outline of rotated layers. Snaps to the frame center.
 - **Adjustments panel**: position, scale, opacity, **3D rotation (pitch, yaw, roll)**, brightness, contrast,
@@ -104,6 +111,7 @@ src/
     anim.rs            keyframes and easing curves
     content.rs         colors, gradients, text and effect settings of generated layers
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
+    transition.rs      transitions on clip edges and where they play on the timeline
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -122,7 +130,7 @@ src/
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector (+ grading), timeline, export_dialog
+  ui/                the window: app.rs, assets, player, inspector (+ grading, transitions), timeline, export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -169,6 +177,11 @@ Example: a new animatable parameter "blur radius".
 | Color wheel strength | `WHEEL_TINT`, `WHEEL_LUM` in `gpu/shaders.wgsl` |
 | Chroma key reach (how far similarity 1.0 goes) | `KEY_REACH` in `gpu/shaders.wgsl` |
 | Color wheel size, key color picker area | `WHEEL_SIZE` in `ui/grading.rs`, `PICK_RADIUS` in `engine/preview.rs` |
+| Transition default length, what counts as touching clips | `DEFAULT_DURATION`, `CUT_TOLERANCE` in `core/transition.rs` |
+| Transition length limit in the UI, timeline marker color | `MAX_DURATION`, `OVERLAY` in `ui/transitions.rs` |
+| Zoom transition strength | `ZOOM_AMOUNT` in `gpu/shaders.wgsl` |
+| Blur quality (taps per pass) | `BLUR_TAPS`, `BLOOM_TAPS`, `LENS_MIN_TAPS`, `LENS_MAX_TAPS`, `RADIAL_TAPS` in `gpu/shaders.wgsl` |
+| Most motion blur samples | `MAX_MOTION_SAMPLES` in `engine/scene.rs` (the slider range is in `core/content.rs`) |
 | Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
 | Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
@@ -179,4 +192,7 @@ Example: a new animatable parameter "blur radius".
 
 - Audio of each file is decoded fully into memory (about 11 MB per minute of audio).
 - The first proxy of a long 4K file takes a while to build; you can edit meanwhile (from the original).
+- Motion blur blurs keyframed movement only. Movement inside the footage itself (a car driving past in
+  the video) is not detected.
+- Transitions mix pictures only; audio at a cut stays a hard cut.
 - Odd frame sizes get one black pixel row/column on MP4 export (H.264 requires even sizes).

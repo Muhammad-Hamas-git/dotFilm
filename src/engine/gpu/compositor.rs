@@ -7,6 +7,7 @@ use crate::core::grade::GradeFrame;
 use crate::core::model::BlendMode;
 use crate::engine::color::Stage;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use wgpu::util::DeviceExt;
 
 /// Working format for accumulation: 16-bit float keeps blending and
@@ -14,8 +15,11 @@ use wgpu::util::DeviceExt;
 const WORK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Output for the preview and readback. egui expects gamma-encoded Rgba8Unorm.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-/// Most layers drawn in one frame.
-pub const MAX_LAYERS: usize = 64;
+/// Most shader passes with their own settings in one frame (motion blur multiplies
+/// the layers below it by its sample count).
+pub const MAX_SLOTS: usize = 4096;
+/// Uniform slots allocated up front; the buffer grows when a frame needs more.
+const INITIAL_SLOTS: usize = 64;
 /// Max color stages per layer (must match shaders.wgsl).
 const MAX_STAGES: usize = 4;
 /// Uniform slots are this far apart (dynamic offsets must be 256-aligned).
@@ -92,14 +96,119 @@ pub struct EffectDraw {
     pub seed: u32,
 }
 
+/// Two clips (or one, at a free edge) mixed by a transition, then put on the stack
+/// like a single layer.
+pub struct TransitionDraw {
+    pub from: Option<LayerDraw>,
+    pub to: Option<LayerDraw>,
+    /// TransitionKind::shader_id.
+    pub kind: u32,
+    /// 0..1, already eased.
+    pub progress: f32,
+    /// Direction for wipe and push, degrees (0 = left to right).
+    pub angle_deg: f32,
+    /// Soft edge for wipes, 0..1.
+    pub softness: f32,
+    /// 0 = between two clips, 1 = fading in (no `from`), 2 = fading out (no `to`).
+    pub edge: u32,
+    pub blend: BlendMode,
+}
+
 /// One item in the stack, bottom first.
 pub enum DrawItem {
     Layer(LayerDraw),
     Effect(EffectDraw),
+    Transition(TransitionDraw),
+    /// Motion blur: draws `prefix` once, then each list on top of it, and averages
+    /// the results. Replaces whatever was drawn before it, so it comes first.
+    Samples { prefix: Vec<DrawItem>, lists: Vec<Vec<DrawItem>> },
 }
 
-/// Effect id of the Gaussian blur (needs two passes).
+/// Effect ids that need two passes (separable blurs): Gaussian blur and bloom.
 const BLUR_ID: u32 = 0;
+const BLOOM_ID: u32 = 4;
+
+fn hash_f32s<'a>(v: impl IntoIterator<Item = &'a f32>, h: &mut impl Hasher) {
+    for x in v {
+        x.to_bits().hash(h);
+    }
+}
+
+impl LayerDraw {
+    fn hash_into(&self, h: &mut impl Hasher) {
+        match &self.paint {
+            Paint::Source(k) => (0u8, k).hash(h),
+            Paint::Gradient { colors, positions, count, angle_deg, size } => {
+                (1u8, count).hash(h);
+                hash_f32s(colors.iter().flatten().chain(positions).chain([angle_deg, &size.0, &size.1]), h);
+            }
+            Paint::Text { mask, fill, outline } => {
+                (2u8, mask).hash(h);
+                hash_f32s(fill.iter().chain(outline), h);
+            }
+        }
+        self.grade.flags.hash(h);
+        hash_f32s(self.grade.data.iter().flatten(), h);
+        hash_f32s(self.quad.pts.iter().flatten().chain(self.quad.w.iter()), h);
+        self.stages.len().hash(h);
+        hash_f32s(self.stages.iter().flatten().flatten(), h);
+        hash_f32s([&self.opacity], h);
+        self.blend.hash(h);
+    }
+}
+
+impl DrawItem {
+    /// Feeds everything that affects the picture into `h` (the preview skips
+    /// rendering when nothing changed). Uploaded texture contents are not included.
+    pub fn hash_into(&self, h: &mut impl Hasher) {
+        match self {
+            DrawItem::Layer(l) => {
+                0u8.hash(h);
+                l.hash_into(h);
+            }
+            DrawItem::Effect(e) => {
+                (1u8, e.kind, e.seed).hash(h);
+                hash_f32s(e.params.iter().chain([&e.opacity]), h);
+            }
+            DrawItem::Transition(t) => {
+                (2u8, t.kind, t.edge, t.blend).hash(h);
+                hash_f32s([&t.progress, &t.angle_deg, &t.softness], h);
+                for l in [&t.from, &t.to] {
+                    l.is_some().hash(h);
+                    if let Some(l) = l {
+                        l.hash_into(h);
+                    }
+                }
+            }
+            DrawItem::Samples { prefix, lists } => {
+                (3u8, prefix.len(), lists.len()).hash(h);
+                for i in prefix {
+                    i.hash_into(h);
+                }
+                for list in lists {
+                    list.len().hash(h);
+                    for i in list {
+                        i.hash_into(h);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A recorded GPU step; `slot` is the index of its settings in the uniform buffer.
+enum Op {
+    Clear,
+    Layer { slot: u32, src: Option<SourceKey>, normal: bool },
+    TwoPass { slot: u32 },
+    Effect { slot: u32 },
+    Transition { from: Option<(u32, Option<SourceKey>)>, to: Option<(u32, Option<SourceKey>)>, slot: u32, normal: bool },
+    BaseSave { slot: u32 },
+    BaseRestore { slot: u32 },
+    SumClear,
+    SumAdd { slot: u32 },
+    SumResolve { slot: u32 },
+}
 
 /// One layer to draw.
 pub struct LayerDraw {
@@ -117,6 +226,12 @@ struct Targets {
     height: u32,
     accum: [wgpu::TextureView; 2],
     layer: wgpu::TextureView,
+    /// Transition inputs (outgoing and incoming clip).
+    trans: [wgpu::TextureView; 2],
+    /// Motion blur running sum.
+    sum: wgpu::TextureView,
+    /// Motion blur: the part of the stack that's the same in every sample.
+    base: wgpu::TextureView,
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
     yuv: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -126,6 +241,11 @@ struct Targets {
     single_groups: [wgpu::BindGroup; 2],
     /// Output/yuv inputs: accum[i] + dims.
     out_groups: [wgpu::BindGroup; 2],
+    /// (trans[0], trans[1], sampler) for the transition pass.
+    trans_group: wgpu::BindGroup,
+    /// The motion blur sum + sampler.
+    sum_group: wgpu::BindGroup,
+    base_group: wgpu::BindGroup,
 }
 
 pub struct Compositor {
@@ -137,8 +257,15 @@ pub struct Compositor {
     blur_h: wgpu::RenderPipeline,
     blur_v: wgpu::RenderPipeline,
     effect: wgpu::RenderPipeline,
+    transition_over: wgpu::RenderPipeline,
+    transition_replace: wgpu::RenderPipeline,
+    sum_add: wgpu::RenderPipeline,
+    sum_copy: wgpu::RenderPipeline,
     output: wgpu::RenderPipeline,
     yuv: wgpu::RenderPipeline,
+    uniform_layout: wgpu::BindGroupLayout,
+    /// Uniform slots the buffer currently holds.
+    uniform_slots: usize,
     source_layout: wgpu::BindGroupLayout,
     pair_layout: wgpu::BindGroupLayout,
     single_layout: wgpu::BindGroupLayout,
@@ -303,27 +430,18 @@ impl Compositor {
         let blur_h = pipeline("blur h", &single_pl, "vs_full", "fs_blur_h", WORK_FORMAT, None, list);
         let blur_v = pipeline("blur v", &blend_layout, "vs_full", "fs_blur_v", WORK_FORMAT, None, list);
         let effect = pipeline("effect", &blend_layout, "vs_full", "fs_effect", WORK_FORMAT, None, list);
+        let transition_over = pipeline("transition over", &blend_layout, "vs_full", "fs_transition", WORK_FORMAT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), list);
+        let transition_replace = pipeline("transition", &blend_layout, "vs_full", "fs_transition", WORK_FORMAT, None, list);
+        let add = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+        };
+        let sum_add = pipeline("sum add", &single_pl, "vs_full", "fs_weighted", WORK_FORMAT, Some(add), list);
+        let sum_copy = pipeline("sum copy", &single_pl, "vs_full", "fs_weighted", WORK_FORMAT, None, list);
         let output = pipeline("output", &out_pl, "vs_full", "fs_output", OUTPUT_FORMAT, None, list);
         let yuv = pipeline("yuv", &out_pl, "vs_full", "fs_yuv", wgpu::TextureFormat::R8Unorm, None, list);
 
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("layer uniforms"),
-            size: UNIFORM_STRIDE * MAX_LAYERS as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("layer uniforms"),
-            layout: &uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniforms,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<LayerUniform>() as u64),
-                }),
-            }],
-        });
+        let (uniforms, uniform_group) = Self::make_uniforms(&device, &uniform_layout, INITIAL_SLOTS);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -355,8 +473,14 @@ impl Compositor {
             blur_h,
             blur_v,
             effect,
+            transition_over,
+            transition_replace,
+            sum_add,
+            sum_copy,
             output,
             yuv,
+            uniform_layout,
+            uniform_slots: INITIAL_SLOTS,
             source_layout,
             pair_layout,
             single_layout,
@@ -373,6 +497,28 @@ impl Compositor {
         }
     }
 
+    fn make_uniforms(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, slots: usize) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer uniforms"),
+            size: UNIFORM_STRIDE * slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer uniforms"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniforms,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<LayerUniform>() as u64),
+                }),
+            }],
+        });
+        (uniforms, group)
+    }
+
     fn make_targets(
         device: &wgpu::Device,
         pair_layout: &wgpu::BindGroupLayout,
@@ -387,6 +533,10 @@ impl Compositor {
         let a0 = texture(device, w, h, WORK_FORMAT, work, "accum 0").create_view(&Default::default());
         let a1 = texture(device, w, h, WORK_FORMAT, work, "accum 1").create_view(&Default::default());
         let layer = texture(device, w, h, WORK_FORMAT, work, "layer").create_view(&Default::default());
+        let t0 = texture(device, w, h, WORK_FORMAT, work, "transition from").create_view(&Default::default());
+        let t1 = texture(device, w, h, WORK_FORMAT, work, "transition to").create_view(&Default::default());
+        let sum = texture(device, w, h, WORK_FORMAT, work, "motion blur sum").create_view(&Default::default());
+        let base = texture(device, w, h, WORK_FORMAT, work, "motion blur base").create_view(&Default::default());
         let output = texture(device, w, h, OUTPUT_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | U::COPY_SRC, "output");
         let output_view = output.create_view(&Default::default());
         let yuv = (w % 2 == 0 && h % 2 == 0).then(|| {
@@ -399,6 +549,17 @@ impl Compositor {
             contents: bytemuck::bytes_of(&Dims { w, h, pad: [0; 2] }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        let pair2 = |a: &wgpu::TextureView, b: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blend inputs"),
+                layout: pair_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            })
+        };
         let pair = |a: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("blend inputs"),
@@ -433,7 +594,27 @@ impl Compositor {
         let blend_groups = [pair(&a0), pair(&a1)];
         let single_groups = [single(&a0), single(&a1)];
         let out_groups = [out(&a0), out(&a1)];
-        Targets { width: w, height: h, accum: [a0, a1], layer, output, output_view, yuv, blend_groups, single_groups, out_groups }
+        let trans_group = pair2(&t0, &t1);
+        let sum_group = single(&sum);
+        let base_group = single(&base);
+        Targets {
+            width: w,
+            height: h,
+            accum: [a0, a1],
+            layer,
+            trans: [t0, t1],
+            sum,
+            base,
+            output,
+            output_view,
+            yuv,
+            blend_groups,
+            single_groups,
+            out_groups,
+            trans_group,
+            sum_group,
+            base_group,
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -536,12 +717,9 @@ impl Compositor {
         }
     }
 
-    /// Can this item be drawn now? (Its picture may not be uploaded yet.)
-    fn drawable(&self, item: &DrawItem) -> bool {
-        match item {
-            DrawItem::Layer(l) => self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k)),
-            DrawItem::Effect(_) => true,
-        }
+    /// Can this layer be drawn now? (Its picture may not be uploaded yet.)
+    fn layer_ready(&self, l: &LayerDraw) -> bool {
+        self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k))
     }
 
     fn uniform_for(&self, layer: &LayerDraw) -> LayerUniform {
@@ -597,6 +775,12 @@ impl Compositor {
         }
     }
 
+    fn uniform_for_transition(&self, t: &TransitionDraw) -> LayerUniform {
+        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0 });
+        u.blend = t.blend.shader_id();
+        u
+    }
+
     fn uniform_for_effect(&self, e: &EffectDraw) -> LayerUniform {
         let (ow, oh) = self.size();
         let mut extra = [[0.0f32; 4]; 6];
@@ -618,83 +802,225 @@ impl Compositor {
         }
     }
 
+    /// Turns the stack into GPU steps and their settings.
+    fn plan(&self, items: &[DrawItem], u: &mut Vec<LayerUniform>, ops: &mut Vec<Op>) {
+        let slot = |u: &mut Vec<LayerUniform>, v: LayerUniform| {
+            u.push(v);
+            (u.len() - 1) as u32
+        };
+        for item in items {
+            if u.len() + 4 > MAX_SLOTS {
+                break;
+            }
+            match item {
+                DrawItem::Layer(l) => {
+                    if self.layer_ready(l) {
+                        let s = slot(u, self.uniform_for(l));
+                        ops.push(Op::Layer { slot: s, src: self.layer_source(l), normal: l.blend == BlendMode::Normal });
+                    }
+                }
+                DrawItem::Effect(e) => {
+                    let s = slot(u, self.uniform_for_effect(e));
+                    ops.push(if e.kind == BLUR_ID || e.kind == BLOOM_ID { Op::TwoPass { slot: s } } else { Op::Effect { slot: s } });
+                }
+                DrawItem::Transition(t) => {
+                    let side = |l: &Option<LayerDraw>, u: &mut Vec<LayerUniform>| {
+                        l.as_ref().filter(|l| self.layer_ready(l)).map(|l| {
+                            // Each side is drawn on its own; the track blend mode applies to the mix.
+                            let mut v = self.uniform_for(l);
+                            v.blend = 0;
+                            (slot(u, v), self.layer_source(l))
+                        })
+                    };
+                    let from = side(&t.from, u);
+                    let to = side(&t.to, u);
+                    if from.is_none() && to.is_none() {
+                        continue;
+                    }
+                    let s = slot(u, self.uniform_for_transition(t));
+                    ops.push(Op::Transition { from, to, slot: s, normal: t.blend == BlendMode::Normal });
+                }
+                DrawItem::Samples { prefix, lists } => {
+                    if lists.is_empty() {
+                        continue;
+                    }
+                    let weight = 1.0 / lists.len() as f32;
+                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0 });
+                    let add = slot(u, w);
+                    w.opacity = 1.0;
+                    let copy = slot(u, w);
+                    // Samples never nest (the scene keeps only the outermost motion blur).
+                    let nested = |i: &&DrawItem| matches!(i, DrawItem::Samples { .. });
+                    ops.push(Op::Clear);
+                    for i in prefix.iter().filter(|i| !nested(i)) {
+                        self.plan(std::slice::from_ref(i), u, ops);
+                    }
+                    ops.push(Op::BaseSave { slot: copy });
+                    ops.push(Op::SumClear);
+                    for list in lists {
+                        ops.push(Op::BaseRestore { slot: copy });
+                        for i in list.iter().filter(|i| !nested(i)) {
+                            self.plan(std::slice::from_ref(i), u, ops);
+                        }
+                        ops.push(Op::SumAdd { slot: add });
+                    }
+                    ops.push(Op::SumResolve { slot: copy });
+                }
+            }
+        }
+    }
+
     /// Draws the stack (bottom first) and fills the 8-bit output texture.
     /// Layers whose picture hasn't been uploaded yet are skipped.
     pub fn render(&mut self, items: &[DrawItem]) {
-        let items: Vec<&DrawItem> = items.iter().filter(|i| self.drawable(i)).take(MAX_LAYERS).collect();
+        let mut uniforms = Vec::new();
+        let mut ops = vec![Op::Clear];
+        self.plan(items, &mut uniforms, &mut ops);
 
-        // All uniforms in one upload; each draw picks its slot with a dynamic offset.
-        let mut data = vec![0u8; UNIFORM_STRIDE as usize * items.len().max(1)];
-        for (i, item) in items.iter().enumerate() {
-            let u = match item {
-                DrawItem::Layer(l) => self.uniform_for(l),
-                DrawItem::Effect(e) => self.uniform_for_effect(e),
-            };
+        // All settings in one upload; each pass picks its slot with a dynamic offset.
+        if uniforms.len() > self.uniform_slots {
+            let slots = uniforms.len().next_power_of_two();
+            let (b, g) = Self::make_uniforms(&self.device, &self.uniform_layout, slots);
+            self.uniforms = b;
+            self.uniform_group = g;
+            self.uniform_slots = slots;
+        }
+        let mut data = vec![0u8; UNIFORM_STRIDE as usize * uniforms.len().max(1)];
+        for (i, v) in uniforms.iter().enumerate() {
             let off = i * UNIFORM_STRIDE as usize;
-            data[off..off + std::mem::size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
+            data[off..off + std::mem::size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(v));
         }
         self.queue.write_buffer(&self.uniforms, 0, &data);
 
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let t = &self.targets;
         let mut cur = 0usize;
-        drop(begin_pass(&mut enc, "clear", &t.accum[0], wgpu::LoadOp::Clear(wgpu::Color::BLACK)));
+        let offset = |slot: u32| (slot as u64 * UNIFORM_STRIDE) as u32;
+        let source_group = |src: Option<SourceKey>| match src {
+            Some(k) => &self.sources[&k].bind_group,
+            None => &self.blank_source,
+        };
+        let clear_clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
 
-        for (i, item) in items.iter().enumerate() {
-            let offset = (i as u64 * UNIFORM_STRIDE) as u32;
-            match item {
-                DrawItem::Layer(l) => {
-                    let group = match self.layer_source(l) {
-                        Some(k) => &self.sources[&k].bind_group,
-                        None => &self.blank_source,
-                    };
-                    if l.blend == BlendMode::Normal {
+        for op in &ops {
+            match *op {
+                Op::Clear => {
+                    drop(begin_pass(&mut enc, "clear", &t.accum[cur], wgpu::LoadOp::Clear(wgpu::Color::BLACK)));
+                }
+                Op::Layer { slot, src, normal } => {
+                    if normal {
                         let mut pass = begin_pass(&mut enc, "layer", &t.accum[cur], wgpu::LoadOp::Load);
                         pass.set_pipeline(&self.layer_over);
-                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                        pass.set_bind_group(1, group, &[]);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                        pass.set_bind_group(1, source_group(src), &[]);
                         pass.draw(0..4, 0..1);
                     } else {
                         {
-                            let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
-                            let mut pass = begin_pass(&mut enc, "layer to tex", &t.layer, clear);
+                            let mut pass = begin_pass(&mut enc, "layer to tex", &t.layer, clear_clear);
                             pass.set_pipeline(&self.layer_replace);
-                            pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                            pass.set_bind_group(1, group, &[]);
+                            pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                            pass.set_bind_group(1, source_group(src), &[]);
                             pass.draw(0..4, 0..1);
                         }
                         let mut pass = begin_pass(&mut enc, "blend", &t.accum[1 - cur], wgpu::LoadOp::Load);
                         pass.set_pipeline(&self.blend);
-                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
                         pass.set_bind_group(1, &t.blend_groups[cur], &[]);
                         pass.draw(0..3, 0..1);
                         drop(pass);
                         cur = 1 - cur;
                     }
                 }
-                DrawItem::Effect(e) => {
-                    if e.kind == BLUR_ID {
-                        // Horizontal pass into `layer`, vertical pass into the other accum.
-                        {
-                            let mut pass = begin_pass(&mut enc, "blur h", &t.layer, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-                            pass.set_pipeline(&self.blur_h);
-                            pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                            pass.set_bind_group(1, &t.single_groups[cur], &[]);
-                            pass.draw(0..3, 0..1);
-                        }
-                        let mut pass = begin_pass(&mut enc, "blur v", &t.accum[1 - cur], wgpu::LoadOp::Load);
-                        pass.set_pipeline(&self.blur_v);
-                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
-                        pass.draw(0..3, 0..1);
-                    } else {
-                        let mut pass = begin_pass(&mut enc, "effect", &t.accum[1 - cur], wgpu::LoadOp::Load);
-                        pass.set_pipeline(&self.effect);
-                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                Op::TwoPass { slot } => {
+                    // Horizontal pass into `layer`, vertical pass into the other accum.
+                    {
+                        let mut pass = begin_pass(&mut enc, "blur h", &t.layer, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+                        pass.set_pipeline(&self.blur_h);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                        pass.set_bind_group(1, &t.single_groups[cur], &[]);
                         pass.draw(0..3, 0..1);
                     }
+                    let mut pass = begin_pass(&mut enc, "blur v", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.blur_v);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                    pass.draw(0..3, 0..1);
+                    drop(pass);
                     cur = 1 - cur;
+                }
+                Op::Effect { slot } => {
+                    let mut pass = begin_pass(&mut enc, "effect", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.effect);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                    pass.draw(0..3, 0..1);
+                    drop(pass);
+                    cur = 1 - cur;
+                }
+                Op::Transition { from, to, slot, normal } => {
+                    // Each side into its own texture (empty if missing), then mix.
+                    for (i, side) in [from, to].into_iter().enumerate() {
+                        let mut pass = begin_pass(&mut enc, "transition side", &t.trans[i], clear_clear);
+                        if let Some((s, src)) = side {
+                            pass.set_pipeline(&self.layer_replace);
+                            pass.set_bind_group(0, &self.uniform_group, &[offset(s)]);
+                            pass.set_bind_group(1, source_group(src), &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
+                    if normal {
+                        let mut pass = begin_pass(&mut enc, "transition", &t.accum[cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.transition_over);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                        pass.set_bind_group(1, &t.trans_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    } else {
+                        {
+                            let mut pass = begin_pass(&mut enc, "transition to tex", &t.layer, clear_clear);
+                            pass.set_pipeline(&self.transition_replace);
+                            pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                            pass.set_bind_group(1, &t.trans_group, &[]);
+                            pass.draw(0..3, 0..1);
+                        }
+                        let mut pass = begin_pass(&mut enc, "blend", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.blend);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                        pass.draw(0..3, 0..1);
+                        drop(pass);
+                        cur = 1 - cur;
+                    }
+                }
+                Op::BaseSave { slot } => {
+                    let mut pass = begin_pass(&mut enc, "base save", &t.base, wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.sum_copy);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.single_groups[cur], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                Op::BaseRestore { slot } => {
+                    let mut pass = begin_pass(&mut enc, "base restore", &t.accum[cur], wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.sum_copy);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.base_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                Op::SumClear => {
+                    drop(begin_pass(&mut enc, "sum clear", &t.sum, clear_clear));
+                }
+                Op::SumAdd { slot } => {
+                    let mut pass = begin_pass(&mut enc, "sum add", &t.sum, wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.sum_add);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.single_groups[cur], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                Op::SumResolve { slot } => {
+                    let mut pass = begin_pass(&mut enc, "sum resolve", &t.accum[cur], wgpu::LoadOp::Load);
+                    pass.set_pipeline(&self.sum_copy);
+                    pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
+                    pass.set_bind_group(1, &t.sum_group, &[]);
+                    pass.draw(0..3, 0..1);
                 }
             }
         }

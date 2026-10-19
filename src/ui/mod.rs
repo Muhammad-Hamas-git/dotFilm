@@ -6,3 +6,4 @@ pub mod grading;
 pub mod inspector;
 pub mod player;
 pub mod timeline;
+pub mod transitions;

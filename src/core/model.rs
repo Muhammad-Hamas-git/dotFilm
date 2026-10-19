@@ -4,6 +4,7 @@
 use super::anim::Anim;
 use super::content::Content;
 use super::grade::{self, Grade};
+use super::transition::Transition;
 use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -326,6 +327,12 @@ pub struct Clip {
     /// White balance, color wheels, HSL per color, chroma key.
     #[serde(default, skip_serializing_if = "Grade::is_default")]
     pub grade: Grade,
+    /// Transition at the clip's start (see core/transition.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_in: Option<Transition>,
+    /// Transition at the clip's end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_out: Option<Transition>,
 }
 
 /// Slowest allowed speed (keeps the time math well behaved).
@@ -729,6 +736,8 @@ impl Project {
             speed_affects_pitch: false,
             content: asset.generator.clone(),
             grade: Grade::default(),
+            transition_in: None,
+            transition_out: None,
         });
         Some(id)
     }
@@ -767,7 +776,11 @@ impl Project {
         // trim_start shifts keyframes and source position, so the right half
         // continues exactly where the left half stops.
         right.trim_start(left_len);
-        self.clip_mut(id)?.duration = left_len;
+        // The cut between the halves has no transition; each half keeps its outer one.
+        right.transition_in = None;
+        let left = self.clip_mut(id)?;
+        left.duration = left_len;
+        left.transition_out = None;
         self.clips.push(right);
         Some(new_id)
     }
@@ -842,6 +855,18 @@ fn scale_anim(a: &mut Anim, k: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_keeps_outer_transitions() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        let tr = Transition::new(crate::core::transition::TransitionKind::Crossfade);
+        p.clip_mut(c).unwrap().transition_in = Some(tr);
+        p.clip_mut(c).unwrap().transition_out = Some(tr);
+        let r = p.split(c, 4.0).unwrap();
+        assert!(p.clip(c).unwrap().transition_in.is_some() && p.clip(c).unwrap().transition_out.is_none());
+        assert!(p.clip(r).unwrap().transition_in.is_none() && p.clip(r).unwrap().transition_out.is_some());
+    }
 
     fn project_with_video() -> (Project, AssetId) {
         let mut p = Project::default();
@@ -990,5 +1015,25 @@ mod tests {
         assert_eq!(p.version, PROJECT_VERSION);
         assert_eq!(p.tracks[1].name, "Top");
         assert_eq!(p.clips[0].track, 1);
+    }
+}
+
+#[cfg(test)]
+impl Asset {
+    /// A plain asset for tests (no file behind it).
+    pub fn test_asset(kind: AssetKind) -> Asset {
+        Asset {
+            id: AssetId(0),
+            path: "test".into(),
+            name: "test".into(),
+            kind,
+            duration: if kind.is_timed() { 10.0 } else { 0.0 },
+            width: 1280,
+            height: 720,
+            has_audio: false,
+            codec: String::new(),
+            color: Default::default(),
+            generator: None,
+        }
     }
 }

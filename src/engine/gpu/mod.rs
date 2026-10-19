@@ -42,7 +42,7 @@ pub fn headless() -> Result<Gpu, String> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey};
+    use super::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey, TransitionDraw};
     use crate::core::geometry::{self, Placement};
     use crate::core::model::{Adjustments, BlendMode};
     use crate::core::grade::GradeFrame;
@@ -387,5 +387,155 @@ pub mod tests {
         gr.values[idx::wheel(2, 1) as usize].value = 0.8;
         let hi = graded(&mut c, [200, 200, 200, 255], &gr);
         assert!(hi[2] > hi[0] + 20, "highlights tinted blue: {hi:?}");
+    }
+
+    fn layer_draw(key: SourceKey, quad: geometry::Quad) -> LayerDraw {
+        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }
+    }
+
+    fn transition(from: Option<LayerDraw>, to: Option<LayerDraw>, kind: u32, progress: f32, angle_deg: f32, edge: u32) -> DrawItem {
+        DrawItem::Transition(TransitionDraw { from, to, kind, progress, angle_deg, softness: 0.0, edge, blend: BlendMode::Normal })
+    }
+
+    #[test]
+    fn transitions_mix_two_clips() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 32u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (red, blue, green) = (SourceKey::Asset(1), SourceKey::Asset(2), SourceKey::Asset(3));
+        solid(&mut c, red, [200, 0, 0, 255]);
+        solid(&mut c, blue, [0, 0, 200, 255]);
+        solid(&mut c, green, [0, 200, 0, 255]);
+        let q = full_frame(w as f32, h as f32);
+        let mut at = |items: &[DrawItem], x: u32| {
+            c.render(items);
+            px(&c.read_rgba(), w, x, 16)
+        };
+        // Crossfade halfway.
+        let mid = at(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 0, 0.5, 0.0, 0)], 32);
+        assert!(close(&mid, [100, 0, 100], 2), "crossfade {mid:?}");
+        // Wipe left to right, halfway: left shows the new clip, right the old one.
+        let wipe = [transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 3, 0.5, 0.0, 0)];
+        assert!(close(&at(&wipe, 8), [0, 0, 200], 2) && close(&at(&wipe, 56), [200, 0, 0], 2));
+        // Fade through black: black in the middle, the new clip at the end.
+        assert!(close(&at(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 1, 0.5, 0.0, 0)], 32), [0, 0, 0], 2));
+        assert!(close(&at(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 1, 1.0, 0.0, 0)], 32), [0, 0, 200], 2));
+        // Fade through white at a quarter: red halfway to white.
+        let white = at(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 2, 0.25, 0.0, 0)], 32);
+        assert!(close(&white, [228, 128, 128], 3), "fade to white {white:?}");
+        // A clip crossfading in over a lower track shows the track through.
+        let fade_in = at(&[layer(green, q, BlendMode::Normal, 1.0), transition(None, Some(layer_draw(blue, q)), 0, 0.25, 0.0, 1)], 32);
+        assert!(close(&fade_in, [0, 150, 50], 2), "fade in {fade_in:?}");
+        // Push left to right, halfway: the new clip fills the left half.
+        let push = [transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 4, 0.5, 0.0, 0)];
+        assert!(close(&at(&push, 8), [0, 0, 200], 2) && close(&at(&push, 56), [200, 0, 0], 2));
+        // A non-normal track blend mode applies to the mixed result.
+        let mul = DrawItem::Transition(TransitionDraw {
+            from: Some(layer_draw(red, q)),
+            to: Some(layer_draw(blue, q)),
+            kind: 0,
+            progress: 0.0,
+            angle_deg: 0.0,
+            softness: 0.0,
+            edge: 0,
+            blend: BlendMode::Multiply,
+        });
+        let m = at(&[layer(green, q, BlendMode::Normal, 1.0), mul], 32);
+        assert!(close(&m, [0, 0, 0], 2), "red multiplied with green is black: {m:?}");
+    }
+
+    #[test]
+    fn motion_blur_samples_are_averaged() {
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 16, 16);
+        let (red, blue) = (SourceKey::Asset(1), SourceKey::Asset(2));
+        solid(&mut c, red, [200, 0, 0, 255]);
+        solid(&mut c, blue, [0, 0, 200, 255]);
+        let q = full_frame(16.0, 16.0);
+        let samples = DrawItem::Samples {
+            prefix: vec![],
+            lists: vec![
+                vec![layer(red, q, BlendMode::Normal, 1.0)],
+                vec![layer(blue, q, BlendMode::Normal, 1.0)],
+                vec![layer(blue, q, BlendMode::Normal, 1.0)],
+                vec![layer(blue, q, BlendMode::Normal, 1.0)],
+            ],
+        };
+        // Layers above the samples are drawn normally on top.
+        let half = geometry::project(&Placement { cx: 4.0, cy: 8.0, width: 8.0, height: 16.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, 16.0, 16.0);
+        c.render(&[samples, layer(red, half, BlendMode::Normal, 1.0)]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, 16, 12, 8), [50, 0, 150], 2), "average {:?}", px(&img, 16, 12, 8));
+        assert!(close(&px(&img, 16, 2, 8), [200, 0, 0], 2));
+
+        // A shared prefix is drawn once under every sample: a half-opaque red layer
+        // over a blue prefix averages the same as drawing blue in each sample.
+        let with_prefix = DrawItem::Samples {
+            prefix: vec![layer(blue, q, BlendMode::Normal, 1.0)],
+            lists: vec![vec![layer(red, q, BlendMode::Normal, 0.5)], vec![]],
+        };
+        c.render(&[with_prefix]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, 16, 8, 8), [50, 0, 150], 2), "prefix {:?}", px(&img, 16, 8, 8));
+    }
+
+    #[test]
+    fn new_effects_do_what_they_say() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (white, black) = (SourceKey::Asset(1), SourceKey::Asset(2));
+        solid(&mut c, white, [255, 255, 255, 255]);
+        solid(&mut c, black, [0, 0, 0, 255]);
+        let q = full_frame(w as f32, h as f32);
+        let square = geometry::project(&Placement { cx: 32.0, cy: 32.0, width: 8.0, height: 8.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        let base = [layer(black, q, BlendMode::Normal, 1.0), layer(white, square, BlendMode::Normal, 1.0)];
+        let run = |c: &mut Compositor, extra: Option<DrawItem>| {
+            let mut items: Vec<DrawItem> = base.iter().map(|d| match d {
+                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+                _ => unreachable!(),
+            }).collect();
+            items.extend(extra);
+            c.render(&items);
+            c.read_rgba()
+        };
+        let plain = run(&mut c, None);
+        assert_eq!(px(&plain, w, 44, 32)[0], 0);
+
+        // Bloom: glow around the bright square, square stays white, far corner stays dark.
+        let bloom = run(&mut c, Some(effect(4, [0.5, 1.0, 16.0, 0.2], 0)));
+        assert!(px(&bloom, w, 42, 32)[0] > 15, "glow {:?}", px(&bloom, w, 42, 32));
+        assert!(px(&bloom, w, 32, 32)[0] == 255);
+        assert!(px(&bloom, w, 2, 2)[0] < 3);
+        // Below the threshold nothing glows.
+        let gray = SourceKey::Asset(3);
+        solid(&mut c, gray, [100, 100, 100, 255]);
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), effect(4, [0.7, 1.0, 16.0, 0.0], 0)]);
+        assert!(close(&px(&c.read_rgba(), w, 32, 32), [100, 100, 100], 1));
+
+        // Lens blur spreads the square into a disc of about the radius.
+        let lens = run(&mut c, Some(effect(5, [10.0, 0.0, 0.0, 0.0], 0)));
+        assert!(px(&lens, w, 40, 32)[0] > 10, "lens blur reaches out {:?}", px(&lens, w, 40, 32));
+        assert!(px(&lens, w, 50, 32)[0] < 3, "not past its radius {:?}", px(&lens, w, 50, 32));
+
+        // Radial blur leaves the center alone and streaks outward only.
+        let radial = run(&mut c, Some(effect(6, [0.6, 0.5, 0.5, 0.0], 0)));
+        assert!(px(&radial, w, 32, 32)[0] > 250);
+        assert!(px(&radial, w, 41, 32)[0] > 5, "streak outward {:?}", px(&radial, w, 41, 32));
+        assert!(px(&radial, w, 32, 41)[0] > 5, "streak down {:?}", px(&radial, w, 32, 41));
+        assert!(px(&radial, w, 41, 41)[0] > 0 || px(&radial, w, 44, 44)[0] < 5);
+
+        // Spin blur smears around the center, not outward.
+        let off = geometry::project(&Placement { cx: 48.0, cy: 32.0, width: 6.0, height: 6.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        c.render(&[layer(black, q, BlendMode::Normal, 1.0), layer(white, off, BlendMode::Normal, 1.0), effect(7, [40.0, 0.5, 0.5, 0.0], 0)]);
+        let spin = c.read_rgba();
+        assert!(px(&spin, w, 47, 36)[0] > 30, "smeared along the circle {:?}", px(&spin, w, 47, 36));
+        assert!(px(&spin, w, 58, 32)[0] < 3, "not outward {:?}", px(&spin, w, 58, 32));
+
+        // Double exposure: a screened copy 16 px to the right.
+        let double = run(&mut c, Some(effect(8, [16.0, 0.0, 1.0, 1.0], 0)));
+        assert!(px(&double, w, 48, 32)[0] > 250, "copy {:?}", px(&double, w, 48, 32));
+        assert!(px(&double, w, 32, 32)[0] > 250, "original kept");
+        assert_eq!(px(&double, w, 40, 32)[0], 0);
     }
 }

@@ -424,6 +424,9 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
             app.paste(None);
             ui.close();
         }
+        if let Some(id) = app.selected {
+            super::transitions::menu(ui, &mut app.project, &mut app.history, id);
+        }
         let has_keys = app.selected.and_then(|id| app.project.clip(id)).is_some_and(|c| !c.keyframe_times(1e-9).is_empty());
         if has_keys {
             ui.separator();
@@ -624,6 +627,7 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             clipped.add(egui::Shape::convex_polygon(pts, fill, stroke));
         }
     }
+    super::transitions::draw_overlays(&app.project, &painter.with_clip_rect(lanes), &|track, a, b| clip_rect(view, lanes, n, track, a, b));
     let _ = ui;
 }
 
