@@ -2,8 +2,9 @@
 
 use super::{assets, export_dialog::ExportDialog, inspector, player, timeline};
 use crate::core::history::History;
-use crate::core::model::{Asset, AssetId, AssetKind, ClipId, Project};
-use crate::engine::audio::{AudioClip, AudioOut};
+use crate::core::model::{Asset, AssetId, AssetKind, Clip, ClipId, Project};
+use crate::engine::audio::{audio_clip, AudioOut};
+use crate::engine::stretch::{self, StretchCache};
 use crate::engine::preview::PreviewRenderer;
 use crate::media::cache::{Loaded, MediaCache};
 use crate::media::ffmpeg;
@@ -19,6 +20,8 @@ use std::time::{Duration, Instant};
 pub const PROJECT_EXT: &str = "dotfilm";
 /// Project files from before the rename still open.
 pub const OLD_PROJECT_EXT: &str = "cutroom";
+/// Marks clip data on the system clipboard.
+const CLIP_CLIPBOARD_PREFIX: &str = "dotfilm-clip:";
 
 pub struct EditorApp {
     pub project: Project,
@@ -26,6 +29,9 @@ pub struct EditorApp {
     pub media: MediaCache,
     pub preview: PreviewRenderer,
     pub proxies: Proxies,
+    pub stretch: StretchCache,
+    /// Last copied clip (also on the system clipboard as text).
+    pub clipboard: Option<Clip>,
     /// Encoders that work on this PC (filled in by a background check at startup).
     pub encoders: Arc<Mutex<Vec<Encoder>>>,
     pub audio: AudioOut,
@@ -56,6 +62,8 @@ impl EditorApp {
             media: MediaCache::new(ctx.clone()),
             preview: PreviewRenderer::new(cc.wgpu_render_state.as_ref()),
             proxies: Proxies::new(ctx.clone()),
+            stretch: StretchCache::new(ctx.clone()),
+            clipboard: None,
             encoders: Arc::new(Mutex::new(vec![Encoder::X264])),
             audio: AudioOut::new(),
             playhead: 0.0,
@@ -297,6 +305,17 @@ impl EditorApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        // Ctrl+C / X / V arrive as clipboard events, not key presses.
+        let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        for e in events {
+            match e {
+                egui::Event::Copy => self.copy_selected(ctx),
+                egui::Event::Cut => self.cut_selected(ctx),
+                egui::Event::Paste(text) => self.paste(Some(&text)),
+                egui::Event::PasteImage(_) => self.paste(None),
+                _ => {}
+            }
+        }
         let cmd = Modifiers::COMMAND;
         let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
         let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -379,36 +398,74 @@ impl EditorApp {
     fn sync_audio(&mut self) {
         let mut h = DefaultHasher::new();
         for c in &self.project.clips {
-            (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.volume.value.to_bits()).hash(&mut h);
-            for k in &c.volume.keys {
-                (k.t.to_bits(), k.v.to_bits()).hash(&mut h);
+            (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.speed_affects_pitch).hash(&mut h);
+            for a in [&c.volume, &c.speed] {
+                a.value.to_bits().hash(&mut h);
+                for k in &a.keys {
+                    (k.t.to_bits(), k.v.to_bits(), format!("{:?}", k.ease)).hash(&mut h);
+                }
             }
         }
         for t in &self.project.tracks {
             t.muted.hash(&mut h);
         }
         self.media.audio.len().hash(&mut h);
+        self.stretch.generation().hash(&mut h);
         let sig = h.finish();
         if sig == self.audio_signature {
             return;
         }
         self.audio_signature = sig;
-        let clips = self
-            .project
-            .clips
-            .iter()
-            .filter(|c| self.project.tracks.get(c.track).is_some_and(|t| !t.muted))
-            .filter_map(|c| {
-                Some(AudioClip {
-                    start: c.start,
-                    source_in: c.source_in,
-                    duration: c.duration,
-                    volume: c.volume.clone(),
-                    pcm: self.media.audio.get(&c.asset)?.clone(),
-                })
-            })
-            .collect();
+        let mut clips = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for c in &self.project.clips {
+            if !self.project.tracks.get(c.track).is_some_and(|t| !t.muted) {
+                continue;
+            }
+            let Some(pcm) = self.media.audio.get(&c.asset).cloned() else { continue };
+            // Pitch-kept audio is made in the background; until then play the direct version.
+            let stretched = if stretch::needed(c) {
+                keys.insert(stretch::key(c));
+                self.stretch.get(c, &pcm)
+            } else {
+                None
+            };
+            clips.push(audio_clip(c, pcm, stretched));
+        }
+        self.stretch.retain(&keys);
         self.audio.set_clips(clips);
+    }
+
+    // ---------- clipboard ----------
+
+    /// Copies the selected clip. The clip goes on the system clipboard too, so
+    /// Ctrl+V always works (and works between projects that share media).
+    pub fn copy_selected(&mut self, ctx: &egui::Context) {
+        if let Some(c) = self.selected.and_then(|id| self.project.clip(id)) {
+            if let Ok(json) = serde_json::to_string(c) {
+                ctx.copy_text(format!("{CLIP_CLIPBOARD_PREFIX}{json}"));
+                self.clipboard = Some(c.clone());
+            }
+        }
+    }
+
+    pub fn cut_selected(&mut self, ctx: &egui::Context) {
+        self.copy_selected(ctx);
+        self.delete_selected();
+    }
+
+    /// Pastes at the playhead: same track if free, otherwise the next free track above.
+    pub fn paste(&mut self, text: Option<&str>) {
+        let from_text = text.and_then(|t| t.strip_prefix(CLIP_CLIPBOARD_PREFIX)).and_then(|j| serde_json::from_str::<Clip>(j).ok());
+        let Some(template) = from_text.or_else(|| self.clipboard.clone()) else { return };
+        if self.project.asset(template.asset).is_none() {
+            self.set_status("The copied clip's media isn't in this project.");
+            return;
+        }
+        self.history.checkpoint(&self.project);
+        if let Some(id) = self.project.paste_clip(&template, self.playhead) {
+            self.selected = Some(id);
+        }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -462,6 +519,16 @@ impl EditorApp {
                 if ui.add_enabled(self.selected.is_some(), egui::Button::new("Delete clip     Del")).clicked() {
                     self.delete_selected();
                 }
+                ui.separator();
+                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Copy     Ctrl+C")).clicked() {
+                    self.copy_selected(&ui.ctx().clone());
+                }
+                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Cut      Ctrl+X")).clicked() {
+                    self.cut_selected(&ui.ctx().clone());
+                }
+                if ui.add_enabled(self.clipboard.is_some(), egui::Button::new("Paste    Ctrl+V")).clicked() {
+                    self.paste(None);
+                }
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts").clicked() {
@@ -494,6 +561,7 @@ impl EditorApp {
                     ("Home / End", "Go to start / end"),
                     ("S", "Split at playhead"),
                     ("Delete", "Delete selected clip"),
+                    ("Ctrl + C / X / V", "Copy / cut / paste clip (pastes at the playhead)"),
                     ("Ctrl + Z / Ctrl + Y", "Undo / redo"),
                     ("+ / -", "Zoom timeline"),
                     ("Ctrl + mouse wheel", "Zoom timeline at cursor"),

@@ -2,7 +2,8 @@
 //! converts it to YUV on the GPU, and streams it into ffmpeg for encoding.
 //! Audio is mixed by the same mixer the preview plays through.
 
-use super::audio::{mix_clips, AudioClip};
+use super::audio::{audio_clip, mix_clips};
+use super::stretch;
 use super::gpu::{self, compositor::{Compositor, LayerDraw, SourceKey}};
 use super::scene;
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
@@ -249,7 +250,7 @@ pub fn run(
         if detail.is_empty() { msg } else { format!("{msg}\n{detail}") }
     };
 
-    let mut streams: HashMap<ClipId, SequentialStream> = HashMap::new();
+    let mut streams: HashMap<ClipId, (SequentialStream, f64)> = HashMap::new();
     let mut images: HashSet<AssetId> = HashSet::new();
     let started = Instant::now();
 
@@ -266,8 +267,9 @@ pub fn run(
             }
             let Some(asset) = project.asset(clip.asset).filter(|a| a.kind == AssetKind::Video) else { continue };
             let (dw, dh) = scene::decode_size(project, asset, clip, 1.0, (asset.width.max(2), asset.height.max(2)));
-            let s = SequentialStream::open(&asset.path, clip.source_in, dw, dh, fps, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
-            streams.insert(clip.id, s);
+            let rate = clip.decode_rate(fps);
+            let s = SequentialStream::open(&asset.path, clip.source_in, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
+            streams.insert(clip.id, (s, rate));
         }
 
         let layers = scene::layers_at(project, t);
@@ -275,8 +277,8 @@ pub fn run(
         for l in &layers {
             let key = match l.asset.kind {
                 AssetKind::Video => {
-                    let Some(stream) = streams.get_mut(&l.clip.id) else { continue };
-                    let index = ((t - l.clip.start) * fps as f64).round().max(0.0) as u64;
+                    let Some((stream, rate)) = streams.get_mut(&l.clip.id) else { continue };
+                    let index = ((l.source_time - l.clip.source_in) * *rate).round().max(0.0) as u64;
                     let (sw, sh) = (stream.width, stream.height);
                     let Some(frame) = stream.frame(index) else { continue };
                     let key = SourceKey::Clip(l.clip.id.0);
@@ -347,7 +349,8 @@ fn write_mix(project: &Project, audio: &HashMap<AssetId, Arc<Vec<i16>>>, total: 
                 p
             }
         };
-        clips.push(AudioClip { start: c.start, source_in: c.source_in, duration: c.duration, volume: c.volume.clone(), pcm });
+        let stretched = stretch::needed(c).then(|| Arc::new(stretch::stretch(&pcm, c)));
+        clips.push(audio_clip(c, pcm, stretched));
     }
 
     let frames = (total * rate as f64).ceil() as u64;
@@ -512,7 +515,7 @@ mod tests {
             .unwrap();
         eprintln!("DIAG source tags: {}", String::from_utf8_lossy(&tags.stdout).trim());
         for hw in [false, true] {
-            let mut s = SequentialStream::open(&src, 0.0, 64, 36, 30, false, hw).unwrap();
+            let mut s = SequentialStream::open(&src, 0.0, 64, 36, 30.0, false, hw).unwrap();
             let f = s.frame(3).unwrap();
             let (y, u, v) = (f[64 * 18 + 32], f[64 * 36 + 10], f[64 * 36 + 32 * 18 + 10]);
             eprintln!("DIAG decoded yuv hwaccel={hw}: Y={y} U={u} V={v} (source is about 100 180 98)");
@@ -541,6 +544,40 @@ mod tests {
             .unwrap();
         eprintln!("DIAG export tags: {}", String::from_utf8_lossy(&tags.stdout).trim());
         eprintln!("DIAG export read implicit: {:?} explicit709: {:?} (expect about [51, 102, 204])", pixel_at(&out, 0.5, 320, 180), explicit(&out));
+    }
+
+    #[test]
+    fn speed_changes_which_frames_are_used() {
+        if !ffmpeg::available() || crate::engine::gpu::tests::gpu().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("dotfilm_export_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("red_then_blue.mp4");
+        let ok = ffmpeg::command("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=320x180:r=30:d=2", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=30:d=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4"])
+            .args(["-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut p = Project::default();
+        p.set_resolution(320, 180);
+        let a = add_asset(&mut p, &src, 4.0, 320, 180, true);
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        let clip = p.clip_mut(c).unwrap();
+        clip.speed.value = 2.0;
+        clip.duration = 2.0;
+        let out = dir.join("speed.mp4");
+        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        let (d, _, _) = probe_size(&out);
+        assert!((d - 2.0).abs() < 0.1, "duration {d}");
+        let early = pixel_at(&out, 0.5, 160, 90);
+        let late = pixel_at(&out, 1.4, 160, 90);
+        assert!(early[0] > 200 && early[2] < 60, "0.5s should be red: {early:?}");
+        assert!(late[2] > 200 && late[0] < 60, "1.4s should be blue (source 2.8s): {late:?}");
     }
 
     #[test]

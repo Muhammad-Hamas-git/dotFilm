@@ -123,13 +123,14 @@ pub struct VideoStream {
 }
 
 impl VideoStream {
-    pub fn new(path: PathBuf, width: u32, height: u32, fps: u32, full_range: bool) -> Self {
+    /// `rate` is frames per source second to decode (see Clip::decode_rate).
+    pub fn new(path: PathBuf, width: u32, height: u32, rate: f64, full_range: bool) -> Self {
         Self {
             path,
             full_range,
             width: (width / 2 * 2).max(2),
             height: (height / 2 * 2).max(2),
-            fps: fps.max(1) as f64,
+            fps: rate.max(0.5),
             running: None,
             current: None,
             next: None,
@@ -140,6 +141,11 @@ impl VideoStream {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Frames per source second this stream decodes.
+    pub fn rate(&self) -> f64 {
+        self.fps
     }
 
     pub fn current(&self) -> Option<&Frame> {
@@ -211,7 +217,7 @@ impl VideoStream {
     }
 }
 
-/// Sequential stream for export: frame N is source time start + N / fps.
+/// Sequential stream for export: frame N is source time start + N / rate.
 pub struct SequentialStream {
     rx: Receiver<Frame>,
     child: Arc<Mutex<Child>>,
@@ -222,10 +228,11 @@ pub struct SequentialStream {
 }
 
 impl SequentialStream {
-    pub fn open(path: &Path, start: f64, width: u32, height: u32, fps: u32, full_range: bool, hwaccel: bool) -> Result<Self, String> {
+    /// Frame N is source time start + N / rate.
+    pub fn open(path: &Path, start: f64, width: u32, height: u32, rate: f64, full_range: bool, hwaccel: bool) -> Result<Self, String> {
         let (w, h) = ((width / 2 * 2).max(2), (height / 2 * 2).max(2));
-        let child = spawn_decoder(path, start, w, h, fps as f64, full_range, hwaccel).ok_or("Can't start ffmpeg decoder")?;
-        let (rx, child) = reader_thread(child, start, w, h, fps as f64);
+        let child = spawn_decoder(path, start, w, h, rate, full_range, hwaccel).ok_or("Can't start ffmpeg decoder")?;
+        let (rx, child) = reader_thread(child, start, w, h, rate);
         Ok(Self { rx, child, next_index: 0, current: None, width: w, height: h })
     }
 

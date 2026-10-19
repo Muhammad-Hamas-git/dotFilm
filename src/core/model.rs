@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Current project file version. Older files are upgraded in `Project::load`.
-pub const PROJECT_VERSION: u32 = 2;
+pub const PROJECT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AssetId(pub u64);
@@ -224,10 +224,11 @@ pub enum Param {
     Hue,
     Value,
     Volume,
+    Speed,
 }
 
 impl Param {
-    pub const ALL: [Param; 13] = [
+    pub const ALL: [Param; 14] = [
         Param::X,
         Param::Y,
         Param::Scale,
@@ -241,6 +242,7 @@ impl Param {
         Param::Hue,
         Param::Value,
         Param::Volume,
+        Param::Speed,
     ];
 
     pub fn label(self) -> &'static str {
@@ -258,6 +260,7 @@ impl Param {
             Param::Hue => "Hue",
             Param::Value => "Value",
             Param::Volume => "Volume",
+            Param::Speed => "Speed",
         }
     }
 
@@ -266,7 +269,7 @@ impl Param {
         match self {
             Param::X => project.width as f32 / 2.0,
             Param::Y => project.height as f32 / 2.0,
-            Param::Scale | Param::Opacity | Param::Contrast | Param::Saturation | Param::Value | Param::Volume => 1.0,
+            Param::Scale | Param::Opacity | Param::Contrast | Param::Saturation | Param::Value | Param::Volume | Param::Speed => 1.0,
             _ => 0.0,
         }
     }
@@ -280,8 +283,7 @@ pub struct Clip {
     pub track: usize,
     /// Position on the timeline, seconds.
     pub start: f64,
-    /// Source time at the clip's first frame, seconds. Keyframes use source time.
-    /// For images this is just an offset and may be negative.
+    /// Source time at the clip's first frame, seconds.
     pub source_in: f64,
     /// Length on the timeline, seconds.
     pub duration: f64,
@@ -291,7 +293,19 @@ pub struct Clip {
     pub opacity: Anim,
     #[serde(default = "one")]
     pub volume: Anim,
+    /// Playback speed (1 = normal, 2 = twice as fast). Keyframeable.
+    #[serde(default = "one")]
+    pub speed: Anim,
+    /// When on, faster playback also raises the audio pitch (like a tape).
+    /// When off, the audio is time-stretched and keeps its pitch.
+    #[serde(default)]
+    pub speed_affects_pitch: bool,
 }
+
+/// Slowest allowed speed (keeps the time math well behaved).
+pub const MIN_SPEED: f32 = 0.05;
+/// Speed range offered in the UI.
+pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
 
 /// All of a clip's parameters evaluated at one moment.
 #[derive(Clone, Copy, Debug)]
@@ -313,13 +327,75 @@ impl Clip {
     pub fn contains(&self, t: f64) -> bool {
         t >= self.start && t < self.end()
     }
-    /// Timeline time -> source time.
+    /// Timeline time -> clip time (what keyframes use).
     pub fn local(&self, t: f64) -> f64 {
-        self.source_in + (t - self.start)
+        t - self.start
     }
-    /// Source time -> timeline time.
+    /// Clip time -> timeline time.
     pub fn timeline(&self, local: f64) -> f64 {
-        self.start + (local - self.source_in)
+        self.start + local
+    }
+    /// Source seconds played between the clip start and clip time `local`.
+    pub fn source_elapsed(&self, local: f64) -> f64 {
+        if local >= 0.0 {
+            self.speed.integral(local, MIN_SPEED)
+        } else {
+            // Before the start (only for trimming): extend with the starting speed.
+            local * self.speed.eval(0.0).max(MIN_SPEED) as f64
+        }
+    }
+    /// Timeline time -> seconds into the source file.
+    pub fn source_time(&self, t: f64) -> f64 {
+        self.source_in + self.source_elapsed(self.local(t))
+    }
+    /// Clip time at which the source reaches `source_seconds` (inverse of source_time).
+    pub fn local_at_source(&self, source_seconds: f64) -> f64 {
+        let target = source_seconds - self.source_in;
+        if !self.speed.is_animated() {
+            return target / self.speed.value.max(MIN_SPEED) as f64;
+        }
+        if target <= 0.0 {
+            return target / self.speed.eval(0.0).max(MIN_SPEED) as f64;
+        }
+        // source_elapsed only grows, so bisection is safe.
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        while self.source_elapsed(hi) < target && hi < 1e7 {
+            hi *= 2.0;
+        }
+        for _ in 0..60 {
+            let mid = (lo + hi) * 0.5;
+            if self.source_elapsed(mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        hi
+    }
+    /// Frames per source second needed so every output frame gets its own frame.
+    pub fn decode_rate(&self, fps: u32) -> f64 {
+        (fps as f64 / self.speed.min_value().max(MIN_SPEED) as f64).clamp(1.0, 240.0)
+    }
+    /// Shifts the clip's start edge by `delta` timeline seconds (trimming).
+    /// Keyframes stay on the same footage moments.
+    pub fn trim_start(&mut self, delta: f64) {
+        let new_source_in = self.source_in + self.source_elapsed(delta);
+        for p in Param::ALL {
+            self.param_mut(p).shift(-delta);
+        }
+        self.source_in = new_source_in;
+        self.start += delta;
+        self.duration -= delta;
+    }
+    /// Removes all keyframes, keeping each value as it is at clip time `at`.
+    pub fn clear_keyframes(&mut self, at: f64) {
+        for p in Param::ALL {
+            let a = self.param_mut(p);
+            if a.is_animated() {
+                a.value = a.eval(at);
+                a.keys.clear();
+            }
+        }
     }
 
     pub fn param(&self, p: Param) -> &Anim {
@@ -337,6 +413,7 @@ impl Clip {
             Param::Hue => &self.adjust.hue,
             Param::Value => &self.adjust.value,
             Param::Volume => &self.volume,
+            Param::Speed => &self.speed,
         }
     }
 
@@ -355,6 +432,7 @@ impl Clip {
             Param::Hue => &mut self.adjust.hue,
             Param::Value => &mut self.adjust.value,
             Param::Volume => &mut self.volume,
+            Param::Speed => &mut self.speed,
         }
     }
 
@@ -380,7 +458,7 @@ impl Clip {
         }
     }
 
-    /// Source times of all keyframes on any parameter, sorted, without duplicates.
+    /// Clip times of all keyframes on any parameter, sorted, without duplicates.
     pub fn keyframe_times(&self, tol: f64) -> Vec<f64> {
         let mut times: Vec<f64> = Param::ALL.iter().flat_map(|p| self.param(*p).keys.iter().map(|k| k.t)).collect();
         times.sort_by(f64::total_cmp);
@@ -466,12 +544,56 @@ impl Project {
         self.clips.iter().map(|c| c.end()).fold(0.0, f64::max)
     }
 
-    /// Longest a clip can be, given where it starts in the source.
+    /// Longest a clip can be, given where it starts in the source and its speed.
     pub fn max_duration(&self, clip: &Clip) -> f64 {
         match self.asset(clip.asset) {
-            Some(a) if a.kind != AssetKind::Image => (a.duration - clip.source_in).max(MIN_CLIP),
+            Some(a) if a.kind != AssetKind::Image => clip.local_at_source(a.duration).max(MIN_CLIP),
             _ => f64::INFINITY,
         }
+    }
+
+    /// Earliest timeline time the clip's start can be trimmed back to.
+    pub fn earliest_start(&self, clip: &Clip) -> f64 {
+        match self.asset(clip.asset) {
+            Some(a) if a.kind != AssetKind::Image => clip.timeline(clip.local_at_source(0.0)),
+            _ => f64::NEG_INFINITY,
+        }
+    }
+
+    /// Start of the next clip on the same track after this one (or infinity).
+    pub fn next_start(&self, clip: &Clip) -> f64 {
+        self.clips
+            .iter()
+            .filter(|c| c.id != clip.id && c.track == clip.track && c.start >= clip.end() - 1e-6)
+            .map(|c| c.start)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// A clip length, limited by the media's length and the next clip on the track.
+    pub fn allowed_duration(&self, clip: &Clip, wanted: f64) -> f64 {
+        let limit = self.max_duration(clip).min(self.next_start(clip) - clip.start);
+        wanted.clamp(MIN_CLIP, limit.max(MIN_CLIP))
+    }
+
+    /// Pastes a copy of `template` at `start`. Uses the template's track if free there,
+    /// otherwise the next free track above (adding one if needed).
+    pub fn paste_clip(&mut self, template: &Clip, start: f64) -> Option<ClipId> {
+        self.asset(template.asset)?;
+        let start = start.max(0.0);
+        let mut track = template.track.min(self.tracks.len().saturating_sub(1));
+        while !self.is_free(track, start, start + template.duration, None) {
+            track += 1;
+            if track >= self.tracks.len() {
+                self.add_track();
+                break;
+            }
+        }
+        let mut c = template.clone();
+        c.id = ClipId(self.alloc_id());
+        c.track = track;
+        c.start = start;
+        self.clips.push(c.clone());
+        Some(c.id)
     }
 
     /// Size of an asset when fitted inside the frame (scale 1.0).
@@ -549,6 +671,8 @@ impl Project {
             adjust: ColorAnim::default(),
             opacity: Anim::new(1.0),
             volume: Anim::new(1.0),
+            speed: Anim::new(1.0),
+            speed_affects_pitch: false,
         });
         Some(id)
     }
@@ -584,9 +708,9 @@ impl Project {
         let left_len = t - clip.start;
         let mut right = clip.clone();
         right.id = new_id;
-        right.start = t;
-        right.source_in = clip.source_in + left_len;
-        right.duration = clip.duration - left_len;
+        // trim_start shifts keyframes and source position, so the right half
+        // continues exactly where the left half stops.
+        right.trim_start(left_len);
         self.clip_mut(id)?.duration = left_len;
         self.clips.push(right);
         Some(new_id)
@@ -637,6 +761,15 @@ impl Project {
             self.tracks.reverse();
             for c in &mut self.clips {
                 c.track = n - 1 - c.track.min(n - 1);
+            }
+        }
+        if self.version < 3 {
+            // Version 2 stored keyframe times in source time; now they're clip time.
+            for c in &mut self.clips {
+                let offset = c.source_in;
+                for p in Param::ALL {
+                    c.param_mut(p).shift(-offset);
+                }
             }
         }
         self.version = PROJECT_VERSION;
@@ -694,6 +827,62 @@ mod tests {
         let before = p.clip(c).unwrap().values_at(3.0).opacity;
         let r = p.split(c, 2.0).unwrap();
         assert!((p.clip(r).unwrap().values_at(3.0).opacity - before).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speed_changes_source_time_and_length() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 1.0).unwrap();
+        p.clip_mut(c).unwrap().speed.value = 2.0;
+        let clip = p.clip(c).unwrap().clone();
+        assert!((clip.source_time(3.0) - 4.0).abs() < 1e-9);
+        assert!((p.max_duration(&clip) - 5.0).abs() < 1e-9);
+        // Ramp 1x -> 3x over 2 s plays 4 s of source.
+        let clip = p.clip_mut(c).unwrap();
+        clip.speed.insert(crate::core::anim::Key { t: 0.0, v: 1.0, ease: Default::default() });
+        clip.speed.insert(crate::core::anim::Key { t: 2.0, v: 3.0, ease: Default::default() });
+        let clip = p.clip(c).unwrap().clone();
+        assert!((clip.source_time(3.0) - 4.0).abs() < 1e-6);
+        assert!((clip.local_at_source(4.0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_with_speed_keeps_footage_continuous() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        let clip = p.clip_mut(c).unwrap();
+        clip.speed.insert(crate::core::anim::Key { t: 0.0, v: 0.5, ease: Default::default() });
+        clip.speed.insert(crate::core::anim::Key { t: 4.0, v: 2.0, ease: Default::default() });
+        let before = p.clip(c).unwrap().source_time(3.0);
+        let r = p.split(c, 1.5).unwrap();
+        let after = p.clip(r).unwrap().source_time(3.0);
+        assert!((before - after).abs() < 1e-6, "{before} vs {after}");
+    }
+
+    #[test]
+    fn paste_goes_above_when_occupied() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        p.clip_mut(c).unwrap().opacity.insert(crate::core::anim::Key { t: 1.0, v: 0.3, ease: Default::default() });
+        let template = p.clip(c).unwrap().clone();
+        let pasted = p.paste_clip(&template, 2.0).unwrap();
+        let pc = p.clip(pasted).unwrap();
+        assert_eq!(pc.track, 1);
+        assert_eq!(pc.start, 2.0);
+        assert_eq!(pc.opacity, template.opacity);
+        let free = p.paste_clip(&template, 20.0).unwrap();
+        assert_eq!(p.clip(free).unwrap().track, 0);
+    }
+
+    #[test]
+    fn duration_is_limited_by_media_and_neighbors() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        let next = p.add_clip(a, 0, 12.0).unwrap();
+        p.clip_mut(next).unwrap().start = 11.0;
+        let clip = p.clip(c).unwrap().clone();
+        assert_eq!(p.allowed_duration(&clip, 50.0), 10.0);
+        assert!((p.allowed_duration(&clip, 1.2) - 1.2).abs() < 1e-12);
     }
 
     #[test]

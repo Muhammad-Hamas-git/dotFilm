@@ -7,8 +7,11 @@ A desktop video editor written in Rust, rendered on the GPU.
 - **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize it.
   Hit-testing follows the real 3D outline of rotated layers. Snaps to the frame center.
 - **Adjustments panel**: position, scale, opacity, **3D rotation (pitch, yaw, roll)**, brightness, contrast,
-  saturation, hue, value, volume. **Every value can be keyframed**, with an easing curve editor
-  (linear, ease in/out, hold, or a custom bezier with overshoot).
+  saturation, hue, value, volume, **speed** (0.1x to 10x, with or without changing audio pitch).
+  **Every value can be keyframed**, with an easing curve editor (linear, ease in/out, hold, or a
+  custom bezier with overshoot). Exact start and length fields.
+- **Copy and paste clips** (Ctrl+C / Ctrl+V or right-click): pastes at the playhead with all its
+  settings and keyframes, on a track above if the spot is taken.
 - **Timeline**: multiple tracks (Track 1 is the bottom layer), **blend mode per track** (18 modes: multiply,
   screen, overlay, soft light, difference, hue, color, luminosity...), drag/trim/split clips, snapping, zoom,
   hide/mute tracks, keyframe diamonds you can drag, click or right-click.
@@ -63,7 +66,8 @@ on a PC without FFmpeg installed.
 5. On the timeline, the selected clip's keyframes show as diamonds:
    drag to retime, click to jump there, right-click for easing presets or delete.
 
-Keyframes are stored in the clip's source time, so they stay with the footage when you move, trim or split.
+Keyframes are stored relative to the clip's start, so they move with it; trimming and splitting keep them
+on the same moment of the footage. Right-click a clip, or use **Clear** in the Adjustments panel, to remove all its keyframes.
 
 ## Shortcuts
 
@@ -74,6 +78,7 @@ Keyframes are stored in the clip's source time, so they stay with the footage wh
 | Home / End | Start / last frame |
 | S | Split at playhead (selected clip, or all clips under the playhead) |
 | Delete | Delete selected clip |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clip at the playhead |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S, Ctrl+O, Ctrl+I, Ctrl+E | Save, open, import, export |
 | Ctrl + wheel | Zoom timeline at the cursor |
@@ -102,6 +107,7 @@ src/
     color.rs           color adjustments as matrices
     preview.rs         the player picture
     audio.rs           audio mixing and playback (also used for export)
+    stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
   ui/                the window: app.rs, assets, player, inspector, timeline, export_dialog
 ```
@@ -145,6 +151,8 @@ Example: a new animatable parameter "blur radius".
 | Hardware decoding on export, audio bitrate | top of `engine/export.rs` |
 | Resolution / fps presets | `RESOLUTIONS` and `FRAME_RATES` in `ui/inspector.rs` |
 | Undo steps | `MAX_UNDO` in `core/history.rs` |
+| Speed range | `SPEED_RANGE` in `core/model.rs` |
+| Time-stretch quality (chunk size, alignment search) | `WINDOW`, `SEEK` in `engine/stretch.rs` |
 
 ## Known limits
 

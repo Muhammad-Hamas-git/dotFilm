@@ -95,7 +95,7 @@ impl PreviewRenderer {
                     if let Some(asset) = project.asset(clip.asset).filter(|a| scene::is_video(a)) {
                         let (path, native) = source_for(asset, proxies);
                         let (w, h) = scene::decode_size(project, asset, clip, frame_scale, native);
-                        ensure_stream(&mut self.streams, clip.id, path, w, h, project.fps, asset.color.full_range).update(clip.source_in);
+                        ensure_stream(&mut self.streams, clip.id, path, w, h, clip.decode_rate(project.fps), asset.color.full_range).update(clip.source_in);
                         keep_streams.insert(clip.id);
                     }
                 }
@@ -112,7 +112,7 @@ impl PreviewRenderer {
                 AssetKind::Video => {
                     let (path, native) = source_for(l.asset, proxies);
                     let (w, h) = scene::decode_size(project, l.asset, l.clip, frame_scale, native);
-                    let stream = ensure_stream(&mut self.streams, l.clip.id, path, w, h, project.fps, l.asset.color.full_range);
+                    let stream = ensure_stream(&mut self.streams, l.clip.id, path, w, h, l.clip.decode_rate(project.fps), l.asset.color.full_range);
                     keep_streams.insert(l.clip.id);
                     let changed = stream.update(l.source_time);
                     if stream.is_stale() {
@@ -192,10 +192,10 @@ fn source_for(asset: &crate::core::model::Asset, proxies: &Proxies) -> (std::pat
     }
 }
 
-fn ensure_stream(streams: &mut HashMap<ClipId, VideoStream>, id: ClipId, path: std::path::PathBuf, w: u32, h: u32, fps: u32, full_range: bool) -> &mut VideoStream {
-    let outdated = streams.get(&id).is_some_and(|s| s.width != w || s.height != h || s.path() != path);
+fn ensure_stream(streams: &mut HashMap<ClipId, VideoStream>, id: ClipId, path: std::path::PathBuf, w: u32, h: u32, rate: f64, full_range: bool) -> &mut VideoStream {
+    let outdated = streams.get(&id).is_some_and(|s| s.width != w || s.height != h || s.path() != path || (s.rate() - rate).abs() > 1e-6);
     if outdated {
         streams.remove(&id);
     }
-    streams.entry(id).or_insert_with(|| VideoStream::new(path, w, h, fps, full_range))
+    streams.entry(id).or_insert_with(|| VideoStream::new(path, w, h, rate, full_range))
 }

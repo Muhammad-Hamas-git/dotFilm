@@ -5,3 +5,4 @@ pub mod export;
 pub mod gpu;
 pub mod preview;
 pub mod scene;
+pub mod stretch;

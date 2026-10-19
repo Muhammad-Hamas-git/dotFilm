@@ -13,8 +13,11 @@ Read README.md first for the folder layout.
   shader's color math; tests compare them.
 - Layer positions are in **project pixels**. The compositor maps them to its output size via `set_canvas`.
 - Every user-adjustable number on a clip is an `Anim` (keyframeable). Add new ones to `Param` so the
-  inspector, timeline diamonds and undo work automatically. Keyframe times are **source time**
-  (`clip.local(t)`), not timeline time.
+  inspector, timeline diamonds and undo work automatically. Keyframe times are **clip time**
+  (`clip.local(t)` = seconds from the clip start). Footage position is `clip.source_time(t)`, which
+  includes speed. Trimming and splitting go through `Clip::trim_start` so keyframes stay attached.
+- Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when
+  they merely round a displayed value, which during playback would create a keyframe every frame.
 - The UI changes the project only through `core::model::Project` methods or direct field edits.
   **Before any edit the user can undo, call `app.history.checkpoint(&app.project)` once.**
   For drags, checkpoint at drag start, not on every frame.

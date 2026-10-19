@@ -34,7 +34,7 @@ pub fn layers_at(project: &Project, t: f64) -> Vec<SceneLayer<'_>> {
                 stages: color::stages(&v.adjust),
                 opacity: v.opacity,
                 blend: project.tracks.get(clip.track).map(|tr| tr.blend).unwrap_or_default(),
-                source_time: clip.local(t),
+                source_time: clip.source_time(t),
             })
         })
         .collect()

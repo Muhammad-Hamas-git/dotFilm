@@ -411,6 +411,29 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
             app.delete_selected();
             ui.close();
         }
+        ui.separator();
+        let ctx = ui.ctx().clone();
+        if ui.add_enabled(app.selected.is_some(), egui::Button::new("Copy            Ctrl+C")).clicked() {
+            app.copy_selected(&ctx);
+            ui.close();
+        }
+        if ui.add_enabled(app.clipboard.is_some(), egui::Button::new("Paste at playhead   Ctrl+V")).clicked() {
+            app.paste(None);
+            ui.close();
+        }
+        let has_keys = app.selected.and_then(|id| app.project.clip(id)).is_some_and(|c| !c.keyframe_times(1e-9).is_empty());
+        if has_keys {
+            ui.separator();
+            if ui.button("Remove all keyframes").clicked() {
+                app.history.checkpoint(&app.project);
+                let t = app.playhead;
+                if let Some(c) = app.selected.and_then(|id| app.project.clip_mut(id)) {
+                    let at = c.local(t).clamp(0.0, c.duration);
+                    c.clear_keyframes(at);
+                }
+                ui.close();
+            }
+        }
     });
 
     // --- hover cursor ---
@@ -500,15 +523,12 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
             if let Some(s) = snap_target(app, t, Some(id), view.pps) {
                 t = s;
             }
-            let earliest = if is_image { prev_end } else { prev_end.max(clip.start - clip.source_in) };
+            let earliest = prev_end.max(app.project.earliest_start(&clip));
             let new_start = t.clamp(earliest, clip.end() - MIN_CLIP);
             let delta = new_start - clip.start;
             if let Some(c) = app.project.clip_mut(id) {
-                c.start = new_start;
-                c.duration -= delta;
-                // Source time moves with the left edge so keyframes stay put.
-                // Images have no real source time, so it may go negative there.
-                c.source_in += delta;
+                // Shifts keyframes and the source position so the footage stays put.
+                c.trim_start(delta);
                 if !is_image {
                     c.source_in = c.source_in.max(0.0);
                 }

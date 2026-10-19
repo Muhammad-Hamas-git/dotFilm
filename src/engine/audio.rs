@@ -13,12 +13,69 @@ use std::time::Instant;
 /// A clip as the mixer sees it.
 pub struct AudioClip {
     pub start: f64,
-    pub source_in: f64,
     pub duration: f64,
-    /// Keyframes are in source time, like everything else on a clip.
+    /// Keyframes are in clip time.
     pub volume: Anim,
-    /// Stereo interleaved, AUDIO_RATE.
-    pub pcm: Arc<Vec<i16>>,
+    pub source: AudioSource,
+}
+
+/// Where a clip's samples come from. All PCM is stereo interleaved at AUDIO_RATE.
+pub enum AudioSource {
+    /// Reads the file directly; speed changes the pitch like a tape.
+    Direct { source_in: f64, speed: SpeedMap, pcm: Arc<Vec<i16>> },
+    /// Already time-stretched audio (pitch kept), aligned to the clip start.
+    Stretched { pcm: Arc<Vec<i16>> },
+}
+
+/// Clip time -> source seconds played, cheap enough for the audio thread.
+pub enum SpeedMap {
+    Constant(f64),
+    /// Precomputed elapsed source time every `step` seconds.
+    Table { step: f64, elapsed: Vec<f64> },
+}
+
+/// Builds the mixer's view of a timeline clip. `stretched` is the pitch-kept
+/// audio when the clip needs it and it's ready; otherwise the file is read directly.
+pub fn audio_clip(clip: &crate::core::model::Clip, pcm: Arc<Vec<i16>>, stretched: Option<Arc<Vec<i16>>>) -> AudioClip {
+    let source = match stretched {
+        Some(pcm) => AudioSource::Stretched { pcm },
+        None => AudioSource::Direct { source_in: clip.source_in, speed: SpeedMap::for_clip(clip), pcm },
+    };
+    AudioClip { start: clip.start, duration: clip.duration, volume: clip.volume.clone(), source }
+}
+
+/// Resolution of the speed lookup table, seconds.
+const SPEED_TABLE_STEP: f64 = 0.002;
+
+impl SpeedMap {
+    pub fn for_clip(clip: &crate::core::model::Clip) -> Self {
+        use crate::core::model::MIN_SPEED;
+        if !clip.speed.is_animated() {
+            return SpeedMap::Constant(clip.speed.value.max(MIN_SPEED) as f64);
+        }
+        let n = (clip.duration / SPEED_TABLE_STEP).ceil() as usize + 2;
+        let mut elapsed = Vec::with_capacity(n);
+        let mut acc = 0.0;
+        elapsed.push(0.0);
+        for i in 1..n {
+            let (a, b) = ((i - 1) as f64 * SPEED_TABLE_STEP, i as f64 * SPEED_TABLE_STEP);
+            acc += clip.speed.eval((a + b) * 0.5).max(MIN_SPEED) as f64 * (b - a);
+            elapsed.push(acc);
+        }
+        SpeedMap::Table { step: SPEED_TABLE_STEP, elapsed }
+    }
+
+    fn elapsed(&self, local: f64) -> f64 {
+        match self {
+            SpeedMap::Constant(s) => local * s,
+            SpeedMap::Table { step, elapsed } => {
+                let x = (local / step).max(0.0);
+                let i = (x as usize).min(elapsed.len().saturating_sub(2));
+                let f = x - i as f64;
+                elapsed[i] + (elapsed[i + 1] - elapsed[i]) * f
+            }
+        }
+    }
 }
 
 struct Shared {
@@ -155,27 +212,37 @@ pub fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
         if clip.start >= t1 || clip.start + clip.duration <= t0 {
             continue;
         }
-        let total = clip.pcm.len() / 2;
+        let pcm = match &clip.source {
+            AudioSource::Direct { pcm, .. } | AudioSource::Stretched { pcm } => pcm,
+        };
+        let total = pcm.len() / 2;
         for i in 0..frames {
             let t = (pos + i as u64) as f64 / rate;
             if t < clip.start || t >= clip.start + clip.duration {
                 continue;
             }
-            // Linear interpolation handles devices that don't run at 48 kHz.
-            let local = t - clip.start + clip.source_in;
+            let local = t - clip.start;
             let gain = if clip.volume.is_animated() { clip.volume.eval(local) } else { clip.volume.value }.max(0.0);
             if gain <= 0.0 {
                 continue;
             }
-            let src = local * src_rate;
+            let seconds = match &clip.source {
+                AudioSource::Direct { source_in, speed, .. } => source_in + speed.elapsed(local),
+                AudioSource::Stretched { .. } => local,
+            };
+            // Linear interpolation also handles devices that don't run at 48 kHz.
+            let src = seconds * src_rate;
+            if src < 0.0 {
+                continue;
+            }
             let idx = src as usize;
             if idx + 1 >= total {
                 continue;
             }
             let frac = (src - idx as f64) as f32;
             for ch in 0..2 {
-                let a = clip.pcm[idx * 2 + ch] as f32;
-                let b = clip.pcm[(idx + 1) * 2 + ch] as f32;
+                let a = pcm[idx * 2 + ch] as f32;
+                let b = pcm[(idx + 1) * 2 + ch] as f32;
                 mix[i * 2 + ch] += (a + (b - a) * frac) / 32768.0 * gain;
             }
         }

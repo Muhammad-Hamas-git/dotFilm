@@ -1,8 +1,9 @@
 //! Keyframe animation.
 //!
 //! Every adjustable number on a clip is an `Anim`: a plain value, or a list of
-//! keyframes. Keyframe times are in *source time* (seconds into the media file),
-//! so they stay attached to the content when a clip is moved, trimmed or split.
+//! keyframes. Keyframe times are *clip time*: seconds from the clip's start.
+//! Moving a clip moves its keyframes; trimming and splitting shift them so they
+//! stay attached to the same moment of the footage.
 
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +100,7 @@ fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, u: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Key {
-    /// Source time, seconds.
+    /// Clip time, seconds.
     pub t: f64,
     pub v: f32,
     #[serde(default)]
@@ -250,7 +251,53 @@ impl Anim {
 
     /// Largest value this parameter takes (used to pick decode resolution).
     pub fn max_value(&self) -> f32 {
-        self.keys.iter().map(|k| k.v).fold(self.value, f32::max)
+        if self.keys.is_empty() { self.value } else { self.keys.iter().map(|k| k.v).fold(f32::MIN, f32::max) }
+    }
+
+    /// Smallest value this parameter takes.
+    pub fn min_value(&self) -> f32 {
+        if self.keys.is_empty() { self.value } else { self.keys.iter().map(|k| k.v).fold(f32::MAX, f32::min) }
+    }
+
+    /// Moves every keyframe by `dt` seconds.
+    pub fn shift(&mut self, dt: f64) {
+        for k in &mut self.keys {
+            k.t += dt;
+        }
+    }
+
+    /// Integral of the value from time 0 to `t` (t >= 0), with values clamped to
+    /// at least `floor`. Used to turn a speed curve into elapsed source time.
+    pub fn integral(&self, t: f64, floor: f32) -> f64 {
+        let f = |v: f32| v.max(floor) as f64;
+        if self.keys.is_empty() {
+            return f(self.value) * t;
+        }
+        // Boundaries where the curve changes shape.
+        let mut edges: Vec<f64> = vec![0.0];
+        edges.extend(self.keys.iter().map(|k| k.t).filter(|kt| *kt > 0.0 && *kt < t));
+        edges.push(t);
+        // 8-point Gauss-Legendre per piece: exact for straight segments, very close for curves.
+        const X: [f64; 4] = [0.183_434_642_495_649_8, 0.525_532_409_916_329, 0.796_666_477_413_626_7, 0.960_289_856_497_536_3];
+        const W: [f64; 4] = [0.362_683_783_378_362, 0.313_706_645_877_887_3, 0.222_381_034_453_374_5, 0.101_228_536_290_376_3];
+        let mut sum = 0.0;
+        for w in edges.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (mid, half) = ((a + b) * 0.5, (b - a) * 0.5);
+            if half <= 0.0 {
+                continue;
+            }
+            // Hold segments are flat: sample just inside the start.
+            let hold = self.keys.iter().rev().find(|k| k.t <= a + 1e-9).is_some_and(|k| k.ease == Ease::Hold);
+            if hold {
+                sum += f(self.eval(a + 1e-9)) * (b - a);
+                continue;
+            }
+            for i in 0..4 {
+                sum += W[i] * half * (f(self.eval(mid - half * X[i])) + f(self.eval(mid + half * X[i])));
+            }
+        }
+        sum
     }
 }
 
@@ -326,6 +373,17 @@ mod tests {
         a.toggle_key(1.0, 0.01);
         assert!(!a.is_animated());
         assert_eq!(a.eval(0.0), 7.0);
+    }
+
+    #[test]
+    fn integral_of_linear_ramp() {
+        let a = anim(&[(0.0, 1.0, Ease::Linear), (2.0, 3.0, Ease::Linear)]);
+        // Area under a ramp from 1 to 3 over 2 s = 4, then flat 3 for 1 s.
+        assert!((a.integral(2.0, 0.0) - 4.0).abs() < 1e-6);
+        assert!((a.integral(3.0, 0.0) - 7.0).abs() < 1e-6);
+        assert!((Anim::new(2.0).integral(1.5, 0.0) - 3.0).abs() < 1e-9);
+        let h = anim(&[(0.0, 1.0, Ease::Hold), (1.0, 4.0, Ease::Linear)]);
+        assert!((h.integral(2.0, 0.0) - 5.0).abs() < 1e-6);
     }
 
     #[test]

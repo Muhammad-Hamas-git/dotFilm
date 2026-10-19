@@ -46,9 +46,16 @@ struct Tracker {
 
 impl Tracker {
     fn add(&mut self, r: &egui::Response) {
-        self.changed |= r.changed();
+        self.changed |= user_edit(r);
         self.active |= r.dragged() || r.has_focus();
     }
+}
+
+/// True only when the person actually changed the widget. Sliders also report
+/// "changed" when they merely round the value they display (e.g. 0.4567 -> 0.46),
+/// which during playback happened every frame and created a keyframe each time.
+fn user_edit(r: &egui::Response) -> bool {
+    r.changed() && (r.dragged() || r.drag_stopped() || r.clicked() || r.has_focus() || r.lost_focus() || r.is_pointer_button_down_on())
 }
 
 pub fn show(app: &mut EditorApp, ui: &mut Ui) {
@@ -107,6 +114,7 @@ fn widget_for(p: Param) -> Widget {
         Param::Hue => Widget::Slider { range: color::HUE_RANGE, decimals: 0, log: false, suffix: " deg" },
         Param::Value => s(color::VALUE_RANGE, 2),
         Param::Volume => s(0.0..=2.0, 2),
+        Param::Speed => Widget::Slider { range: crate::core::model::SPEED_RANGE, decimals: 2, log: true, suffix: "x" },
     }
 }
 
@@ -125,7 +133,7 @@ fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &m
         Widget::Slider { range, decimals, log, suffix } => ui.add(Slider::new(&mut v, range).fixed_decimals(decimals).logarithmic(log).suffix(suffix)),
     };
     t.add(&r);
-    if r.changed() {
+    if user_edit(&r) {
         clip.param_mut(p).set(local, v, tol);
     }
     ui.end_row();
@@ -167,8 +175,39 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
         if ui.add_enabled(next.is_some(), egui::Button::new("Next >")).clicked() {
             t.seek = next.map(|k| c.timeline(k));
         }
+        if ui.add_enabled(!times.is_empty(), egui::Button::new("Clear")).on_hover_text("Remove all keyframes of this clip").clicked() {
+            c.clear_keyframes(local);
+            t.changed = true;
+        }
     });
     ui.separator();
+
+    // Timing: exact start and length.
+    let mut timing_changed = false;
+    egui::CollapsingHeader::new("Timing").default_open(true).show(ui, |ui| {
+        egui::Grid::new("timing").num_columns(2).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+            ui.label("Start");
+            let mut start = c.start;
+            let r = ui.add(egui::DragValue::new(&mut start).speed(0.01).range(0.0..=f64::MAX).max_decimals(3).suffix(" s"));
+            t.add(&r);
+            if user_edit(&r) && project.is_free(c.track, start, start + c.duration, Some(c.id)) {
+                c.start = start;
+                timing_changed = true;
+            }
+            ui.end_row();
+            ui.label("Length");
+            let mut d = c.duration;
+            let r = ui.add(egui::DragValue::new(&mut d).speed(0.01).range(crate::core::model::MIN_CLIP..=f64::MAX).max_decimals(3).suffix(" s"));
+            t.add(&r);
+            if user_edit(&r) {
+                // Limited by the media length and the next clip on the track.
+                c.duration = project.allowed_duration(&c, d);
+                timing_changed = true;
+            }
+            ui.end_row();
+        });
+    });
+    t.changed |= timing_changed;
 
     if asset.kind != AssetKind::Audio {
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
@@ -205,6 +244,33 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
                 for p in params {
                     let d = p.default_value(project);
                     c.param_mut(p).set(local, d, tol);
+                }
+                t.changed = true;
+            }
+        });
+    }
+    if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
+        egui::CollapsingHeader::new("Speed").default_open(true).show(ui, |ui| {
+            let before = c.speed.clone();
+            param_grid(ui, "speed", &mut c, &[Param::Speed], local, tol, t);
+            // A plain (not keyframed) speed change keeps the same footage, like CapCut:
+            // 2x makes the clip half as long.
+            if !c.speed.is_animated() && !before.is_animated() && c.speed.value != before.value {
+                let wanted = c.duration * before.value as f64 / c.speed.value.max(crate::core::model::MIN_SPEED) as f64;
+                c.duration = project.allowed_duration(&c, wanted);
+            }
+            if asset.has_audio {
+                let r = ui.checkbox(&mut c.speed_affects_pitch, "Affects audio pitch")
+                    .on_hover_text("On: faster sounds higher, like a tape. Off: the audio keeps its pitch.");
+                if r.changed() {
+                    t.changed = true;
+                }
+            }
+            if ui.button("Normal speed").clicked() {
+                let old = c.speed.clone();
+                c.speed = crate::core::anim::Anim::new(1.0);
+                if !old.is_animated() {
+                    c.duration = project.allowed_duration(&c, c.duration * old.value as f64);
                 }
                 t.changed = true;
             }
