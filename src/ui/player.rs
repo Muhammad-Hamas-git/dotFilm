@@ -24,6 +24,8 @@ enum Drag {
 #[derive(Default)]
 pub struct PlayerState {
     drag: Option<Drag>,
+    /// Mask being edited on the player.
+    pub masks: super::masks::MaskUi,
     /// Shown while a moved clip is snapped to the center.
     guides: (bool, bool),
 }
@@ -37,6 +39,10 @@ struct OnScreen {
 
 pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     transport(app, ui);
+    if app.source.is_some() {
+        source_view(app, ui);
+        return;
+    }
 
     let area = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(area, Sense::click_and_drag());
@@ -119,6 +125,11 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
             }
             return;
         }
+    }
+
+    // --- editing a mask takes over the mouse ---
+    if super::masks::player(app, ui, &response, &painter, &to_screen, &to_project) {
+        return;
     }
 
     // --- start drag: corner of the selected clip, or the topmost picture under the cursor ---
@@ -229,6 +240,55 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     }
 }
 
+/// The player while an asset is previewed: just the asset, a bar to add it or go back.
+fn source_view(app: &mut EditorApp, ui: &mut Ui) {
+    let Some(src) = app.source.as_ref() else { return };
+    let name = src.project.assets.first().map(|a| a.name.clone()).unwrap_or_default();
+    let is_audio = src.project.assets.first().is_some_and(|a| a.kind == crate::core::model::AssetKind::Audio);
+    let asset = src.asset;
+    let mut add = false;
+    let mut back = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Preview").color(Color32::from_rgb(255, 196, 64)).strong());
+        ui.label(egui::RichText::new(&name).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            back = ui.button("Back to timeline").on_hover_text("Esc").clicked();
+            add = ui.button("Add at playhead").on_hover_text("Or double-click the asset").clicked();
+        });
+    });
+    let area = ui.available_rect_before_wrap();
+    ui.allocate_rect(area, Sense::hover());
+    let project = &app.source.as_ref().unwrap().project;
+    let (pw, ph) = (project.width as f32, project.height as f32);
+    let k = ((area.width() - 16.0) / pw).min((area.height() - 16.0) / ph).max(0.01);
+    let frame = Rect::from_center_size(area.center(), vec2(pw * k, ph * k));
+    let t = app.view_time();
+    let texture = app.preview.update(project, &app.media, &app.proxies, t, app.playing);
+    if app.preview.waiting && !app.playing {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    let painter = ui.painter_at(area);
+    painter.rect_filled(area, 0.0, Color32::from_gray(14));
+    match texture {
+        Some(tex) => {
+            painter.image(tex, frame, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            painter.rect_filled(frame, 0.0, Color32::BLACK);
+        }
+    }
+    if is_audio {
+        painter.text(frame.center(), Align2::CENTER_CENTER, "Audio", FontId::proportional(18.0), Color32::from_gray(150));
+    }
+    painter.rect_stroke(frame, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 196, 64)), StrokeKind::Outside);
+    if add {
+        let at = app.playhead;
+        app.add_asset_to_timeline(asset, 0, at);
+    } else if back {
+        app.close_source();
+    }
+}
+
 fn transport(app: &mut EditorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         if ui.button("|<").on_hover_text("Go to start (Home)").clicked() {
@@ -247,7 +307,7 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
             app.seek(app.last_frame());
         }
         ui.separator();
-        ui.monospace(format!("{} / {}", format_time(app.playhead), format_time(app.project.duration())));
+        ui.monospace(format!("{} / {}", format_time(app.view_time()), format_time(app.view_project().duration())));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(format!("{} x {}  {} fps", app.project.width, app.project.height, app.project.fps)).weak());

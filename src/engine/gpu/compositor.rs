@@ -4,6 +4,7 @@
 use super::wgpu;
 use crate::core::geometry::Quad;
 use crate::core::grade::GradeFrame;
+use crate::core::mask::MaskFrame;
 use crate::core::model::BlendMode;
 use crate::engine::color::Stage;
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ const INITIAL_SLOTS: usize = 64;
 /// Max color stages per layer (must match shaders.wgsl).
 const MAX_STAGES: usize = 4;
 /// Uniform slots are this far apart (dynamic offsets must be 256-aligned).
-const UNIFORM_STRIDE: u64 = 768;
+const UNIFORM_STRIDE: u64 = 1280;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,6 +40,9 @@ struct LayerUniform {
     opacity: f32,
     grade_flags: u32,
     pad: [u32; 3],
+    masks: [[f32; 4]; 12],
+    mask_points: [[f32; 4]; 16],
+    mask_info: [f32; 4],
 }
 
 #[repr(C)]
@@ -94,6 +98,8 @@ pub struct EffectDraw {
     pub opacity: f32,
     /// Changes every frame (animated grain).
     pub seed: u32,
+    /// Limits the effect to an area of the frame (project pixels).
+    pub mask: MaskFrame,
 }
 
 /// Two clips (or one, at a free edge) mixed by a transition, then put on the stack
@@ -134,6 +140,13 @@ fn hash_f32s<'a>(v: impl IntoIterator<Item = &'a f32>, h: &mut impl Hasher) {
     }
 }
 
+fn hash_mask(m: &MaskFrame, h: &mut impl Hasher) {
+    hash_f32s(m.info.iter(), h);
+    if m.info[0] > 0.0 {
+        hash_f32s(m.masks.iter().flatten().chain(m.points.iter().flatten()), h);
+    }
+}
+
 impl LayerDraw {
     fn hash_into(&self, h: &mut impl Hasher) {
         match &self.paint {
@@ -149,6 +162,7 @@ impl LayerDraw {
         }
         self.grade.flags.hash(h);
         hash_f32s(self.grade.data.iter().flatten(), h);
+        hash_mask(&self.mask, h);
         hash_f32s(self.quad.pts.iter().flatten().chain(self.quad.w.iter()), h);
         self.stages.len().hash(h);
         hash_f32s(self.stages.iter().flatten().flatten(), h);
@@ -169,6 +183,7 @@ impl DrawItem {
             DrawItem::Effect(e) => {
                 (1u8, e.kind, e.seed).hash(h);
                 hash_f32s(e.params.iter().chain([&e.opacity]), h);
+                hash_mask(&e.mask, h);
             }
             DrawItem::Transition(t) => {
                 (2u8, t.kind, t.edge, t.blend).hash(h);
@@ -215,6 +230,8 @@ pub struct LayerDraw {
     pub paint: Paint,
     /// Color grading (white balance, wheels, HSL, chroma key).
     pub grade: GradeFrame,
+    /// Where the layer shows (in its own pixels).
+    pub mask: MaskFrame,
     pub quad: Quad,
     pub stages: Vec<Stage>,
     pub opacity: f32,
@@ -772,11 +789,14 @@ impl Compositor {
             opacity: layer.opacity,
             grade_flags: layer.grade.flags,
             pad: [0; 3],
+            masks: layer.mask.masks,
+            mask_points: layer.mask.points,
+            mask_info: layer.mask.info,
         }
     }
 
     fn uniform_for_transition(&self, t: &TransitionDraw) -> LayerUniform {
-        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0 });
+        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0, mask: MaskFrame::NONE });
         u.blend = t.blend.shader_id();
         u
     }
@@ -799,6 +819,9 @@ impl Compositor {
             opacity: e.opacity,
             grade_flags: 0,
             pad: [0; 3],
+            masks: e.mask.masks,
+            mask_points: e.mask.points,
+            mask_info: e.mask.info,
         }
     }
 
@@ -845,7 +868,7 @@ impl Compositor {
                         continue;
                     }
                     let weight = 1.0 / lists.len() as f32;
-                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0 });
+                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0, mask: MaskFrame::NONE });
                     let add = slot(u, w);
                     w.opacity = 1.0;
                     let copy = slot(u, w);

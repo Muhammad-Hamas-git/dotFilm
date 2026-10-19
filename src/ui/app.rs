@@ -22,6 +22,17 @@ pub const PROJECT_EXT: &str = "dotfilm";
 pub const OLD_PROJECT_EXT: &str = "cutroom";
 /// Marks clip data on the system clipboard.
 const CLIP_CLIPBOARD_PREFIX: &str = "dotfilm-clip:";
+/// Clip id used for the asset preview (never used by real clips).
+const SOURCE_CLIP: ClipId = ClipId(u64::MAX);
+
+/// An asset shown on its own in the player (single click in the assets panel).
+pub struct SourceView {
+    pub asset: AssetId,
+    /// A one-clip project holding just that asset, rendered like any project.
+    pub project: Project,
+    /// Playhead inside the asset.
+    pub time: f64,
+}
 
 pub struct EditorApp {
     pub project: Project,
@@ -37,6 +48,8 @@ pub struct EditorApp {
     pub audio: AudioOut,
     pub playhead: f64,
     pub playing: bool,
+    /// When set, the player shows this asset instead of the timeline.
+    pub source: Option<SourceView>,
     pub selected: Option<ClipId>,
     /// Asset currently being dragged from the assets panel.
     pub dragged_asset: Option<AssetId>,
@@ -68,6 +81,7 @@ impl EditorApp {
             audio: AudioOut::new(),
             playhead: 0.0,
             playing: false,
+            source: None,
             selected: None,
             dragged_asset: None,
             timeline: Default::default(),
@@ -106,28 +120,48 @@ impl EditorApp {
         self.status = Some((msg.into(), Instant::now()));
     }
 
+    /// What the player and transport work on: the previewed asset, or the timeline.
+    pub fn view_project(&self) -> &Project {
+        self.source.as_ref().map_or(&self.project, |s| &s.project)
+    }
+
+    /// Current time of what the player shows.
+    pub fn view_time(&self) -> f64 {
+        self.source.as_ref().map_or(self.playhead, |s| s.time)
+    }
+
+    fn clock(&mut self) -> &mut f64 {
+        match &mut self.source {
+            Some(s) => &mut s.time,
+            None => &mut self.playhead,
+        }
+    }
+
     pub fn seek(&mut self, t: f64) {
-        self.playhead = t.max(0.0);
-        self.audio.seek(self.playhead);
+        let t = t.max(0.0);
+        *self.clock() = t;
+        self.audio.seek(t);
     }
 
     pub fn toggle_play(&mut self) {
         if self.playing {
             self.audio.pause();
             self.playing = false;
-            self.playhead = self.audio.time();
+            let t = self.audio.time();
+            *self.clock() = t;
         } else {
-            if self.playhead >= self.last_frame() - 0.5 / self.project.fps as f64 {
+            if self.view_time() >= self.last_frame() - 0.5 / self.project.fps as f64 {
                 self.seek(0.0);
             }
-            self.audio.play(self.playhead);
+            self.audio.play(self.view_time());
             self.playing = true;
         }
     }
 
     /// Time of the last frame (the end itself shows nothing, since clips end there).
     pub fn last_frame(&self) -> f64 {
-        (self.project.duration() - 1.0 / self.project.fps.max(1) as f64).max(0.0)
+        let p = self.view_project();
+        (p.duration() - 1.0 / p.fps.max(1) as f64).max(0.0)
     }
 
     pub fn frame_step(&mut self, frames: i32) {
@@ -136,8 +170,45 @@ impl EditorApp {
         }
         let f = 1.0 / self.project.fps as f64;
         // Round to the frame grid first so steps stay aligned.
-        let t = ((self.playhead / f).round() + frames as f64) * f;
-        self.seek(t);
+        let t = ((self.view_time() / f).round() + frames as f64) * f;
+        self.seek(t.min(self.last_frame().max(0.0)));
+    }
+
+    /// Shows an asset on its own in the player (with its sound), without touching the timeline.
+    pub fn open_source(&mut self, id: AssetId) {
+        if self.source.as_ref().is_some_and(|s| s.asset == id) {
+            return;
+        }
+        let Some(asset) = self.project.asset(id).cloned() else { return };
+        if asset.generator.as_ref().is_some_and(|g| g.is_effect()) {
+            self.set_status("Effects change the tracks below them: drag one onto the timeline to see it.");
+            return;
+        }
+        if self.playing {
+            self.toggle_play();
+        }
+        let mut p = Project { width: self.project.width, height: self.project.height, fps: self.project.fps, ..Project::default() };
+        p.assets.push(asset);
+        let Some(cid) = p.add_clip(id, 0, 0.0) else { return };
+        if let Some(c) = p.clip_mut(cid) {
+            c.id = SOURCE_CLIP;
+        }
+        self.source = Some(SourceView { asset: id, project: p, time: 0.0 });
+        self.audio_signature = 0;
+        self.audio.seek(0.0);
+    }
+
+    /// Back to the timeline in the player.
+    pub fn close_source(&mut self) {
+        if self.source.is_none() {
+            return;
+        }
+        if self.playing {
+            self.toggle_play();
+        }
+        self.source = None;
+        self.audio_signature = 0;
+        self.audio.seek(self.playhead);
     }
 
     pub fn import_dialog(&mut self) {
@@ -151,6 +222,7 @@ impl EditorApp {
     }
 
     pub fn add_asset_to_timeline(&mut self, asset: AssetId, track: usize, start: f64) {
+        self.close_source();
         self.history.checkpoint(&self.project);
         if let Some(id) = self.project.add_clip(asset, track, start) {
             self.selected = Some(id);
@@ -198,6 +270,9 @@ impl EditorApp {
     }
 
     pub fn remove_asset(&mut self, id: AssetId) {
+        if self.source.as_ref().is_some_and(|s| s.asset == id) {
+            self.close_source();
+        }
         self.history.checkpoint(&self.project);
         self.project.remove_asset(id);
         self.history.clear(); // Undo could bring back clips whose asset is gone.
@@ -205,6 +280,7 @@ impl EditorApp {
     }
 
     fn replace_project(&mut self, project: Project, path: Option<PathBuf>) {
+        self.close_source();
         if self.playing {
             self.toggle_play();
         }
@@ -371,7 +447,15 @@ impl EditorApp {
             self.seek(self.last_frame());
         }
         if pressed(Modifiers::NONE, Key::Escape) {
-            self.selected = None;
+            if self.source.is_some() {
+                self.close_source();
+            } else if self.preview.picking_key.is_some() {
+                self.preview.picking_key = None;
+            } else if self.player.masks.edit.is_some() {
+                self.player.masks.edit = None;
+            } else {
+                self.selected = None;
+            }
         }
         if pressed(Modifiers::NONE, Key::Plus) || pressed(Modifiers::NONE, Key::Equals) {
             self.timeline.zoom(1.25);
@@ -386,9 +470,10 @@ impl EditorApp {
         if !self.playing {
             return;
         }
-        self.playhead = self.audio.time();
-        let end = self.project.duration();
-        if self.playhead >= end {
+        let t = self.audio.time();
+        *self.clock() = t;
+        let end = self.view_project().duration();
+        if t >= end {
             self.audio.pause();
             self.playing = false;
             self.seek(self.last_frame());
@@ -399,7 +484,9 @@ impl EditorApp {
     /// Sends the audible clips to the mixer when anything relevant changed.
     fn sync_audio(&mut self) {
         let mut h = DefaultHasher::new();
-        for c in &self.project.clips {
+        let project = self.source.as_ref().map_or(&self.project, |s| &s.project);
+        self.source.as_ref().map(|s| s.asset.0).hash(&mut h);
+        for c in &project.clips {
             (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.speed_affects_pitch).hash(&mut h);
             for a in [&c.volume, &c.speed] {
                 a.value.to_bits().hash(&mut h);
@@ -408,7 +495,7 @@ impl EditorApp {
                 }
             }
         }
-        for t in &self.project.tracks {
+        for t in &project.tracks {
             t.muted.hash(&mut h);
         }
         self.media.audio.len().hash(&mut h);
@@ -420,8 +507,9 @@ impl EditorApp {
         self.audio_signature = sig;
         let mut clips = Vec::new();
         let mut keys = std::collections::HashSet::new();
-        for c in &self.project.clips {
-            if !self.project.tracks.get(c.track).is_some_and(|t| !t.muted) {
+        let project = self.source.as_ref().map_or(&self.project, |s| &s.project);
+        for c in &project.clips {
+            if !project.tracks.get(c.track).is_some_and(|t| !t.muted) {
                 continue;
             }
             let Some(pcm) = self.media.audio.get(&c.asset).cloned() else { continue };

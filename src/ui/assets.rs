@@ -1,6 +1,7 @@
 //! Assets panel: imported files as a grid of thumbnails.
 //! Import with the button or by dropping files onto the window.
-//! Drag an item onto the timeline (or the player), or double-click to add it at the playhead.
+//! Click an item to preview it in the player, double-click to add it at the playhead,
+//! or drag it onto the timeline (or the player).
 
 use super::app::EditorApp;
 use super::timeline::format_time;
@@ -59,6 +60,8 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     let mut add: Option<AssetId> = None;
     let mut remove: Option<AssetId> = None;
+    let mut preview: Option<AssetId> = None;
+    let previewing = app.source.as_ref().map(|s| s.asset);
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -135,12 +138,17 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                 }
                 if response.double_clicked() {
                     add = Some(asset.id);
+                } else if response.clicked() {
+                    preview = Some(asset.id);
+                }
+                if previewing == Some(asset.id) {
+                    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(2.0, Color32::from_rgb(255, 196, 64)), StrokeKind::Inside);
                 }
                 let tip = if asset.generator.is_some() {
-                    "Drag onto the timeline, or double-click to add at the playhead.".to_string()
+                    "Click to preview. Double-click to add at the playhead, or drag onto the timeline.".to_string()
                 } else {
                     format!(
-                        "{}\n{}x{}  {}{}",
+                        "{}\n{}x{}  {}{}\nClick to preview, double-click to add at the playhead.",
                         asset.path.display(),
                         asset.width,
                         asset.height,
@@ -169,6 +177,8 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     if let Some(id) = add {
         app.add_asset_to_timeline(id, 0, app.playhead);
+    } else if let Some(id) = preview {
+        app.open_source(id);
     }
     if let Some(id) = remove {
         app.remove_asset(id);

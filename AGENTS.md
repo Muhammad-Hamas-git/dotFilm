@@ -34,6 +34,12 @@ Read README.md first for the folder layout.
   callback can run several times per clip in one frame, so it must not re-decode or re-upload needlessly.
 - The preview skips rendering when `DrawItem::hash_into` (plus video frame times) is unchanged. New draw
   settings must be hashed there.
+- Masks live in `clip.masks` (`core/mask.rs`), addressed as `Param::Mask(mask, i)`. They're in the layer's
+  own pixels (effect layers: project pixels), so the shader evaluates them on the layer's UV. `mask::distance`
+  is the CPU twin of the shader's `mask_distance`; a GPU test compares them, keep them in step. The player
+  edits masks through `Quad::homography`, the same projective map the GPU uses.
+- The asset preview (`app.source`) is a separate one-clip `Project` rendered by the same preview renderer.
+  Transport functions (`seek`, `toggle_play`, ...) act on whatever `view_project` / `view_time` return.
 - Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when
   they merely round a displayed value, which during playback would create a keyframe every frame.
 - The UI changes the project only through `core::model::Project` methods or direct field edits.

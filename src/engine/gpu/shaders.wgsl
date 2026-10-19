@@ -43,6 +43,15 @@ struct Layer {
     pad0: u32,
     pad1: u32,
     pad2: u32,
+    // Masks, packed by core::mask::frame. Per mask 3 rows:
+    //   (center x, center y, width, height) in layer px, or (first point, count, _, _) for shapes
+    //   (rotation rad, feather px, roundness, expansion px)
+    //   (kind, invert, mode, opacity)
+    masks: array<vec4<f32>, 12>,
+    // Shape points in layer px, two per row.
+    mask_points: array<vec4<f32>, 16>,
+    // (mask count, layer width, layer height, _).
+    mask_info: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> L: Layer;
@@ -247,6 +256,105 @@ fn hsl_adjust(c: vec3<f32>) -> vec3<f32> {
     return hsl_to_rgb(hsl);
 }
 
+// ---------------------------------------------------------------- masks
+
+fn mask_point(i: u32) -> vec2<f32> {
+    let r = L.mask_points[i / 2u];
+    return select(r.xy, r.zw, (i % 2u) == 1u);
+}
+
+// Signed distance to a closed polygon, negative inside (after Inigo Quilez).
+fn sd_polygon(p: vec2<f32>, first: u32, n: u32) -> f32 {
+    var d = dot(p - mask_point(first), p - mask_point(first));
+    var s = 1.0;
+    for (var k = 0u; k < n; k = k + 1u) {
+        let vi = mask_point(first + k);
+        let vj = mask_point(first + (k + n - 1u) % n);
+        let e = vj - vi;
+        let w = p - vi;
+        let b = w - e * clamp(dot(w, e) / max(dot(e, e), 1e-12), 0.0, 1.0);
+        d = min(d, dot(b, b));
+        let c = vec3<bool>((p.y >= vi.y), (p.y < vj.y), (e.x * w.y > e.y * w.x));
+        if (all(c) || all(!c)) {
+            s = -s;
+        }
+    }
+    return s * sqrt(d);
+}
+
+// Distance from p (layer px) to mask i's edge, negative inside. Matches core::mask::distance.
+fn mask_distance(i: u32, p: vec2<f32>) -> f32 {
+    let v0 = L.masks[i * 3u];
+    let v1 = L.masks[i * 3u + 1u];
+    let kind = u32(L.masks[i * 3u + 2u].x + 0.5);
+    var d = 0.0;
+    if (kind == 4u) {
+        d = sd_polygon(p, u32(v0.x + 0.5), u32(v0.y + 0.5));
+    } else {
+        let q0 = p - v0.xy;
+        let r = -v1.x;
+        let q = vec2(q0.x * cos(r) - q0.y * sin(r), q0.x * sin(r) + q0.y * cos(r));
+        let hs = max(v0.zw * 0.5, vec2(0.0));
+        switch kind {
+            case 0u: {
+                let rad = v1.z * min(hs.x, hs.y);
+                let dd = abs(q) - hs + rad;
+                d = length(max(dd, vec2(0.0))) + min(max(dd.x, dd.y), 0.0) - rad;
+            }
+            case 1u: {
+                let ab = max(hs, vec2(1e-3));
+                d = (length(q / ab) - 1.0) * min(ab.x, ab.y);
+            }
+            case 2u: {
+                d = -q.y;
+            }
+            default: {
+                d = abs(q.y) - hs.y;
+            }
+        }
+    }
+    return d - v1.w;
+}
+
+// How much of the layer shows at p (layer px), 0..1. `aa` = layer px per output px,
+// so hard edges stay smooth. Matches core::mask::coverage.
+fn mask_value(p: vec2<f32>, aa: f32) -> f32 {
+    let n = u32(L.mask_info.x + 0.5);
+    if (n == 0u) {
+        return 1.0;
+    }
+    var acc = select(1.0, 0.0, L.masks[2].z < 0.5);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let v1 = L.masks[i * 3u + 1u];
+        let v2 = L.masks[i * 3u + 2u];
+        let f = max(v1.y, aa);
+        var c = 1.0 - smoothstep(-0.5 * f, 0.5 * f, mask_distance(i, p));
+        if (v2.y > 0.5) {
+            c = 1.0 - c;
+        }
+        let o = clamp(v2.w, 0.0, 1.0);
+        let mode = u32(v2.z + 0.5);
+        if (mode == 0u) {
+            acc = acc + c * o - acc * c * o;
+        } else if (mode == 1u) {
+            acc = acc * (1.0 - c * o);
+        } else {
+            acc = acc * (1.0 - o + c * o);
+        }
+    }
+    return acc;
+}
+
+// Mask of an effect layer at output pixel `xy` (masks are in project pixels there).
+fn effect_mask(xy: vec2<f32>) -> f32 {
+    if (L.mask_info.x < 0.5) {
+        return 1.0;
+    }
+    let size = out_size();
+    let k = L.mask_info.y / size.x;
+    return mask_value(xy / size * L.mask_info.yz, k);
+}
+
 @fragment
 fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     // Sample all planes unconditionally (keeps sampling in uniform control flow).
@@ -294,7 +402,11 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     let edge = min(in.uv, vec2(1.0) - in.uv) / fw;
     let aa = clamp(min(edge.x, edge.y) + 0.5, 0.0, 1.0);
 
-    let a = src.a * key_alpha * L.opacity * aa;
+    // Masks, in the layer's own pixels so they move with it.
+    let lp = in.uv * L.mask_info.yz;
+    let m = mask_value(lp, max(length(fwidth(lp)) * 0.7071, 1e-3));
+
+    let a = src.a * key_alpha * m * L.opacity * aa;
     return vec4(rgb * a, a);
 }
 
@@ -530,9 +642,9 @@ fn fs_blur_v(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0);
     if (L.kind == 4u) {
         // Bloom adds the glow on top.
-        return vec4(orig.rgb + blurred.rgb * L.gen[0].y * L.opacity, 1.0);
+        return vec4(orig.rgb + blurred.rgb * L.gen[0].y * L.opacity * effect_mask(p.xy), 1.0);
     }
-    return vec4(mix(orig.rgb, blurred.rgb, L.opacity), 1.0);
+    return vec4(mix(orig.rgb, blurred.rgb, L.opacity * effect_mask(p.xy)), 1.0);
 }
 
 // ---------------------------------------------------------------- motion blur samples
@@ -755,5 +867,5 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         }
         default: {}
     }
-    return vec4(mix(orig, rgb, L.opacity), 1.0);
+    return vec4(mix(orig, rgb, L.opacity * effect_mask(p.xy)), 1.0);
 }

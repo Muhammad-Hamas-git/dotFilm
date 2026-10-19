@@ -74,6 +74,24 @@ impl Quad {
         sign != 0.0
     }
 
+    /// The projective map from the layer (u, v in 0..1, top-left = 0,0) to project pixels.
+    /// Exactly what the GPU's perspective-correct mapping does, so the player can draw
+    /// and edit things in a layer's own space (masks).
+    pub fn homography(&self) -> Homography {
+        let [p0, p1, p2, p3] = self.pts.map(|p| [p[0] as f64, p[1] as f64]);
+        let (sx, sy) = (p0[0] - p1[0] + p2[0] - p3[0], p0[1] - p1[1] + p2[1] - p3[1]);
+        let (dx1, dx2, dy1, dy2) = (p1[0] - p2[0], p3[0] - p2[0], p1[1] - p2[1], p3[1] - p2[1]);
+        let den = dx1 * dy2 - dx2 * dy1;
+        let (g, h) = if den.abs() < 1e-12 { (0.0, 0.0) } else { ((sx * dy2 - dx2 * sy) / den, (dx1 * sy - sx * dy1) / den) };
+        Homography {
+            m: [
+                [p1[0] - p0[0] + g * p1[0], p3[0] - p0[0] + h * p3[0], p0[0]],
+                [p1[1] - p0[1] + g * p1[1], p3[1] - p0[1] + h * p3[1], p0[1]],
+                [g, h, 1.0],
+            ],
+        }
+    }
+
     pub fn center(&self) -> [f32; 2] {
         let mut c = [0.0, 0.0];
         for p in &self.pts {
@@ -84,8 +102,62 @@ impl Quad {
     }
 }
 
+/// A 3x3 projective transform (see `Quad::homography`).
+#[derive(Clone, Copy, Debug)]
+pub struct Homography {
+    m: [[f64; 3]; 3],
+}
+
+impl Homography {
+    /// Layer (u, v) -> project pixels.
+    pub fn map(&self, u: f32, v: f32) -> [f32; 2] {
+        let m = &self.m;
+        let (u, v) = (u as f64, v as f64);
+        let w = m[2][0] * u + m[2][1] * v + m[2][2];
+        [((m[0][0] * u + m[0][1] * v + m[0][2]) / w) as f32, ((m[1][0] * u + m[1][1] * v + m[1][2]) / w) as f32]
+    }
+
+    /// Project pixels -> layer (u, v). None if the layer is seen edge-on.
+    pub fn unmap(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        let m = &self.m;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = [
+            [m[1][1] * m[2][2] - m[1][2] * m[2][1], m[0][2] * m[2][1] - m[0][1] * m[2][2], m[0][1] * m[1][2] - m[0][2] * m[1][1]],
+            [m[1][2] * m[2][0] - m[1][0] * m[2][2], m[0][0] * m[2][2] - m[0][2] * m[2][0], m[0][2] * m[1][0] - m[0][0] * m[1][2]],
+            [m[1][0] * m[2][1] - m[1][1] * m[2][0], m[0][1] * m[2][0] - m[0][0] * m[2][1], m[0][0] * m[1][1] - m[0][1] * m[1][0]],
+        ];
+        let (x, y) = (x as f64, y as f64);
+        let w = inv[2][0] * x + inv[2][1] * y + inv[2][2];
+        if w.abs() < 1e-12 {
+            return None;
+        }
+        Some([((inv[0][0] * x + inv[0][1] * y + inv[0][2]) / w) as f32, ((inv[1][0] * x + inv[1][1] * y + inv[1][2]) / w) as f32])
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn homography_hits_the_corners_and_inverts() {
+        let q = project(&place(25.0, -35.0, 15.0), 1920.0, 1080.0);
+        let h = q.homography();
+        for (i, (u, v)) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].into_iter().enumerate() {
+            let p = h.map(u, v);
+            assert!((p[0] - q.pts[i][0]).abs() < 0.01 && (p[1] - q.pts[i][1]).abs() < 0.01, "corner {i}: {p:?} vs {:?}", q.pts[i]);
+        }
+        let p = h.map(0.3, 0.7);
+        let back = h.unmap(p[0], p[1]).unwrap();
+        assert!((back[0] - 0.3).abs() < 1e-4 && (back[1] - 0.7).abs() < 1e-4);
+        // The layer's own center lands where perspective puts it, not at the corners' average.
+        let c = h.map(0.5, 0.5);
+        let diag = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs();
+        assert!(diag(q.pts[0], q.pts[2], c) < 0.5 && diag(q.pts[1], q.pts[3], c) < 0.5, "center lies on both diagonals");
+    }
+
     use super::*;
 
     fn place(pitch: f32, yaw: f32, roll: f32) -> Placement {

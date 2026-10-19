@@ -46,6 +46,7 @@ pub mod tests {
     use crate::core::geometry::{self, Placement};
     use crate::core::model::{Adjustments, BlendMode};
     use crate::core::grade::GradeFrame;
+    use crate::core::mask::MaskFrame;
     use crate::engine::color;
 
     const NO_GRADE: GradeFrame = GradeFrame { data: [[0.0; 4]; 12], flags: 0 };
@@ -75,11 +76,11 @@ pub mod tests {
     }
 
     fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> DrawItem {
-        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, quad, stages: vec![], opacity, blend })
+        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, quad, stages: vec![], opacity, blend })
     }
 
     fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
-        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed })
+        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed, mask: MaskFrame::NONE })
     }
 
     fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
@@ -141,7 +142,7 @@ pub mod tests {
         let src = [180u8, 90, 40, 255];
         solid(&mut c, k, src);
         let adj = Adjustments { brightness: 0.05, contrast: 1.3, saturation: 1.4, hue: 35.0, value: 0.9 };
-        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
+        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, mask: MaskFrame::NONE, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
         c.render(&[DrawItem::Layer(d)]);
         let px = c.read_rgba();
         let mut cpu = Vec::new();
@@ -217,7 +218,7 @@ pub mod tests {
             angle_deg: 90.0,
             size: (w as f32, h as f32),
         };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
         let img = c.read_rgba();
         let (l, m, r) = (px(&img, w, 1, 10), px(&img, w, 50, 10), px(&img, w, 98, 10));
         assert!(l[0] > 240 && l[2] < 15, "left {l:?}");
@@ -239,7 +240,7 @@ pub mod tests {
         let k = SourceKey::Clip(9);
         c.upload_rgba(k, 4, 4, &mask);
         let paint = Paint::Text { mask: k, fill: [1.0, 1.0, 0.0, 1.0], outline: [0.0, 0.0, 1.0, 1.0] };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
         let img = c.read_rgba();
         assert!(close(&px(&img, 4, 0, 1), [255, 255, 0], 3), "fill {:?}", px(&img, 4, 0, 1));
         assert!(close(&px(&img, 4, 3, 1), [0, 0, 255], 3), "outline {:?}", px(&img, 4, 3, 1));
@@ -288,7 +289,7 @@ pub mod tests {
     fn graded(c: &mut Compositor, rgba: [u8; 4], grade: &crate::core::grade::Grade) -> [u8; 4] {
         let k = SourceKey::Asset(77);
         solid(c, k, rgba);
-        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), mask: MaskFrame::NONE, quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
         let px = c.read_rgba();
         let i = (4 * 8 + 4) * 4;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -354,7 +355,7 @@ pub mod tests {
             let q = full_frame(8.0, 8.0);
             c.render(&[
                 layer(bg, q, BlendMode::Normal, 1.0),
-                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), mask: MaskFrame::NONE, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
             ]);
             px(&c.read_rgba(), 8, 4, 4)
         };
@@ -390,7 +391,7 @@ pub mod tests {
     }
 
     fn layer_draw(key: SourceKey, quad: geometry::Quad) -> LayerDraw {
-        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }
+        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }
     }
 
     fn transition(from: Option<LayerDraw>, to: Option<LayerDraw>, kind: u32, progress: f32, angle_deg: f32, edge: u32) -> DrawItem {
@@ -492,7 +493,7 @@ pub mod tests {
         let base = [layer(black, q, BlendMode::Normal, 1.0), layer(white, square, BlendMode::Normal, 1.0)];
         let run = |c: &mut Compositor, extra: Option<DrawItem>| {
             let mut items: Vec<DrawItem> = base.iter().map(|d| match d {
-                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, mask: MaskFrame::NONE, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
                 _ => unreachable!(),
             }).collect();
             items.extend(extra);
@@ -537,5 +538,63 @@ pub mod tests {
         assert!(px(&double, w, 48, 32)[0] > 250, "copy {:?}", px(&double, w, 48, 32));
         assert!(px(&double, w, 32, 32)[0] > 250, "original kept");
         assert_eq!(px(&double, w, 40, 32)[0], 0);
+    }
+
+    #[test]
+    fn masks_match_the_cpu_reference() {
+        use crate::core::anim::Anim;
+        use crate::core::mask::{self, idx, Mask, MaskKind, MaskMode};
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let size = (w as f32, h as f32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let white = SourceKey::Asset(1);
+        solid(&mut c, white, [255, 255, 255, 255]);
+        let q = full_frame(size.0, size.1);
+
+        let mut rect = Mask::new(MaskKind::Rectangle, size);
+        rect.values[idx::FEATHER as usize] = Anim::new(8.0);
+        rect.values[idx::ROUNDNESS as usize] = Anim::new(0.5);
+        let mut ell = Mask::new(MaskKind::Ellipse, size);
+        ell.mode = MaskMode::Subtract;
+        ell.values[idx::WIDTH as usize] = Anim::new(20.0);
+        ell.values[idx::HEIGHT as usize] = Anim::new(12.0);
+        ell.values[idx::ROTATION as usize] = Anim::new(30.0);
+        ell.values[idx::FEATHER as usize] = Anim::new(4.0);
+        let mut tri = Mask::new(MaskKind::Shape, size);
+        for p in [[0.05, 0.05], [0.45, 0.05], [0.05, 0.45]] {
+            tri.points.push([Anim::new(p[0]), Anim::new(p[1])]);
+        }
+        tri.values[idx::FEATHER as usize] = Anim::new(3.0);
+        let masks = vec![rect, ell, tri];
+
+        let frame = mask::frame(&masks, 0.0, size);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(white), grade: NO_GRADE, mask: frame, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        let img = c.read_rgba();
+        let mut worst = 0.0f32;
+        for y in (0..h).step_by(3) {
+            for x in (0..w).step_by(3) {
+                let want = mask::coverage(&masks, 0.0, size, [x as f32 + 0.5, y as f32 + 0.5]) * 255.0;
+                let got = px(&img, w, x, y)[0] as f32;
+                worst = worst.max((want - got).abs());
+            }
+        }
+        assert!(worst <= 6.0, "GPU and CPU masks differ by {worst}");
+        // Spot checks: center is cut out by the ellipse, the triangle corner shows.
+        assert!(px(&img, w, 32, 32)[0] < 10);
+        assert!(px(&img, w, 6, 6)[0] > 245);
+        assert!(px(&img, w, 60, 60)[0] < 10);
+
+        // A mask on an effect layer limits the effect: invert only the left half.
+        let mut left = Mask::new(MaskKind::Linear, size);
+        left.values[idx::ROTATION as usize] = Anim::new(90.0);
+        left.values[idx::FEATHER as usize] = Anim::new(0.0);
+        let gray = SourceKey::Asset(2);
+        solid(&mut c, gray, [128, 128, 128, 255]);
+        let vignette = DrawItem::Effect(EffectDraw { kind: 1, params: [-1.0, 0.0, 0.01, 0.0], opacity: 1.0, seed: 0, mask: mask::frame(&[left], 0.0, size) });
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), vignette]);
+        let img = c.read_rgba();
+        assert!(px(&img, w, 8, 32)[0] > 200, "effect applies on the left {:?}", px(&img, w, 8, 32));
+        assert!(close(&px(&img, w, 56, 32), [128, 128, 128], 1), "not on the right {:?}", px(&img, w, 56, 32));
     }
 }

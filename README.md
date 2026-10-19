@@ -3,6 +3,8 @@
 A desktop video editor written in Rust, rendered on the GPU.
 
 - **Assets panel**: import video, images and audio (Import button, or drag files onto the window).
+  **Click** an asset to preview it in the player (with sound, its own playhead), **double-click** to add
+  it at the playhead, or drag it onto the timeline.
   Heavy videos (4K, HEVC, ProRes...) automatically get a fast **proxy** for editing.
   **New** makes solid colors, gradients (2 or 3 colors, any angle), text and effects.
 - **Text**: any installed font, bold/italic, alignment, size, line spacing, fill and outline color,
@@ -12,6 +14,11 @@ A desktop video editor written in Rust, rendered on the GPU.
   An effect clip is its own layer on a track and changes everything on the tracks below it.
   Motion blur blurs anything that moves by keyframes (position, scale, rotation...): it draws the layers
   below at several moments within the shutter and averages them. Shutter angle and sample count are adjustable.
+- **Masks** (up to 4 per clip): rectangle (rounded corners), ellipse, linear, mirror (a band) and freeform
+  shapes you click out point by point. Feather, expansion, opacity, invert, and add / subtract / intersect.
+  Everything keyframeable. Masks stick to the clip as it moves, scales and turns in 3D. Edit them right in
+  the player: drag the center, corners, edges, the round rotation handle, the inside, or shape points.
+  On an **effect layer** a mask limits the effect to that area (blur just a face, glow just the sky).
 - **Transitions**: crossfade, fade through black or white, wipe (any direction, soft edge), push and zoom,
   with adjustable length and easing. Set them on a clip's start or end (Adjustments panel, or right-click
   the clip). Between two touching clips the transition plays across the cut; on a free edge the clip
@@ -95,6 +102,7 @@ on the same moment of the footage. Right-click a clip, or use **Clear** in the A
 | Home / End | Start / last frame |
 | S | Split at playhead (selected clip, or all clips under the playhead) |
 | Delete | Delete selected clip |
+| Esc | Back from an asset preview / stop picking a key color / stop editing a mask / deselect |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clip at the playhead |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S, Ctrl+O, Ctrl+I, Ctrl+E | Save, open, import, export |
@@ -112,6 +120,7 @@ src/
     content.rs         colors, gradients, text and effect settings of generated layers
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
     transition.rs      transitions on clip edges and where they play on the timeline
+    mask.rs            mask shapes, their math, and packing for the GPU
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -130,7 +139,7 @@ src/
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector (+ grading, transitions), timeline, export_dialog
+  ui/                the window: app.rs, assets, player, inspector (+ grading, masks, transitions), timeline, export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -182,6 +191,9 @@ Example: a new animatable parameter "blur radius".
 | Zoom transition strength | `ZOOM_AMOUNT` in `gpu/shaders.wgsl` |
 | Blur quality (taps per pass) | `BLUR_TAPS`, `BLOOM_TAPS`, `LENS_MIN_TAPS`, `LENS_MAX_TAPS`, `RADIAL_TAPS` in `gpu/shaders.wgsl` |
 | Most motion blur samples | `MAX_MOTION_SAMPLES` in `engine/scene.rs` (the slider range is in `core/content.rs`) |
+| Masks per clip, shape points per clip | `MAX_MASKS`, `MAX_POINTS` in `core/mask.rs` (the shader has room for exactly this) |
+| Mask value ranges and defaults | `info` and `Mask::new` in `core/mask.rs` |
+| Mask handle size, grab distance, outline color | top of `ui/masks.rs` |
 | Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
 | Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |

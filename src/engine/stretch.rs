@@ -182,6 +182,7 @@ mod tests {
             speed_affects_pitch: false,
             content: None,
             grade: Default::default(),
+            masks: Vec::new(),
             transition_in: None,
             transition_out: None,
         }

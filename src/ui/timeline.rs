@@ -79,6 +79,10 @@ impl View {
 }
 
 pub fn show(app: &mut EditorApp, ui: &mut Ui) {
+    // Clicking anywhere on the timeline goes back from an asset preview.
+    if app.source.is_some() && ui.input(|i| i.pointer.any_pressed()) && ui.ctx().pointer_latest_pos().is_some_and(|p| ui.max_rect().contains(p)) {
+        app.close_source();
+    }
     toolbar(app, ui);
     ui.separator();
 

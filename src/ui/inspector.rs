@@ -72,7 +72,10 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
         match app.selected.filter(|id| app.project.clip(*id).is_some()) {
             Some(id) => {
+                let frame_scale = app.preview.frame_scale(&app.project);
                 let ctx = ClipCtx {
+                    frame_scale,
+                    mask_edit: &mut app.player.masks.edit,
                     text: &mut app.preview.text,
                     font_search: &mut app.inspector.font_search,
                     grading: &mut app.inspector.grading,
@@ -130,6 +133,15 @@ fn widget_for(p: Param) -> Widget {
         Param::Speed => Widget::Slider { range: crate::core::model::SPEED_RANGE, decimals: 2, log: true, suffix: "x" },
         Param::Content(_) => s(0.0..=1.0, 2),
         Param::Grade(i) => info_widget(&crate::core::grade::info(i)),
+        Param::Mask(_, i) => {
+            use crate::core::mask::{self, idx};
+            match i {
+                idx::WIDTH | idx::HEIGHT => Widget::Drag { speed: 1.0, suffix: " px" },
+                idx::CENTER_X | idx::CENTER_Y => Widget::Drag { speed: 0.002, suffix: "" },
+                _ if (i as usize) >= mask::VALUES => Widget::Drag { speed: 0.002, suffix: "" },
+                _ => info_widget(&mask::info(mask::MaskKind::Rectangle, i)),
+            }
+        }
     }
 }
 
@@ -165,6 +177,7 @@ pub(super) fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol:
     let (label, widget) = match p {
         Param::Content(i) => content_param(clip.content.as_ref(), i),
         Param::Opacity if clip.content.as_ref().is_some_and(|c| c.is_effect()) => ("Mix", widget_for(p)),
+        Param::Mask(m, i) if (i as usize) < crate::core::mask::VALUES => (crate::core::mask::info(clip.masks[m as usize].kind, i).label, widget_for(p)),
         _ => (p.label(), widget_for(p)),
     };
     ui.label(label);
@@ -324,6 +337,8 @@ fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f
 
 /// Editor state the clip inspector needs besides the project.
 struct ClipCtx<'a> {
+    frame_scale: f32,
+    mask_edit: &'a mut Option<super::masks::MaskEdit>,
     text: &'a mut TextEngine,
     font_search: &'a mut String,
     grading: &'a mut super::grading::GradingState,
@@ -435,6 +450,11 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
             }
         });
         super::grading::section(ui, &mut c, local, tol, t, ctx.grading, ctx.picking);
+    }
+    if super::masks::supports_masks(project, &c) {
+        if let Some((size, _)) = crate::engine::scene::layer_space(project, &c, playhead, ctx.text, ctx.frame_scale) {
+            super::masks::section(ui, &mut c, size, local, tol, t, ctx.mask_edit);
+        }
     }
     super::transitions::section(ui, project, &mut c, t);
     if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
