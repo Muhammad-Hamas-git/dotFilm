@@ -27,9 +27,20 @@ jobs:
         run: cargo build --release
 
       - name: Test
+        shell: pwsh
         env:
           DOTFILM_REQUIRE_GPU: "1"
-        run: cargo test --release -- --nocapture
+        run: |
+          cargo test --release -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath test.log
+          $code = $LASTEXITCODE
+          # Report the GPU in use and any failure as annotations (readable through the GitHub API).
+          $gpu = Select-String -Path test.log -Pattern "adapter:" | Select-Object -First 1
+          if ($gpu) { Write-Output "::notice title=GPU::$($gpu.Line)" }
+          if ($code -ne 0) {
+            $tail = (Get-Content test.log | Select-Object -Last 60) -join "%0A"
+            Write-Output "::error title=Tests failed::$tail"
+            exit $code
+          }
 
       - name: Package
         shell: pwsh

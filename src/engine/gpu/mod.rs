@@ -50,7 +50,10 @@ pub mod tests {
     /// Set DOTFILM_REQUIRE_GPU=1 (CI does) to fail instead of skipping without a GPU.
     pub fn gpu() -> Option<super::Gpu> {
         match super::headless() {
-            Ok(g) => Some(g),
+            Ok(g) => {
+                eprintln!("adapter: {}", g.adapter_name);
+                Some(g)
+            }
             Err(e) if std::env::var_os("DOTFILM_REQUIRE_GPU").is_some() => panic!("GPU required: {e}"),
             Err(e) => {
                 eprintln!("no GPU, skipping: {e}");
