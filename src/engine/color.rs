@@ -4,7 +4,7 @@
 //! preview and the export. `apply` below is a CPU reference used by the tests to
 //! check the GPU result. Each stage clamps to 0..1.
 
-use crate::core::model::Adjustments;
+use crate::core::model::{Adjustments, ColorMatrix, VideoColor};
 
 /// Rows are output R, G, B. Columns: input R, G, B, constant offset.
 pub type Stage = [[f32; 4]; 3];
@@ -19,6 +19,32 @@ pub const CONTRAST_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 pub const SATURATION_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 pub const HUE_RANGE: std::ops::RangeInclusive<f32> = -180.0..=180.0;
 pub const VALUE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
+
+/// YUV -> RGB conversion for a video, as an affine matrix on (y, u, v) in 0..1.
+/// Rows are R, G, B; columns are y, u, v, offset.
+pub fn yuv_to_rgb(color: VideoColor, height: u32) -> Stage {
+    let (kr, kb) = match color.matrix_for(height) {
+        ColorMatrix::Bt601 => (0.299, 0.114),
+        ColorMatrix::Bt2020 => (0.2627, 0.0593),
+        _ => (0.2126, 0.0722),
+    };
+    let kg = 1.0 - kr - kb;
+    // Y = ay*y + by, chroma = ac*c + bc
+    let (ay, by, ac, bc) = if color.full_range {
+        (1.0, 0.0, 1.0, -128.0 / 255.0)
+    } else {
+        (255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0)
+    };
+    let rv = 2.0 * (1.0 - kr);
+    let bu = 2.0 * (1.0 - kb);
+    let gu = -2.0 * kb * (1.0 - kb) / kg;
+    let gv = -2.0 * kr * (1.0 - kr) / kg;
+    [
+        [ay, 0.0, rv * ac, by + rv * bc],
+        [ay, gu * ac, gv * ac, by + (gu + gv) * bc],
+        [ay, bu * ac, 0.0, by + bu * bc],
+    ]
+}
 
 /// Builds the stages for a set of adjustments, skipping any that do nothing.
 pub fn stages(adj: &Adjustments) -> Vec<Stage> {

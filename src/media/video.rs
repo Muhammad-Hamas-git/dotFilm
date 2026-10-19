@@ -1,8 +1,12 @@
 //! Streams decoded frames from a video file.
 //!
 //! One ffmpeg process decodes from a start time and writes raw YUV 4:2:0 frames
-//! (BT.709, limited range) to a pipe. YUV is 1.5 bytes per pixel instead of 4 for
-//! RGBA, and the GPU converts it to RGB for free, so this is much faster.
+//! to a pipe. YUV is 1.5 bytes per pixel instead of 4 for RGBA, and the GPU converts
+//! it to RGB for free, so this is much faster.
+//!
+//! ffmpeg only decodes and resizes here; it never converts between color standards
+//! (its YUV-to-YUV matrix conversion is imprecise and differs between versions).
+//! The GPU does the exact conversion using the file's own standard.
 //! A reader thread pushes frames into a small bounded queue, so ffmpeg runs only
 //! slightly ahead. Seeking backwards or far ahead restarts the process.
 
@@ -34,7 +38,9 @@ pub fn frame_bytes(w: u32, h: u32) -> usize {
 }
 
 /// Starts ffmpeg decoding `path` from `start` seconds at `fps`, scaled to w x h (even).
-fn spawn_decoder(path: &Path, start: f64, w: u32, h: u32, fps: f64, hwaccel: bool) -> Option<Child> {
+/// `full_range` keeps full-range sources full range (no conversion).
+fn spawn_decoder(path: &Path, start: f64, w: u32, h: u32, fps: f64, full_range: bool, hwaccel: bool) -> Option<Child> {
+    let pix = if full_range { "yuvj420p" } else { "yuv420p" };
     let mut cmd = ffmpeg::command("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if hwaccel {
@@ -47,7 +53,7 @@ fn spawn_decoder(path: &Path, start: f64, w: u32, h: u32, fps: f64, hwaccel: boo
             "-sn",
             "-dn",
             "-vf",
-            &format!("fps={fps},scale={w}:{h}:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p"),
+            &format!("fps={fps},scale={w}:{h}:flags=bilinear,format={pix}"),
             "-f",
             "rawvideo",
             "pipe:1",
@@ -104,6 +110,7 @@ impl Drop for Running {
 /// Random-access stream for the preview: follows the playhead, seeks when needed.
 pub struct VideoStream {
     path: PathBuf,
+    full_range: bool,
     pub width: u32,
     pub height: u32,
     fps: f64,
@@ -116,9 +123,10 @@ pub struct VideoStream {
 }
 
 impl VideoStream {
-    pub fn new(path: PathBuf, width: u32, height: u32, fps: u32) -> Self {
+    pub fn new(path: PathBuf, width: u32, height: u32, fps: u32, full_range: bool) -> Self {
         Self {
             path,
+            full_range,
             width: (width / 2 * 2).max(2),
             height: (height / 2 * 2).max(2),
             fps: fps.max(1) as f64,
@@ -197,7 +205,7 @@ impl VideoStream {
         self.stale = true;
         self.last_restart = Some(Instant::now());
         let t = t.max(0.0);
-        let Some(child) = spawn_decoder(&self.path, t, self.width, self.height, self.fps, false) else { return };
+        let Some(child) = spawn_decoder(&self.path, t, self.width, self.height, self.fps, self.full_range, false) else { return };
         let (rx, child) = reader_thread(child, t, self.width, self.height, self.fps);
         self.running = Some(Running { rx, child, start: t, eof: false });
     }
@@ -214,9 +222,9 @@ pub struct SequentialStream {
 }
 
 impl SequentialStream {
-    pub fn open(path: &Path, start: f64, width: u32, height: u32, fps: u32, hwaccel: bool) -> Result<Self, String> {
+    pub fn open(path: &Path, start: f64, width: u32, height: u32, fps: u32, full_range: bool, hwaccel: bool) -> Result<Self, String> {
         let (w, h) = ((width / 2 * 2).max(2), (height / 2 * 2).max(2));
-        let child = spawn_decoder(path, start, w, h, fps as f64, hwaccel).ok_or("Can't start ffmpeg decoder")?;
+        let child = spawn_decoder(path, start, w, h, fps as f64, full_range, hwaccel).ok_or("Can't start ffmpeg decoder")?;
         let (rx, child) = reader_thread(child, start, w, h, fps as f64);
         Ok(Self { rx, child, next_index: 0, current: None, width: w, height: h })
     }

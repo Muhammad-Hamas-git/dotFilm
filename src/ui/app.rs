@@ -271,6 +271,7 @@ impl EditorApp {
                         height: info.height,
                         has_audio: info.has_audio,
                         codec: info.codec,
+                        color: info.color,
                     };
                     self.media.load(&asset);
                     self.proxies.request(&asset);

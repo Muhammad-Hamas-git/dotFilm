@@ -17,10 +17,13 @@
 struct Layer {
     // Corners in clip space (x*w, y*w, 0, w): top-left, top-right, bottom-right, bottom-left.
     pos: array<vec4<f32>, 4>,
+    // YUV -> RGB for video sources (rows R, G, B; columns y, u, v, offset),
+    // matching the file's own color standard (BT.601 / 709 / 2020, limited or full range).
+    yuv: array<vec4<f32>, 3>,
     // Up to 4 color stages, 3 rows each: (r, g, b, offset).
     stages: array<vec4<f32>, 12>,
     stage_count: u32,
-    // 0 = RGBA texture, 1 = YUV 4:2:0 planes (BT.709, limited range).
+    // 0 = RGBA texture, 1 = YUV 4:2:0 planes.
     kind: u32,
     // Blend mode id, see blend() below and BlendMode::shader_id().
     blend: u32,
@@ -51,12 +54,9 @@ fn vs_layer(@builtin(vertex_index) i: u32) -> LayerOut {
     return o;
 }
 
-fn yuv709_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
-    let yy = (y * 255.0 - 16.0) / 219.0;
-    let cb = (u * 255.0 - 128.0) / 224.0;
-    let cr = (v * 255.0 - 128.0) / 224.0;
-    let rgb = vec3(yy + 1.5748 * cr, yy - 0.18733 * cb - 0.46813 * cr, yy + 1.8556 * cb);
-    return clamp(rgb, vec3(0.0), vec3(1.0));
+fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
+    let p = vec4(y, u, v, 1.0);
+    return clamp(vec3(dot(L.yuv[0], p), dot(L.yuv[1], p), dot(L.yuv[2], p)), vec3(0.0), vec3(1.0));
 }
 
 fn grade(c: vec3<f32>) -> vec3<f32> {
@@ -78,7 +78,7 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     let p2 = textureSample(plane2, samp, in.uv).r;
     var src = p0;
     if (L.kind == 1u) {
-        src = vec4(yuv709_to_rgb(p0.r, p1, p2), 1.0);
+        src = vec4(yuv_to_rgb(p0.r, p1, p2), 1.0);
     }
     let rgb = grade(src.rgb);
 

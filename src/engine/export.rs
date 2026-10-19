@@ -209,7 +209,12 @@ pub fn run(
     let mut cmd = ffmpeg::command("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"]);
     cmd.args(["-pix_fmt", if even { "yuv420p" } else { "rgba" }]);
-    cmd.args(["-s", &format!("{w}x{h}"), "-framerate", &fps.to_string(), "-i", "pipe:0", "-i"]).arg(&wav);
+    cmd.args(["-s", &format!("{w}x{h}"), "-framerate", &fps.to_string()]);
+    if even {
+        // Say exactly what the GPU produced, so no ffmpeg version adds a conversion.
+        cmd.args(["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
+    }
+    cmd.args(["-i", "pipe:0", "-i"]).arg(&wav);
     if !even {
         // H.264 needs even sizes: add one black pixel row/column.
         cmd.args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_color_matrix=bt709:out_range=tv"]);
@@ -261,7 +266,7 @@ pub fn run(
             }
             let Some(asset) = project.asset(clip.asset).filter(|a| a.kind == AssetKind::Video) else { continue };
             let (dw, dh) = scene::decode_size(project, asset, clip, 1.0, (asset.width.max(2), asset.height.max(2)));
-            let s = SequentialStream::open(&asset.path, clip.source_in, dw, dh, fps, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
+            let s = SequentialStream::open(&asset.path, clip.source_in, dw, dh, fps, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
             streams.insert(clip.id, s);
         }
 
@@ -275,7 +280,7 @@ pub fn run(
                     let (sw, sh) = (stream.width, stream.height);
                     let Some(frame) = stream.frame(index) else { continue };
                     let key = SourceKey::Clip(l.clip.id.0);
-                    comp.upload_yuv420(key, sw, sh, frame);
+                    comp.upload_yuv420(key, sw, sh, frame, super::color::yuv_to_rgb(l.asset.color, l.asset.height));
                     key
                 }
                 AssetKind::Image => {
@@ -411,16 +416,19 @@ mod tests {
 
     fn add_asset(p: &mut Project, path: &Path, d: f64, w: u32, h: u32, audio: bool) -> AssetId {
         let id = AssetId(p.alloc_id());
-        p.assets.push(Asset { id, path: path.into(), name: "x".into(), kind: AssetKind::Video, duration: d, width: w, height: h, has_audio: audio, codec: "h264".into() });
+        let color = probe::probe(path).map(|i| i.color).unwrap_or_default();
+        p.assets.push(Asset { id, path: path.into(), name: "x".into(), kind: AssetKind::Video, duration: d, width: w, height: h, has_audio: audio, codec: "h264".into(), color });
         id
     }
 
+    /// Reads one pixel of an exported file, converting explicitly as BT.709 limited
+    /// (what export writes) so the result doesn't depend on ffmpeg's defaults.
     fn pixel_at(video: &Path, t: f64, x: u32, y: u32) -> [u8; 3] {
         let (_, _, w) = probe_size(video);
         let out = ffmpeg::command("ffmpeg")
             .args(["-loglevel", "error", "-ss", &format!("{t}"), "-i"])
             .arg(video)
-            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .args(["-frames:v", "1", "-vf", "scale=in_color_matrix=bt709:in_range=tv,format=rgb24", "-f", "rawvideo", "pipe:1"])
             .output()
             .unwrap();
         let i = ((y * w + x) * 3) as usize;
@@ -485,6 +493,54 @@ mod tests {
         // Corner is outside the half-size overlay: plain base color.
         let corner = pixel_at(&out, 2.5, 10, 10);
         assert!(near(corner, [51, 102, 204], 8), "corner {corner:?}");
+    }
+
+    /// Prints each stage of the color pipeline (shows up in CI logs). Never fails.
+    #[test]
+    fn color_pipeline_diagnostics() {
+        if !ffmpeg::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("dotfilm_diag");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        color_video(&src, "0x3366CC", 1, 640, 360, None);
+        let tags = ffmpeg::command("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=pix_fmt,color_range,color_space,color_transfer,color_primaries", "-of", "csv=p=0"])
+            .arg(&src)
+            .output()
+            .unwrap();
+        eprintln!("DIAG source tags: {}", String::from_utf8_lossy(&tags.stdout).trim());
+        for hw in [false, true] {
+            let mut s = SequentialStream::open(&src, 0.0, 64, 36, 30, false, hw).unwrap();
+            let f = s.frame(3).unwrap();
+            let (y, u, v) = (f[64 * 18 + 32], f[64 * 36 + 10], f[64 * 36 + 32 * 18 + 10]);
+            eprintln!("DIAG decoded yuv hwaccel={hw}: Y={y} U={u} V={v} (source is about 100 180 98)");
+        }
+        let explicit = |file: &Path| {
+            let out = ffmpeg::command("ffmpeg")
+                .args(["-loglevel", "error", "-i"])
+                .arg(file)
+                .args(["-frames:v", "1", "-vf", "scale=in_color_matrix=bt709:in_range=tv,format=rgb24", "-f", "rawvideo", "pipe:1"])
+                .output()
+                .unwrap();
+            let i = ((180 * 640 + 320) * 3) as usize;
+            [out.stdout[i], out.stdout[i + 1], out.stdout[i + 2]]
+        };
+        eprintln!("DIAG source read implicit: {:?} explicit709: {:?}", pixel_at(&src, 0.0, 320, 180), explicit(&src));
+        let mut p = Project::default();
+        p.set_resolution(640, 360);
+        let a = add_asset(&mut p, &src, 1.0, 640, 360, false);
+        p.add_clip(a, 0, 0.0).unwrap();
+        let out = dir.join("passthrough.mp4");
+        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        let tags = ffmpeg::command("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=pix_fmt,color_range,color_space", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        eprintln!("DIAG export tags: {}", String::from_utf8_lossy(&tags.stdout).trim());
+        eprintln!("DIAG export read implicit: {:?} explicit709: {:?} (expect about [51, 102, 204])", pixel_at(&out, 0.5, 320, 180), explicit(&out));
     }
 
     #[test]

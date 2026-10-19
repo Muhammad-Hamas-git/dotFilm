@@ -24,6 +24,7 @@ const UNIFORM_STRIDE: u64 = 512;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LayerUniform {
     pos: [[f32; 4]; 4],
+    yuv: [[f32; 4]; 3],
     stages: [[f32; 4]; 12],
     stage_count: u32,
     kind: u32,
@@ -55,6 +56,8 @@ enum SourceKind {
 
 struct Source {
     kind: SourceKind,
+    /// YUV -> RGB matrix for video sources.
+    yuv: Stage,
     width: u32,
     height: u32,
     textures: Vec<wgpu::Texture>,
@@ -393,7 +396,7 @@ impl Compositor {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
             });
-            self.sources.insert(key, Source { kind, width: w, height: h, textures, bind_group });
+            self.sources.insert(key, Source { kind, yuv: [[0.0; 4]; 3], width: w, height: h, textures, bind_group });
         }
         &self.sources[&key]
     }
@@ -415,8 +418,12 @@ impl Compositor {
     }
 
     /// Uploads an I420 frame (Y, then U, then V). Width and height must be even.
-    pub fn upload_yuv420(&mut self, key: SourceKey, w: u32, h: u32, data: &[u8]) {
+    /// `yuv` converts it to RGB (see color::yuv_to_rgb).
+    pub fn upload_yuv420(&mut self, key: SourceKey, w: u32, h: u32, data: &[u8], yuv: Stage) {
         self.ensure_source(key, SourceKind::Yuv420, w, h);
+        if let Some(s) = self.sources.get_mut(&key) {
+            s.yuv = yuv;
+        }
         let t = self.sources[&key].textures.clone();
         let (ys, cs) = ((w * h) as usize, (w / 2 * h / 2) as usize);
         self.write_plane(&t[0], w, h, 1, &data[..ys]);
@@ -424,7 +431,8 @@ impl Compositor {
         self.write_plane(&t[2], w / 2, h / 2, 1, &data[ys + cs..ys + 2 * cs]);
     }
 
-    fn uniform_for(&self, layer: &LayerDraw, kind: SourceKind) -> LayerUniform {
+    fn uniform_for(&self, layer: &LayerDraw, src: &Source) -> LayerUniform {
+        let kind = src.kind;
         let (w, h) = self.canvas;
         let mut pos = [[0.0; 4]; 4];
         for i in 0..4 {
@@ -442,6 +450,7 @@ impl Compositor {
         }
         LayerUniform {
             pos,
+            yuv: src.yuv,
             stages,
             stage_count: count as u32,
             kind: if kind == SourceKind::Yuv420 { 1 } else { 0 },
@@ -458,7 +467,7 @@ impl Compositor {
         // All uniforms in one upload; each draw picks its slot with a dynamic offset.
         let mut data = vec![0u8; UNIFORM_STRIDE as usize * layers.len().max(1)];
         for (i, l) in layers.iter().enumerate() {
-            let u = self.uniform_for(l, self.sources[&l.source].kind);
+            let u = self.uniform_for(l, &self.sources[&l.source]);
             let off = i * UNIFORM_STRIDE as usize;
             data[off..off + std::mem::size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
         }

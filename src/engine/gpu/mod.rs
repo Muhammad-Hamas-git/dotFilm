@@ -149,7 +149,8 @@ pub mod tests {
         let mut frame = vec![y; (w * h) as usize];
         frame.extend(std::iter::repeat_n(u, (w * h / 4) as usize));
         frame.extend(std::iter::repeat_n(v, (w * h / 4) as usize));
-        c.upload_yuv420(k, w, h, &frame);
+        let bt709_limited = crate::engine::color::yuv_to_rgb(crate::core::model::VideoColor { matrix: crate::core::model::ColorMatrix::Bt709, full_range: false }, h);
+        c.upload_yuv420(k, w, h, &frame, bt709_limited);
         c.render(&[layer(k, full_frame(w as f32, h as f32), BlendMode::Normal, 1.0)]);
         let back = c.read_yuv420().unwrap();
         assert_eq!(back.len(), frame.len());

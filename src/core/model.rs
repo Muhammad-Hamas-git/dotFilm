@@ -22,6 +22,35 @@ pub enum AssetKind {
     Audio,
 }
 
+/// Which YUV standard a video's pixels use. Read from the file at import.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ColorMatrix {
+    /// Not tagged in the file: BT.709 for HD and larger, BT.601 for smaller (what players do).
+    #[default]
+    Auto,
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VideoColor {
+    pub matrix: ColorMatrix,
+    /// Full range (0-255, e.g. many phone and screen recordings) instead of limited (16-235).
+    pub full_range: bool,
+}
+
+impl VideoColor {
+    /// The matrix to use, resolving Auto by picture height.
+    pub fn matrix_for(&self, height: u32) -> ColorMatrix {
+        match self.matrix {
+            ColorMatrix::Auto if height >= 720 => ColorMatrix::Bt709,
+            ColorMatrix::Auto => ColorMatrix::Bt601,
+            m => m,
+        }
+    }
+}
+
 /// An imported media file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Asset {
@@ -38,6 +67,9 @@ pub struct Asset {
     /// Video codec name from ffprobe, e.g. "h264", "hevc".
     #[serde(default)]
     pub codec: String,
+    /// Video color standard. Decoding keeps it; the GPU converts exactly.
+    #[serde(default)]
+    pub color: VideoColor,
 }
 
 /// Plain (evaluated) color adjustments, used by the color math.
@@ -635,6 +667,7 @@ mod tests {
             height: 720,
             has_audio: true,
             codec: "h264".into(),
+            color: Default::default(),
         });
         (p, id)
     }

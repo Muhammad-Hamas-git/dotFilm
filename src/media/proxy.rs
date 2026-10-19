@@ -75,6 +75,7 @@ pub fn proxy_path(source: &Path) -> PathBuf {
 }
 
 struct Job {
+    full_range: bool,
     id: AssetId,
     source: PathBuf,
     duration: f64,
@@ -122,7 +123,7 @@ impl Proxies {
             return;
         }
         states.insert(asset.id, ProxyState::Queued);
-        let _ = self.tx.send(Job { id: asset.id, source: asset.path.clone(), duration: asset.duration, size: proxy_size(asset) });
+        let _ = self.tx.send(Job { full_range: asset.color.full_range, id: asset.id, source: asset.path.clone(), duration: asset.duration, size: proxy_size(asset) });
     }
 
     /// Deletes and rebuilds a proxy.
@@ -170,7 +171,9 @@ fn build(job: &Job, states: &Arc<Mutex<HashMap<AssetId, ProxyState>>>, ctx: &egu
     let spawn = ffmpeg::command("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-hwaccel", "auto", "-i"])
         .arg(&job.source)
-        .args(["-an", "-sn", "-dn", "-vf", &format!("scale={w}:{h},format=yuv420p")])
+        // Resize only: keep the source's color standard and range, so the proxy
+        // decodes with exactly the same colors as the original.
+        .args(["-an", "-sn", "-dn", "-vf", &format!("scale={w}:{h},format={}", if job.full_range { "yuvj420p" } else { "yuv420p" })])
         .args(["-c:v", "libx264", "-preset", "veryfast", "-tune", "fastdecode"])
         .args(["-g", &PROXY_GOP.to_string(), "-bf", "0", "-crf", &PROXY_CRF.to_string()])
         .args(["-progress", "pipe:1", "-nostats"])

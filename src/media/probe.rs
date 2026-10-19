@@ -2,7 +2,7 @@
 //! All functions here are blocking; call them from a background thread.
 
 use super::ffmpeg;
-use crate::core::model::AssetKind;
+use crate::core::model::{AssetKind, ColorMatrix, VideoColor};
 use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
@@ -16,6 +16,7 @@ pub struct ProbeInfo {
     pub has_audio: bool,
     /// Video codec name, e.g. "h264". Empty for images and audio.
     pub codec: String,
+    pub color: VideoColor,
 }
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif"];
@@ -29,7 +30,7 @@ pub fn is_image(path: &Path) -> bool {
 pub fn probe(path: &Path) -> Result<ProbeInfo, String> {
     if is_image(path) {
         let (w, h) = image::image_dimensions(path).map_err(|e| format!("Can't read image: {e}"))?;
-        return Ok(ProbeInfo { kind: AssetKind::Image, duration: 0.0, width: w, height: h, has_audio: false, codec: String::new() });
+        return Ok(ProbeInfo { kind: AssetKind::Image, duration: 0.0, width: w, height: h, has_audio: false, codec: String::new(), color: VideoColor::default() });
     }
 
     let out = ffmpeg::command("ffprobe")
@@ -75,11 +76,26 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, String> {
                 return Err("Video has no duration".into());
             }
             let codec = v["codec_name"].as_str().unwrap_or_default().to_string();
-            Ok(ProbeInfo { kind: AssetKind::Video, duration, width: w, height: h, has_audio, codec })
+            let color = read_color(v);
+            Ok(ProbeInfo { kind: AssetKind::Video, duration, width: w, height: h, has_audio, codec, color })
         }
-        None if has_audio => Ok(ProbeInfo { kind: AssetKind::Audio, duration, width: 0, height: 0, has_audio, codec: String::new() }),
+        None if has_audio => Ok(ProbeInfo { kind: AssetKind::Audio, duration, width: 0, height: 0, has_audio, codec: String::new(), color: VideoColor::default() }),
         None => Err("No video or audio found".into()),
     }
+}
+
+/// Color standard from ffprobe's stream info.
+fn read_color(v: &Value) -> VideoColor {
+    let space = v["color_space"].as_str().unwrap_or("");
+    let matrix = match space {
+        "bt709" => ColorMatrix::Bt709,
+        "smpte170m" | "bt470bg" | "fcc" | "smpte240m" => ColorMatrix::Bt601,
+        "bt2020nc" | "bt2020c" => ColorMatrix::Bt2020,
+        _ => ColorMatrix::Auto,
+    };
+    let pix = v["pix_fmt"].as_str().unwrap_or("");
+    let full_range = v["color_range"].as_str() == Some("pc") || pix.starts_with("yuvj");
+    VideoColor { matrix, full_range }
 }
 
 /// Decodes one frame at `t` seconds, scaled to exactly w x h, as RGBA bytes.
