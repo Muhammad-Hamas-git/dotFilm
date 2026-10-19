@@ -1,0 +1,44 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-dl
+          $bin = (Get-ChildItem ffmpeg-dl -Recurse -Filter ffmpeg.exe | Select-Object -First 1).Directory.FullName
+          "FFMPEG_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/cutroom.exe dist/
+          Copy-Item "$env:FFMPEG_BIN/ffmpeg.exe" dist/
+          Copy-Item "$env:FFMPEG_BIN/ffprobe.exe" dist/
+          Copy-Item README.md dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cutroom-windows
+          path: dist/
