@@ -6,3 +6,4 @@ pub mod gpu;
 pub mod preview;
 pub mod scene;
 pub mod stretch;
+pub mod text;

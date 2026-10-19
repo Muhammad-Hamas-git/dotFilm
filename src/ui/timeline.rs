@@ -21,6 +21,9 @@ const MAX_PPS: f32 = 600.0; // most zoomed in
 const COLOR_VIDEO: Color32 = Color32::from_rgb(52, 98, 160);
 const COLOR_IMAGE: Color32 = Color32::from_rgb(120, 78, 160);
 const COLOR_AUDIO: Color32 = Color32::from_rgb(46, 130, 92);
+const COLOR_TEXT: Color32 = Color32::from_rgb(30, 130, 140);
+const COLOR_EFFECT: Color32 = Color32::from_rgb(180, 110, 40);
+const COLOR_FILL: Color32 = Color32::from_rgb(150, 70, 110);
 const COLOR_PLAYHEAD: Color32 = Color32::from_rgb(235, 70, 70);
 
 #[derive(Clone, Copy)]
@@ -564,6 +567,11 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             AssetKind::Video => COLOR_VIDEO,
             AssetKind::Image => COLOR_IMAGE,
             AssetKind::Audio => COLOR_AUDIO,
+            AssetKind::Generated => match &clip.content {
+                Some(crate::core::content::Content::Text(_)) => COLOR_TEXT,
+                Some(crate::core::content::Content::Effect(_)) => COLOR_EFFECT,
+                _ => COLOR_FILL,
+            },
         };
         let fill = if blocked { Color32::from_rgb(160, 50, 50) } else { base };
         let hidden = app.project.tracks.get(clip.track).is_some_and(|t| t.hidden);
@@ -583,7 +591,11 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             }
         }
         let text_painter = painter.with_clip_rect(r.shrink(2.0).intersect(lanes));
-        text_painter.text(pos2(text_left, r.top() + 5.0), Align2::LEFT_TOP, &asset.name, FontId::proportional(12.0), Color32::WHITE);
+        let name = match &clip.content {
+            Some(crate::core::content::Content::Text(t)) => t.text.lines().next().unwrap_or("").to_string(),
+            _ => asset.name.clone(),
+        };
+        text_painter.text(pos2(text_left, r.top() + 5.0), Align2::LEFT_TOP, name, FontId::proportional(12.0), Color32::WHITE);
         text_painter.text(
             pos2(text_left, r.bottom() - 5.0),
             Align2::LEFT_BOTTOM,

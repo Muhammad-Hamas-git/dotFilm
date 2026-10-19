@@ -16,6 +16,10 @@ Read README.md first for the folder layout.
   inspector, timeline diamonds and undo work automatically. Keyframe times are **clip time**
   (`clip.local(t)` = seconds from the clip start). Footage position is `clip.source_time(t)`, which
   includes speed. Trimming and splitting go through `Clip::trim_start` so keyframes stay attached.
+- Generated layers (color, gradient, text, effect) keep their settings in `clip.content`; each number
+  there is an `Anim` addressed as `Param::Content(i)` (see `core/content.rs` `index`). Text is drawn as a
+  coverage mask and colored in the shader. Effects are `DrawItem::Effect` passes that read the frame so
+  far and write the other accumulation texture. Get on-screen outlines from `engine::scene::clip_quad`.
 - Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when
   they merely round a displayed value, which during playback would create a keyframe every frame.
 - The UI changes the project only through `core::model::Project` methods or direct field edits.

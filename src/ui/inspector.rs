@@ -9,6 +9,8 @@
 use super::app::EditorApp;
 use super::timeline::format_time;
 use crate::core::anim::Ease;
+use crate::core::content::{index, Content, ParamInfo, TextAlign};
+use crate::engine::text::TextEngine;
 use crate::core::model::{AssetKind, Clip, ClipId, Param, Project, MAX_FPS, MAX_SIZE};
 use crate::engine::color;
 use egui::{pos2, vec2, Color32, Rect, Sense, Shape, Slider, Stroke, Ui};
@@ -34,6 +36,8 @@ const CURVE_Y: (f32, f32) = (-0.35, 1.35);
 pub struct InspectorState {
     /// True while a widget is being dragged, so one drag = one undo step.
     editing: bool,
+    /// Filter typed into the font list.
+    font_search: String,
 }
 
 /// Collects what the widgets did this frame.
@@ -66,7 +70,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
         let mut t = Tracker::default();
 
         match app.selected.filter(|id| app.project.clip(*id).is_some()) {
-            Some(id) => clip_inspector(ui, &mut app.project, id, app.playhead, &mut t),
+            Some(id) => clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, &mut app.preview.text, &mut app.inspector.font_search),
             None => project_inspector(ui, &mut app.project, &mut t),
         }
 
@@ -115,6 +119,28 @@ fn widget_for(p: Param) -> Widget {
         Param::Value => s(color::VALUE_RANGE, 2),
         Param::Volume => s(0.0..=2.0, 2),
         Param::Speed => Widget::Slider { range: crate::core::model::SPEED_RANGE, decimals: 2, log: true, suffix: "x" },
+        Param::Content(_) => s(0.0..=1.0, 2),
+    }
+}
+
+fn info_widget(i: &ParamInfo) -> Widget {
+    Widget::Slider { range: i.min..=i.max, decimals: i.decimals, log: i.log, suffix: i.suffix }
+}
+
+/// Label and widget for a content parameter (colors use `color_row` instead).
+fn content_param(content: Option<&Content>, i: u8) -> (&'static str, Widget) {
+    let slider = |range, decimals, log, suffix| Widget::Slider { range, decimals, log, suffix };
+    match content {
+        Some(Content::Gradient(_)) if i == index::GRADIENT_ANGLE => ("Angle", slider(-360.0..=360.0, 0, false, " deg")),
+        Some(Content::Gradient(_)) => ("Position", slider(0.0..=1.0, 2, false, "")),
+        Some(Content::Text(_)) if i == index::TEXT_SIZE => ("Size", slider(4.0..=1000.0, 0, true, " px")),
+        Some(Content::Text(_)) if i == index::TEXT_LINE_SPACING => ("Line spacing", slider(0.5..=3.0, 2, false, "")),
+        Some(Content::Text(_)) if i == index::TEXT_OUTLINE_WIDTH => ("Outline width", slider(0.0..=100.0, 1, false, " px")),
+        Some(Content::Effect(e)) => match e.kind.params().get(i as usize).copied().flatten() {
+            Some(info) => (info.label, info_widget(&info)),
+            None => ("Value", slider(0.0..=1.0, 2, false, "")),
+        },
+        _ => ("Value", slider(0.0..=1.0, 2, false, "")),
     }
 }
 
@@ -126,9 +152,14 @@ fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &m
         clip.param_mut(p).toggle_key(local, tol);
         t.changed = true;
     }
-    ui.label(p.label());
+    let (label, widget) = match p {
+        Param::Content(i) => content_param(clip.content.as_ref(), i),
+        Param::Opacity if clip.content.as_ref().is_some_and(|c| c.is_effect()) => ("Mix", widget_for(p)),
+        _ => (p.label(), widget_for(p)),
+    };
+    ui.label(label);
     let mut v = clip.param(p).eval(local);
-    let r = match widget_for(p) {
+    let r = match widget {
         Widget::Drag { speed, suffix } => ui.add(egui::DragValue::new(&mut v).speed(speed).suffix(suffix)),
         Widget::Slider { range, decimals, log, suffix } => ui.add(Slider::new(&mut v, range).fixed_decimals(decimals).logarithmic(log).suffix(suffix)),
     };
@@ -139,6 +170,140 @@ fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &m
     ui.end_row();
 }
 
+/// A keyframeable color: one diamond for all four channels, and a color picker.
+/// `first` is the content index of the red channel.
+fn color_row(ui: &mut Ui, clip: &mut Clip, first: u8, label: &str, local: f64, tol: f64, t: &mut Tracker) {
+    let channels = [0, 1, 2, 3].map(|i| Param::Content(first + i));
+    let on_key = channels.iter().any(|p| clip.param(*p).key_at(local, tol).is_some());
+    let animated = channels.iter().any(|p| clip.param(*p).is_animated());
+    if key_button(ui, on_key, animated).clicked() {
+        for p in channels {
+            // Keep all four channels in step: add to all, or remove from all.
+            let a = clip.param_mut(p);
+            match (on_key, a.key_at(local, tol).is_some()) {
+                (true, true) | (false, false) => a.toggle_key(local, tol),
+                _ => {}
+            }
+        }
+        t.changed = true;
+    }
+    ui.label(label);
+    let mut rgba = channels.map(|p| (clip.param(p).eval(local).clamp(0.0, 1.0) * 255.0).round() as u8);
+    // The color button doesn't round anything by itself, so `changed` is a real edit.
+    let r = ui.color_edit_button_srgba_unmultiplied(&mut rgba);
+    if r.changed() {
+        for (i, p) in channels.into_iter().enumerate() {
+            clip.param_mut(p).set(local, rgba[i] as f32 / 255.0, tol);
+        }
+        t.changed = true;
+    }
+    ui.end_row();
+}
+
+/// The color, gradient, text or effect settings of a generated clip.
+fn content_section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Tracker, text: &mut TextEngine, font_search: &mut String) {
+    let Some(content) = c.content.clone() else { return };
+    match content {
+        Content::Color(_) => {
+            egui::CollapsingHeader::new("Fill").default_open(true).show(ui, |ui| {
+                egui::Grid::new("fill").num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+                    color_row(ui, c, index::COLOR, "Color", local, tol, t);
+                });
+            });
+        }
+        Content::Gradient(g) => {
+            egui::CollapsingHeader::new("Gradient").default_open(true).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Colors");
+                    for n in [2u8, 3] {
+                        if ui.selectable_label(g.stops == n, n.to_string()).clicked() && g.stops != n {
+                            if let Some(Content::Gradient(gm)) = &mut c.content {
+                                gm.stops = n;
+                            }
+                            t.changed = true;
+                        }
+                    }
+                });
+                egui::Grid::new("gradient").num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+                    for i in 0..g.stops.clamp(2, 3) {
+                        color_row(ui, c, index::gradient_color(i), &format!("Color {}", i + 1), local, tol, t);
+                        param_row(ui, c, Param::Content(index::gradient_position(i)), local, tol, t);
+                    }
+                    param_row(ui, c, Param::Content(index::GRADIENT_ANGLE), local, tol, t);
+                });
+            });
+        }
+        Content::Text(tp) => {
+            egui::CollapsingHeader::new("Text").default_open(true).show(ui, |ui| {
+                let mut value = tp.text.clone();
+                let r = ui.add(egui::TextEdit::multiline(&mut value).desired_rows(2).desired_width(f32::INFINITY));
+                let mut edited = tp.clone();
+                let mut changed = false;
+                if r.changed() {
+                    edited.text = value;
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Font");
+                    let shown = if edited.font.is_empty() { "Default".to_string() } else { edited.font.clone() };
+                    egui::ComboBox::from_id_salt("font").selected_text(shown).width(170.0).height(320.0).show_ui(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(font_search).hint_text("Search fonts"));
+                        if ui.selectable_label(edited.font.is_empty(), "Default").clicked() {
+                            edited.font.clear();
+                            changed = true;
+                        }
+                        let q = font_search.to_lowercase();
+                        for f in text.families().iter().filter(|f| q.is_empty() || f.to_lowercase().contains(&q)) {
+                            if ui.selectable_label(edited.font == *f, f).clicked() {
+                                edited.font = f.clone();
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.toggle_value(&mut edited.bold, "Bold").changed();
+                    changed |= ui.toggle_value(&mut edited.italic, "Italic").changed();
+                    ui.separator();
+                    for (a, label) in [(TextAlign::Left, "Left"), (TextAlign::Center, "Center"), (TextAlign::Right, "Right")] {
+                        if ui.selectable_label(edited.align == a, label).clicked() && edited.align != a {
+                            edited.align = a;
+                            changed = true;
+                        }
+                    }
+                });
+                if changed {
+                    if let Some(Content::Text(target)) = &mut c.content {
+                        target.text = edited.text;
+                        target.font = edited.font;
+                        target.bold = edited.bold;
+                        target.italic = edited.italic;
+                        target.align = edited.align;
+                    }
+                    t.changed = true;
+                    t.active |= r.has_focus();
+                }
+                egui::Grid::new("text").num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+                    param_row(ui, c, Param::Content(index::TEXT_SIZE), local, tol, t);
+                    param_row(ui, c, Param::Content(index::TEXT_LINE_SPACING), local, tol, t);
+                    color_row(ui, c, index::TEXT_FILL, "Color", local, tol, t);
+                    color_row(ui, c, index::TEXT_OUTLINE, "Outline", local, tol, t);
+                    param_row(ui, c, Param::Content(index::TEXT_OUTLINE_WIDTH), local, tol, t);
+                });
+            });
+        }
+        Content::Effect(e) => {
+            egui::CollapsingHeader::new(e.kind.label()).default_open(true).show(ui, |ui| {
+                ui.label(egui::RichText::new("Applies to everything on the tracks below.").weak());
+                let used: Vec<Param> = e.kind.params().iter().enumerate().filter(|(_, p)| p.is_some()).map(|(i, _)| Param::Content(i as u8)).collect();
+                let mut all = vec![Param::Opacity];
+                all.extend(used);
+                param_grid(ui, "effect", c, &all, local, tol, t);
+            });
+        }
+    }
+}
+
 fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f64, tol: f64, t: &mut Tracker) {
     egui::Grid::new(id).num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
         for p in params {
@@ -147,7 +312,7 @@ fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f
     });
 }
 
-fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker) {
+fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, text: &mut TextEngine, font_search: &mut String) {
     let tol = project.key_tolerance();
     let (pw, ph) = (project.width as f32, project.height as f32);
     let Some(mut c) = project.clip(id).cloned() else { return };
@@ -209,7 +374,10 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
     });
     t.changed |= timing_changed;
 
-    if asset.kind != AssetKind::Audio {
+    let is_effect = c.content.as_ref().is_some_and(|x| x.is_effect());
+    content_section(ui, &mut c, local, tol, t, text, font_search);
+
+    if asset.kind != AssetKind::Audio && !is_effect {
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
             param_grid(ui, "transform", &mut c, &[Param::X, Param::Y, Param::Scale, Param::Opacity], local, tol, t);
             ui.horizontal(|ui| {
@@ -291,7 +459,7 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
                 ui.label(egui::RichText::new("This is the last keyframe. Easing shapes the motion towards the next keyframe.").weak());
                 return;
             }
-            let current = Param::ALL.iter().find_map(|p| c.param(*p).ease_at(local, tol)).unwrap_or_default();
+            let current = c.params().iter().find_map(|p| c.param(*p).ease_at(local, tol)).unwrap_or_default();
             let mut ease = current;
             ui.horizontal_wrapped(|ui| {
                 for (label, preset) in Ease::PRESETS {
@@ -308,7 +476,7 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
                 }
             }
             if ease != current {
-                for p in Param::ALL {
+                for p in c.params() {
                     c.param_mut(p).set_ease_at(local, ease, tol);
                 }
                 t.changed = true;

@@ -26,6 +26,7 @@ struct LayerUniform {
     pos: [[f32; 4]; 4],
     yuv: [[f32; 4]; 3],
     stages: [[f32; 4]; 12],
+    extra: [[f32; 4]; 6],
     stage_count: u32,
     kind: u32,
     blend: u32,
@@ -64,9 +65,41 @@ struct Source {
     bind_group: wgpu::BindGroup,
 }
 
+/// What fills a layer.
+#[derive(Clone, Debug)]
+pub enum Paint {
+    /// An uploaded picture (video frame or image).
+    Source(SourceKey),
+    /// Computed on the GPU. Stops must be sorted by position.
+    Gradient { colors: [[f32; 4]; 3], positions: [f32; 3], count: u32, angle_deg: f32, size: (f32, f32) },
+    /// An uploaded text coverage mask, colored on the GPU.
+    Text { mask: SourceKey, fill: [f32; 4], outline: [f32; 4] },
+}
+
+/// An effect layer: processes everything drawn before it.
+#[derive(Clone, Debug)]
+pub struct EffectDraw {
+    /// EffectKind::shader_id.
+    pub kind: u32,
+    pub params: [f32; 4],
+    /// Mix with the unprocessed picture, 0..1.
+    pub opacity: f32,
+    /// Changes every frame (animated grain).
+    pub seed: u32,
+}
+
+/// One item in the stack, bottom first.
+pub enum DrawItem {
+    Layer(LayerDraw),
+    Effect(EffectDraw),
+}
+
+/// Effect id of the Gaussian blur (needs two passes).
+const BLUR_ID: u32 = 0;
+
 /// One layer to draw.
 pub struct LayerDraw {
-    pub source: SourceKey,
+    pub paint: Paint,
     pub quad: Quad,
     pub stages: Vec<Stage>,
     pub opacity: f32,
@@ -81,8 +114,10 @@ struct Targets {
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
     yuv: Option<(wgpu::Texture, wgpu::TextureView)>,
-    /// Blend inputs: (accum[i], layer) for i = 0, 1.
+    /// Blend and effect inputs: (accum[i], layer, sampler) for i = 0, 1.
     blend_groups: [wgpu::BindGroup; 2],
+    /// Just accum[i] + sampler (for passes that write into `layer`).
+    single_groups: [wgpu::BindGroup; 2],
     /// Output/yuv inputs: accum[i] + dims.
     out_groups: [wgpu::BindGroup; 2],
 }
@@ -93,11 +128,17 @@ pub struct Compositor {
     layer_over: wgpu::RenderPipeline,
     layer_replace: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
+    blur_h: wgpu::RenderPipeline,
+    blur_v: wgpu::RenderPipeline,
+    effect: wgpu::RenderPipeline,
     output: wgpu::RenderPipeline,
     yuv: wgpu::RenderPipeline,
     source_layout: wgpu::BindGroupLayout,
     pair_layout: wgpu::BindGroupLayout,
+    single_layout: wgpu::BindGroupLayout,
     out_layout: wgpu::BindGroupLayout,
+    /// Source bind group with blank textures, for gradients.
+    blank_source: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     uniform_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -189,9 +230,19 @@ impl Compositor {
                 },
             ],
         });
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
         let pair_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blend inputs"),
-            entries: &[tex_entry(4, false), tex_entry(5, false)],
+            entries: &[tex_entry(4, true), tex_entry(5, true), sampler_entry(6)],
+        });
+        let single_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("effect input"),
+            entries: &[tex_entry(4, true), sampler_entry(6)],
         });
         let out_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("output input"),
@@ -211,6 +262,7 @@ impl Compositor {
         };
         let layer_layout = layout("layer", &[Some(&uniform_layout), Some(&source_layout)]);
         let blend_layout = layout("blend", &[Some(&uniform_layout), Some(&pair_layout)]);
+        let single_pl = layout("effect single", &[Some(&uniform_layout), Some(&single_layout)]);
         let out_pl = layout("output", &[Some(&out_layout)]);
 
         let pipeline = |label: &str,
@@ -242,6 +294,9 @@ impl Compositor {
         let layer_over = pipeline("layer over", &layer_layout, "vs_layer", "fs_layer", WORK_FORMAT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), strip);
         let layer_replace = pipeline("layer replace", &layer_layout, "vs_layer", "fs_layer", WORK_FORMAT, None, strip);
         let blend = pipeline("blend", &blend_layout, "vs_full", "fs_blend", WORK_FORMAT, None, list);
+        let blur_h = pipeline("blur h", &single_pl, "vs_full", "fs_blur_h", WORK_FORMAT, None, list);
+        let blur_v = pipeline("blur v", &blend_layout, "vs_full", "fs_blur_v", WORK_FORMAT, None, list);
+        let effect = pipeline("effect", &blend_layout, "vs_full", "fs_effect", WORK_FORMAT, None, list);
         let output = pipeline("output", &out_pl, "vs_full", "fs_output", OUTPUT_FORMAT, None, list);
         let yuv = pipeline("yuv", &out_pl, "vs_full", "fs_yuv", wgpu::TextureFormat::R8Unorm, None, list);
 
@@ -273,19 +328,34 @@ impl Compositor {
         });
         let dummy = texture(&device, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING, "dummy")
             .create_view(&Default::default());
+        let blank_source = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blank source"),
+            layout: &source_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dummy) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dummy) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dummy) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
 
-        let targets = Self::make_targets(&device, &pair_layout, &out_layout, width, height);
+        let targets = Self::make_targets(&device, &pair_layout, &single_layout, &out_layout, &sampler, width, height);
         Self {
             device,
             queue,
             layer_over,
             layer_replace,
             blend,
+            blur_h,
+            blur_v,
+            effect,
             output,
             yuv,
             source_layout,
             pair_layout,
+            single_layout,
             out_layout,
+            blank_source,
             uniforms,
             uniform_group,
             sampler,
@@ -297,7 +367,15 @@ impl Compositor {
         }
     }
 
-    fn make_targets(device: &wgpu::Device, pair_layout: &wgpu::BindGroupLayout, out_layout: &wgpu::BindGroupLayout, w: u32, h: u32) -> Targets {
+    fn make_targets(
+        device: &wgpu::Device,
+        pair_layout: &wgpu::BindGroupLayout,
+        single_layout: &wgpu::BindGroupLayout,
+        out_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        w: u32,
+        h: u32,
+    ) -> Targets {
         use wgpu::TextureUsages as U;
         let work = U::RENDER_ATTACHMENT | U::TEXTURE_BINDING;
         let a0 = texture(device, w, h, WORK_FORMAT, work, "accum 0").create_view(&Default::default());
@@ -322,6 +400,17 @@ impl Compositor {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(a) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&layer) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            })
+        };
+        let single = |a: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("effect input"),
+                layout: single_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(sampler) },
                 ],
             })
         };
@@ -336,8 +425,9 @@ impl Compositor {
             })
         };
         let blend_groups = [pair(&a0), pair(&a1)];
+        let single_groups = [single(&a0), single(&a1)];
         let out_groups = [out(&a0), out(&a1)];
-        Targets { width: w, height: h, accum: [a0, a1], layer, output, output_view, yuv, blend_groups, out_groups }
+        Targets { width: w, height: h, accum: [a0, a1], layer, output, output_view, yuv, blend_groups, single_groups, out_groups }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -347,7 +437,7 @@ impl Compositor {
     /// Changes the output size. Uploaded sources are kept.
     pub fn resize(&mut self, w: u32, h: u32) {
         if (w, h) != self.size() {
-            self.targets = Self::make_targets(&self.device, &self.pair_layout, &self.out_layout, w, h);
+            self.targets = Self::make_targets(&self.device, &self.pair_layout, &self.single_layout, &self.out_layout, &self.sampler, w, h);
         }
     }
 
@@ -431,8 +521,24 @@ impl Compositor {
         self.write_plane(&t[2], w / 2, h / 2, 1, &data[ys + cs..ys + 2 * cs]);
     }
 
-    fn uniform_for(&self, layer: &LayerDraw, src: &Source) -> LayerUniform {
-        let kind = src.kind;
+    /// The source a layer reads from, if it needs one.
+    fn layer_source(&self, l: &LayerDraw) -> Option<SourceKey> {
+        match &l.paint {
+            Paint::Source(k) => Some(*k),
+            Paint::Text { mask, .. } => Some(*mask),
+            Paint::Gradient { .. } => None,
+        }
+    }
+
+    /// Can this item be drawn now? (Its picture may not be uploaded yet.)
+    fn drawable(&self, item: &DrawItem) -> bool {
+        match item {
+            DrawItem::Layer(l) => self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k)),
+            DrawItem::Effect(_) => true,
+        }
+    }
+
+    fn uniform_for(&self, layer: &LayerDraw) -> LayerUniform {
         let (w, h) = self.canvas;
         let mut pos = [[0.0; 4]; 4];
         for i in 0..4 {
@@ -448,26 +554,61 @@ impl Compositor {
                 stages[s * 3 + r] = m[r];
             }
         }
+        let mut extra = [[0.0f32; 4]; 6];
+        let mut yuv = [[0.0; 4]; 3];
+        let kind = match &layer.paint {
+            Paint::Source(k) => {
+                let src = &self.sources[k];
+                yuv = src.yuv;
+                if src.kind == SourceKind::Yuv420 { 1 } else { 0 }
+            }
+            Paint::Gradient { colors, positions, count, angle_deg, size } => {
+                extra[0] = colors[0];
+                extra[1] = colors[1];
+                extra[2] = colors[2];
+                extra[3] = [positions[0], positions[1], positions[2], *count as f32];
+                extra[4] = [angle_deg.to_radians(), size.0, size.1, 0.0];
+                2
+            }
+            Paint::Text { fill, outline, .. } => {
+                extra[0] = *fill;
+                extra[1] = *outline;
+                3
+            }
+        };
         LayerUniform {
             pos,
-            yuv: src.yuv,
+            yuv,
             stages,
+            extra,
             stage_count: count as u32,
-            kind: if kind == SourceKind::Yuv420 { 1 } else { 0 },
+            kind,
             blend: layer.blend.shader_id(),
             opacity: layer.opacity,
         }
     }
 
-    /// Draws the layers (bottom first) and fills the 8-bit output texture.
-    /// Layers whose source hasn't been uploaded are skipped.
-    pub fn render(&mut self, layers: &[LayerDraw]) {
-        let layers: Vec<&LayerDraw> = layers.iter().filter(|l| self.sources.contains_key(&l.source)).take(MAX_LAYERS).collect();
+    fn uniform_for_effect(&self, e: &EffectDraw) -> LayerUniform {
+        let (ow, oh) = self.size();
+        let mut extra = [[0.0f32; 4]; 6];
+        extra[0] = e.params;
+        // Effect sizes are in project pixels; scale them to this output.
+        extra[1] = [ow as f32 / self.canvas.0, e.seed as f32, ow as f32, oh as f32];
+        LayerUniform { pos: [[0.0; 4]; 4], yuv: [[0.0; 4]; 3], stages: [[0.0; 4]; 12], extra, stage_count: 0, kind: e.kind, blend: 0, opacity: e.opacity }
+    }
+
+    /// Draws the stack (bottom first) and fills the 8-bit output texture.
+    /// Layers whose picture hasn't been uploaded yet are skipped.
+    pub fn render(&mut self, items: &[DrawItem]) {
+        let items: Vec<&DrawItem> = items.iter().filter(|i| self.drawable(i)).take(MAX_LAYERS).collect();
 
         // All uniforms in one upload; each draw picks its slot with a dynamic offset.
-        let mut data = vec![0u8; UNIFORM_STRIDE as usize * layers.len().max(1)];
-        for (i, l) in layers.iter().enumerate() {
-            let u = self.uniform_for(l, &self.sources[&l.source]);
+        let mut data = vec![0u8; UNIFORM_STRIDE as usize * items.len().max(1)];
+        for (i, item) in items.iter().enumerate() {
+            let u = match item {
+                DrawItem::Layer(l) => self.uniform_for(l),
+                DrawItem::Effect(e) => self.uniform_for_effect(e),
+            };
             let off = i * UNIFORM_STRIDE as usize;
             data[off..off + std::mem::size_of::<LayerUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
         }
@@ -478,31 +619,62 @@ impl Compositor {
         let mut cur = 0usize;
         drop(begin_pass(&mut enc, "clear", &t.accum[0], wgpu::LoadOp::Clear(wgpu::Color::BLACK)));
 
-        for (i, l) in layers.iter().enumerate() {
-            let src = &self.sources[&l.source];
+        for (i, item) in items.iter().enumerate() {
             let offset = (i as u64 * UNIFORM_STRIDE) as u32;
-            if l.blend == BlendMode::Normal {
-                let mut pass = begin_pass(&mut enc, "layer", &t.accum[cur], wgpu::LoadOp::Load);
-                pass.set_pipeline(&self.layer_over);
-                pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                pass.set_bind_group(1, &src.bind_group, &[]);
-                pass.draw(0..4, 0..1);
-            } else {
-                {
-                    let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
-                    let mut pass = begin_pass(&mut enc, "layer to tex", &t.layer, clear);
-                    pass.set_pipeline(&self.layer_replace);
-                    pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                    pass.set_bind_group(1, &src.bind_group, &[]);
-                    pass.draw(0..4, 0..1);
+            match item {
+                DrawItem::Layer(l) => {
+                    let group = match self.layer_source(l) {
+                        Some(k) => &self.sources[&k].bind_group,
+                        None => &self.blank_source,
+                    };
+                    if l.blend == BlendMode::Normal {
+                        let mut pass = begin_pass(&mut enc, "layer", &t.accum[cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.layer_over);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                        pass.set_bind_group(1, group, &[]);
+                        pass.draw(0..4, 0..1);
+                    } else {
+                        {
+                            let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                            let mut pass = begin_pass(&mut enc, "layer to tex", &t.layer, clear);
+                            pass.set_pipeline(&self.layer_replace);
+                            pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                            pass.set_bind_group(1, group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        let mut pass = begin_pass(&mut enc, "blend", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.blend);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                        pass.draw(0..3, 0..1);
+                        drop(pass);
+                        cur = 1 - cur;
+                    }
                 }
-                let mut pass = begin_pass(&mut enc, "blend", &t.accum[1 - cur], wgpu::LoadOp::Load);
-                pass.set_pipeline(&self.blend);
-                pass.set_bind_group(0, &self.uniform_group, &[offset]);
-                pass.set_bind_group(1, &t.blend_groups[cur], &[]);
-                pass.draw(0..3, 0..1);
-                drop(pass);
-                cur = 1 - cur;
+                DrawItem::Effect(e) => {
+                    if e.kind == BLUR_ID {
+                        // Horizontal pass into `layer`, vertical pass into the other accum.
+                        {
+                            let mut pass = begin_pass(&mut enc, "blur h", &t.layer, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+                            pass.set_pipeline(&self.blur_h);
+                            pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                            pass.set_bind_group(1, &t.single_groups[cur], &[]);
+                            pass.draw(0..3, 0..1);
+                        }
+                        let mut pass = begin_pass(&mut enc, "blur v", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.blur_v);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                        pass.draw(0..3, 0..1);
+                    } else {
+                        let mut pass = begin_pass(&mut enc, "effect", &t.accum[1 - cur], wgpu::LoadOp::Load);
+                        pass.set_pipeline(&self.effect);
+                        pass.set_bind_group(0, &self.uniform_group, &[offset]);
+                        pass.set_bind_group(1, &t.blend_groups[cur], &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    cur = 1 - cur;
+                }
             }
         }
 

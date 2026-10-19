@@ -22,8 +22,14 @@ struct Layer {
     yuv: array<vec4<f32>, 3>,
     // Up to 4 color stages, 3 rows each: (r, g, b, offset).
     stages: array<vec4<f32>, 12>,
+    // Extra values for generated layers and effects:
+    //   gradient: [0..3] stop colors, [3] stop positions + count in w, [4] (angle rad, width, height, _)
+    //   text:     [0] fill color, [1] outline color
+    //   effects:  [0] effect settings, [1] (canvas scale, frame seed, output width, output height)
+    gen: array<vec4<f32>, 6>,
     stage_count: u32,
-    // 0 = RGBA texture, 1 = YUV 4:2:0 planes.
+    // Layers: 0 = RGBA texture, 1 = YUV 4:2:0 planes, 2 = gradient, 3 = text mask.
+    // Effects: the effect id (see EffectKind::shader_id).
     kind: u32,
     // Blend mode id, see blend() below and BlendMode::shader_id().
     blend: u32,
@@ -59,6 +65,29 @@ fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
     return clamp(vec3(dot(L.yuv[0], p), dot(L.yuv[1], p), dot(L.yuv[2], p)), vec3(0.0), vec3(1.0));
 }
 
+// CSS-style linear gradient across the layer.
+fn gradient(uv: vec2<f32>) -> vec4<f32> {
+    let ang = L.gen[4].x;
+    let size = L.gen[4].yz;
+    let count = u32(L.gen[3].w);
+    let dir = vec2(sin(ang), -cos(ang));
+    let len = abs(size.x * dir.x) + abs(size.y * dir.y);
+    let t = clamp(dot((uv - 0.5) * size, dir) / max(len, 1e-6) + 0.5, 0.0, 1.0);
+    let pos = L.gen[3].xyz;
+    if (count < 2u || t <= pos.x) {
+        return L.gen[0];
+    }
+    if (count == 2u || t <= pos.y) {
+        let f = clamp((t - pos.x) / max(pos.y - pos.x, 1e-6), 0.0, 1.0);
+        return mix(L.gen[0], L.gen[1], f);
+    }
+    if (t >= pos.z) {
+        return L.gen[2];
+    }
+    let f = clamp((t - pos.y) / max(pos.z - pos.y, 1e-6), 0.0, 1.0);
+    return mix(L.gen[1], L.gen[2], f);
+}
+
 fn grade(c: vec3<f32>) -> vec3<f32> {
     var x = c;
     for (var s = 0u; s < L.stage_count; s = s + 1u) {
@@ -79,6 +108,20 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     var src = p0;
     if (L.kind == 1u) {
         src = vec4(yuv_to_rgb(p0.r, p1, p2), 1.0);
+    } else if (L.kind == 2u) {
+        src = gradient(in.uv);
+    } else if (L.kind == 3u) {
+        // Text mask: red = letters, green = outline. Letters sit on top of the outline.
+        let fill = L.gen[0];
+        let outline = L.gen[1];
+        let a_fill = p0.r * fill.a;
+        let a_out = p0.g * outline.a * (1.0 - a_fill);
+        let a = a_fill + a_out;
+        var rgb = vec3(0.0);
+        if (a > 0.0) {
+            rgb = (fill.rgb * a_fill + outline.rgb * a_out) / a;
+        }
+        src = vec4(rgb, a);
     }
     let rgb = grade(src.rgb);
 
@@ -251,4 +294,127 @@ fn fs_yuv(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let yy = dot(c, LUMA709);
     let v = select((c.b - yy) / 1.8556, (c.r - yy) / 1.5748, is_v);
     return vec4((128.0 + 224.0 * v) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------- effect passes
+// Effect layers process everything below them: they read the frame so far
+// (`backdrop`) and write the result into the other accumulation texture.
+
+@group(1) @binding(6) var lin: sampler;
+
+fn out_size() -> vec2<f32> {
+    return L.gen[1].zw;
+}
+
+// Gaussian blur along one direction. Radius is in project pixels, scaled to the
+// output so preview and export look the same. Large radii use spaced-out taps.
+fn blur_dir(tex: texture_2d<f32>, uv: vec2<f32>, dir: vec2<f32>) -> vec4<f32> {
+    let radius = L.gen[0].x * L.gen[1].x;
+    if (radius < 0.5) {
+        return textureSampleLevel(tex, lin, uv, 0.0);
+    }
+    let n = i32(min(ceil(radius), 32.0));
+    let step = radius / f32(n);
+    let sigma = radius * 0.5;
+    var sum = vec4(0.0);
+    var wsum = 0.0;
+    for (var i = -n; i <= n; i = i + 1) {
+        let x = f32(i) * step;
+        let w = exp(-(x * x) / (2.0 * sigma * sigma));
+        sum = sum + textureSampleLevel(tex, lin, uv + dir * x, 0.0) * w;
+        wsum = wsum + w;
+    }
+    return sum / wsum;
+}
+
+@fragment
+fn fs_blur_h(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = out_size();
+    return blur_dir(backdrop, p.xy / size, vec2(1.0 / size.x, 0.0));
+}
+
+@fragment
+fn fs_blur_v(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = out_size();
+    let blurred = blur_dir(layer_tex, p.xy / size, vec2(0.0, 1.0 / size.y));
+    let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0);
+    return vec4(mix(orig.rgb, blurred.rgb, L.opacity), 1.0);
+}
+
+fn hash3(p: vec3<u32>) -> f32 {
+    var x = p.x * 1664525u + p.y * 1013904223u + p.z * 2654435761u;
+    x = x ^ (x >> 16u);
+    x = x * 2246822519u;
+    x = x ^ (x >> 13u);
+    x = x * 3266489917u;
+    x = x ^ (x >> 16u);
+    return f32(x) / 4294967295.0;
+}
+
+// One grain value per cell: present with probability `amount`, random strength.
+fn grain_cell(c: vec2<i32>, seed: u32, channel: u32, amount: f32) -> f32 {
+    let key = vec3(bitcast<u32>(c.x), bitcast<u32>(c.y), seed * 4u + channel);
+    let present = hash3(key) < amount;
+    return select(0.0, hash3(key + vec3(0u, 0u, 7919u)) * 2.0 - 1.0, present);
+}
+
+// Smooth (bilinear) value noise over grain cells, so grains look organic, not square.
+fn grain(pos: vec2<f32>, seed: u32, channel: u32, amount: f32) -> f32 {
+    let base = floor(pos);
+    let f = pos - base;
+    let s = f * f * (3.0 - 2.0 * f);
+    let b = vec2<i32>(base);
+    let a00 = grain_cell(b, seed, channel, amount);
+    let a10 = grain_cell(b + vec2(1, 0), seed, channel, amount);
+    let a01 = grain_cell(b + vec2(0, 1), seed, channel, amount);
+    let a11 = grain_cell(b + vec2(1, 1), seed, channel, amount);
+    return mix(mix(a00, a10, s.x), mix(a01, a11, s.x), s.y);
+}
+
+@fragment
+fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = out_size();
+    let uv = p.xy / size;
+    let k = L.gen[1].x;
+    let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0).rgb;
+    let e = L.gen[0];
+    var rgb = orig;
+    switch L.kind {
+        case 1u: {
+            // Vignette: e = (amount, size, softness, roundness).
+            let aspect = size.x / size.y;
+            let frame_d = length((uv - 0.5) * 2.0) / sqrt(2.0);
+            let circle_d = length((uv - 0.5) * vec2(aspect, 1.0)) / length(vec2(aspect, 1.0) * 0.5);
+            let d = mix(frame_d, circle_d, e.w);
+            let v = smoothstep(e.y, e.y + e.z, d);
+            if (e.x >= 0.0) {
+                rgb = orig * (1.0 - e.x * v);
+            } else {
+                rgb = mix(orig, vec3(1.0), -e.x * v);
+            }
+        }
+        case 2u: {
+            // Film grain: e = (size px, intensity, amount, color). New pattern every frame.
+            let seed = u32(L.gen[1].y);
+            let pos = (p.xy / k) / max(e.x, 0.1);
+            let mono = grain(pos, seed, 0u, e.z);
+            let colored = vec3(grain(pos, seed, 1u, e.z), grain(pos, seed, 2u, e.z), grain(pos, seed, 3u, e.z));
+            let n = mix(vec3(mono), colored, e.w);
+            // Strongest in the midtones, like real film.
+            let lum = dot(orig, vec3(0.2126, 0.7152, 0.0722));
+            let w = 1.0 - pow(abs(lum * 2.0 - 1.0), 2.0) * 0.7;
+            rgb = clamp(orig + n * e.y * 0.5 * w, vec3(0.0), vec3(1.0));
+        }
+        case 3u: {
+            // Chromatic aberration: e = (amount px, angle deg, radial, _).
+            let ang = radians(e.y);
+            let dir = mix(vec2(cos(ang), sin(ang)), (uv - 0.5) * 2.0, e.z);
+            let off = dir * e.x * k / size;
+            let r = textureSampleLevel(backdrop, lin, uv + off, 0.0).r;
+            let b = textureSampleLevel(backdrop, lin, uv - off, 0.0).b;
+            rgb = vec3(r, orig.g, b);
+        }
+        default: {}
+    }
+    return vec4(mix(orig, rgb, L.opacity), 1.0);
 }

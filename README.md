@@ -4,6 +4,11 @@ A desktop video editor written in Rust, rendered on the GPU.
 
 - **Assets panel**: import video, images and audio (Import button, or drag files onto the window).
   Heavy videos (4K, HEVC, ProRes...) automatically get a fast **proxy** for editing.
+  **New** makes solid colors, gradients (2 or 3 colors, any angle), text and effects.
+- **Text**: any installed font, bold/italic, alignment, size, line spacing, fill and outline color,
+  outline width. Proper shaping for Arabic, Urdu and other complex scripts. All keyframeable.
+- **Effect layers**: Gaussian blur, vignette, film grain (new pattern every frame), chromatic aberration.
+  An effect clip is its own layer on a track and changes everything on the tracks below it.
 - **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize it.
   Hit-testing follows the real 3D outline of rotated layers. Snaps to the frame center.
 - **Adjustments panel**: position, scale, opacity, **3D rotation (pitch, yaw, roll)**, brightness, contrast,
@@ -92,6 +97,7 @@ src/
   core/              the project as plain data (no UI, no video, no GPU)
     model.rs           assets, tracks, clips, blend modes, parameters, save/load
     anim.rs            keyframes and easing curves
+    content.rs         colors, gradients, text and effect settings of generated layers
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -106,6 +112,7 @@ src/
     gpu/compositor.rs  runs the shaders, manages GPU textures
     color.rs           color adjustments as matrices
     preview.rs         the player picture
+    text.rs            text layout and rasterizing (cosmic-text, system fonts)
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
@@ -151,6 +158,9 @@ Example: a new animatable parameter "blur radius".
 | Hardware decoding on export, audio bitrate | top of `engine/export.rs` |
 | Resolution / fps presets | `RESOLUTIONS` and `FRAME_RATES` in `ui/inspector.rs` |
 | Undo steps | `MAX_UNDO` in `core/history.rs` |
+| Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
+| Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
+| Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
 | Speed range | `SPEED_RANGE` in `core/model.rs` |
 | Time-stretch quality (chunk size, alignment search) | `WINDOW`, `SEEK` in `engine/stretch.rs` |
 

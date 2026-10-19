@@ -42,7 +42,7 @@ pub fn headless() -> Result<Gpu, String> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::compositor::{Compositor, LayerDraw, SourceKey};
+    use super::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey};
     use crate::core::geometry::{self, Placement};
     use crate::core::model::{Adjustments, BlendMode};
     use crate::engine::color;
@@ -71,8 +71,17 @@ pub mod tests {
         c.upload_rgba(key, 4, 4, &px);
     }
 
-    fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> LayerDraw {
-        LayerDraw { source: key, quad, stages: vec![], opacity, blend }
+    fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> DrawItem {
+        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), quad, stages: vec![], opacity, blend })
+    }
+
+    fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
+        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed })
+    }
+
+    fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * w + x) * 4) as usize;
+        [img[i], img[i + 1], img[i + 2]]
     }
 
     fn close(a: &[u8], b: [u8; 3], tol: i32) -> bool {
@@ -129,9 +138,8 @@ pub mod tests {
         let src = [180u8, 90, 40, 255];
         solid(&mut c, k, src);
         let adj = Adjustments { brightness: 0.05, contrast: 1.3, saturation: 1.4, hue: 35.0, value: 0.9 };
-        let mut d = LayerDraw { source: k, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
-        d.stages = color::stages(&adj);
-        c.render(&[d]);
+        let d = LayerDraw { paint: Paint::Source(k), quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
+        c.render(&[DrawItem::Layer(d)]);
         let px = c.read_rgba();
         let mut cpu = Vec::new();
         color::apply(&src, &mut cpu, &adj);
@@ -192,5 +200,84 @@ pub mod tests {
         assert_eq!(at(100, 50), 255);
         assert_eq!(at(5, 5), 0);
         assert_eq!(q.contains(100.0, 50.0), true);
+    }
+
+    #[test]
+    fn gradient_runs_left_to_right_at_90_degrees() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (100u32, 20u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let paint = Paint::Gradient {
+            colors: [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+            positions: [0.0, 0.5, 1.0],
+            count: 3,
+            angle_deg: 90.0,
+            size: (w as f32, h as f32),
+        };
+        c.render(&[DrawItem::Layer(LayerDraw { paint, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        let img = c.read_rgba();
+        let (l, m, r) = (px(&img, w, 1, 10), px(&img, w, 50, 10), px(&img, w, 98, 10));
+        assert!(l[0] > 240 && l[2] < 15, "left {l:?}");
+        assert!(m[1] > 240, "middle {m:?}");
+        assert!(r[2] > 240 && r[0] < 15, "right {r:?}");
+    }
+
+    #[test]
+    fn text_mask_is_colored_on_gpu() {
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 4, 4);
+        // Left half letters (red channel), right half outline only (green channel).
+        let mut mask = Vec::new();
+        for _y in 0..4 {
+            for x in 0..4 {
+                mask.extend_from_slice(if x < 2 { &[255u8, 255, 0, 255] } else { &[0u8, 255, 0, 255] });
+            }
+        }
+        let k = SourceKey::Clip(9);
+        c.upload_rgba(k, 4, 4, &mask);
+        let paint = Paint::Text { mask: k, fill: [1.0, 1.0, 0.0, 1.0], outline: [0.0, 0.0, 1.0, 1.0] };
+        c.render(&[DrawItem::Layer(LayerDraw { paint, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, 4, 0, 1), [255, 255, 0], 3), "fill {:?}", px(&img, 4, 0, 1));
+        assert!(close(&px(&img, 4, 3, 1), [0, 0, 255], 3), "outline {:?}", px(&img, 4, 3, 1));
+    }
+
+    #[test]
+    fn effects_process_the_layers_below() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let white = SourceKey::Asset(1);
+        solid(&mut c, white, [255, 255, 255, 255]);
+        let q = full_frame(w as f32, h as f32);
+
+        // Vignette darkens corners, leaves the center.
+        c.render(&[layer(white, q, BlendMode::Normal, 1.0), effect(1, [1.0, 0.3, 0.3, 0.0], 0)]);
+        let img = c.read_rgba();
+        assert!(px(&img, w, 32, 32)[0] > 240);
+        assert!(px(&img, w, 1, 1)[0] < 40, "corner {:?}", px(&img, w, 1, 1));
+
+        // Blur spreads a sharp edge: a white square on black.
+        let p = Placement { cx: 32.0, cy: 32.0, width: 20.0, height: 20.0, pitch: 0.0, yaw: 0.0, roll: 0.0 };
+        let small = geometry::project(&p, w as f32, h as f32);
+        c.render(&[layer(white, small, BlendMode::Normal, 1.0)]);
+        let sharp = px(&c.read_rgba(), w, 20, 32)[0];
+        c.render(&[layer(white, small, BlendMode::Normal, 1.0), effect(0, [8.0, 0.0, 0.0, 0.0], 0)]);
+        let soft = c.read_rgba();
+        assert_eq!(sharp, 0);
+        assert!(px(&soft, w, 20, 32)[0] > 20, "blur should reach outside: {:?}", px(&soft, w, 20, 32));
+        assert!(px(&soft, w, 32, 32)[0] > 200);
+
+        // Grain changes with the frame seed.
+        let gray = SourceKey::Asset(2);
+        solid(&mut c, gray, [128, 128, 128, 255]);
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), effect(2, [1.0, 1.0, 1.0, 0.0], 1)]);
+        let a = c.read_rgba();
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), effect(2, [1.0, 1.0, 1.0, 0.0], 2)]);
+        let b = c.read_rgba();
+        let varied = a.chunks(4).filter(|p| (p[0] as i32 - 128).abs() > 10).count();
+        let differs = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x[0] != y[0]).count();
+        assert!(varied > 500, "grain should vary pixels: {varied}");
+        assert!(differs > 500, "grain should change per frame: {differs}");
     }
 }

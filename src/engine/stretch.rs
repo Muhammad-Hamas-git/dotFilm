@@ -180,6 +180,7 @@ mod tests {
             volume: Anim::new(1.0),
             speed: Anim::new(speed),
             speed_affects_pitch: false,
+            content: None,
         }
     }
 

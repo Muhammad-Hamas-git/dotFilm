@@ -6,7 +6,8 @@
 //! - upcoming clips start decoding a second early (pre-roll);
 //! - if nothing changed since the last frame, no GPU work is done at all.
 
-use super::gpu::compositor::{Compositor, LayerDraw, SourceKey};
+use super::gpu::compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey};
+use super::text::TextEngine;
 use super::gpu::wgpu;
 use super::{color, scene};
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
@@ -39,6 +40,10 @@ pub struct PreviewRenderer {
     gpu: Option<Gpu>,
     streams: HashMap<ClipId, VideoStream>,
     uploaded_images: HashSet<AssetId>,
+    /// Text mask currently uploaded for each text clip (by mask key).
+    uploaded_text: HashMap<ClipId, u64>,
+    /// Lays out and draws text; also used by the player to measure text clips.
+    pub text: TextEngine,
     last_signature: u64,
     /// True while a visible video is still waiting for its frame.
     pub waiting: bool,
@@ -55,17 +60,32 @@ impl PreviewRenderer {
             texture: None,
             registered: (0, 0),
         });
-        Self { gpu, streams: HashMap::new(), uploaded_images: HashSet::new(), last_signature: 0, waiting: false, quality: DEFAULT_QUALITY }
+        Self {
+            gpu,
+            streams: HashMap::new(),
+            uploaded_images: HashSet::new(),
+            uploaded_text: HashMap::new(),
+            text: TextEngine::default(),
+            last_signature: 0,
+            waiting: false,
+            quality: DEFAULT_QUALITY,
+        }
     }
 
     /// Drops all decoders and uploads (e.g. after loading another project).
     pub fn reset(&mut self) {
         self.streams.clear();
         self.uploaded_images.clear();
+        self.uploaded_text.clear();
         if let Some(g) = &mut self.gpu {
             g.compositor.retain_sources(|_| false);
         }
         self.last_signature = 0;
+    }
+
+    /// Preview size / project size.
+    pub fn frame_scale(&self, project: &Project) -> f32 {
+        self.preview_size(project).0 as f32 / project.width as f32
     }
 
     /// Size the preview renders at.
@@ -102,48 +122,75 @@ impl PreviewRenderer {
             }
         }
 
-        let layers = scene::layers_at(project, t);
-        let mut draws = Vec::with_capacity(layers.len());
+        let items = scene::items_at(project, t, &mut self.text, frame_scale);
+        let seed = scene::frame_seed(project, t);
+        let mut draws = Vec::with_capacity(items.len());
         let mut sig = DefaultHasher::new();
         size.hash(&mut sig);
+        let mut keep_text: HashSet<ClipId> = HashSet::new();
 
-        for l in &layers {
-            let key = match l.asset.kind {
-                AssetKind::Video => {
-                    let (path, native) = source_for(l.asset, proxies);
-                    let (w, h) = scene::decode_size(project, l.asset, l.clip, frame_scale, native);
-                    let stream = ensure_stream(&mut self.streams, l.clip.id, path, w, h, l.clip.decode_rate(project.fps), l.asset.color.full_range);
-                    keep_streams.insert(l.clip.id);
-                    let changed = stream.update(l.source_time);
-                    if stream.is_stale() {
-                        self.waiting = true;
-                    }
-                    let key = SourceKey::Clip(l.clip.id.0);
-                    match stream.current() {
-                        Some(f) => {
-                            if changed || !gpu.compositor.has_source(key) {
-                                let yuv = color::yuv_to_rgb(l.asset.color, l.asset.height);
-                                gpu.compositor.upload_yuv420(key, stream.width, stream.height, &f.data, yuv);
-                            }
-                            f.pts.to_bits().hash(&mut sig);
-                            (stream.width, stream.height).hash(&mut sig);
-                        }
-                        None => continue,
-                    }
-                    key
+        for item in &items {
+            let l = match item {
+                scene::SceneItem::Effect(e) => {
+                    (e.kind, e.params.map(f32::to_bits), e.opacity.to_bits(), seed).hash(&mut sig);
+                    draws.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed }));
+                    continue;
                 }
-                AssetKind::Image => {
-                    let key = SourceKey::Asset(l.asset.id.0);
-                    if !self.uploaded_images.contains(&l.asset.id) {
-                        let Some(img) = media.images.get(&l.asset.id) else { continue };
-                        gpu.compositor.upload_rgba(key, img.width, img.height, &img.rgba);
-                        self.uploaded_images.insert(l.asset.id);
-                    }
-                    key
-                }
-                AssetKind::Audio => continue,
+                scene::SceneItem::Layer(l) => l,
             };
-            key.hash(&mut sig);
+            let paint = match &l.paint {
+                scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
+                    (colors.iter().flatten().chain(positions.iter()).map(|v| v.to_bits()).collect::<Vec<_>>(), count, angle_deg.to_bits()).hash(&mut sig);
+                    Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
+                }
+                scene::ScenePaint::Text { mask, fill, outline } => {
+                    let key = SourceKey::Clip(l.clip.id.0);
+                    keep_text.insert(l.clip.id);
+                    if self.uploaded_text.get(&l.clip.id) != Some(&mask.key) || !gpu.compositor.has_source(key) {
+                        gpu.compositor.upload_rgba(key, mask.width, mask.height, &mask.rgba);
+                        self.uploaded_text.insert(l.clip.id, mask.key);
+                    }
+                    (mask.key, fill.map(f32::to_bits), outline.map(f32::to_bits)).hash(&mut sig);
+                    Paint::Text { mask: key, fill: *fill, outline: *outline }
+                }
+                scene::ScenePaint::Media => match l.asset.kind {
+                    AssetKind::Video => {
+                        let (path, native) = source_for(l.asset, proxies);
+                        let (w, h) = scene::decode_size(project, l.asset, l.clip, frame_scale, native);
+                        let stream = ensure_stream(&mut self.streams, l.clip.id, path, w, h, l.clip.decode_rate(project.fps), l.asset.color.full_range);
+                        keep_streams.insert(l.clip.id);
+                        let changed = stream.update(l.source_time);
+                        if stream.is_stale() {
+                            self.waiting = true;
+                        }
+                        let key = SourceKey::Clip(l.clip.id.0);
+                        match stream.current() {
+                            Some(f) => {
+                                if changed || !gpu.compositor.has_source(key) {
+                                    let yuv = color::yuv_to_rgb(l.asset.color, l.asset.height);
+                                    gpu.compositor.upload_yuv420(key, stream.width, stream.height, &f.data, yuv);
+                                }
+                                f.pts.to_bits().hash(&mut sig);
+                                (stream.width, stream.height).hash(&mut sig);
+                            }
+                            None => continue,
+                        }
+                        Paint::Source(key)
+                    }
+                    AssetKind::Image => {
+                        let key = SourceKey::Asset(l.asset.id.0);
+                        if !self.uploaded_images.contains(&l.asset.id) {
+                            let Some(img) = media.images.get(&l.asset.id) else { continue };
+                            gpu.compositor.upload_rgba(key, img.width, img.height, &img.rgba);
+                            self.uploaded_images.insert(l.asset.id);
+                        }
+                        key.hash(&mut sig);
+                        Paint::Source(key)
+                    }
+                    _ => continue,
+                },
+            };
+            l.clip.id.hash(&mut sig);
             for p in l.quad.pts.iter().flatten().chain(l.quad.w.iter()) {
                 p.to_bits().hash(&mut sig);
             }
@@ -152,15 +199,16 @@ impl PreviewRenderer {
             }
             l.opacity.to_bits().hash(&mut sig);
             l.blend.hash(&mut sig);
-            draws.push(LayerDraw { source: key, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend });
+            draws.push(DrawItem::Layer(LayerDraw { paint, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
         }
 
-        // Free decoders, video textures and images that are gone.
+        // Free decoders, video textures, text masks and images that are gone.
         self.streams.retain(|id, _| keep_streams.contains(id));
+        self.uploaded_text.retain(|id, _| keep_text.contains(id));
         let live_assets: HashSet<u64> = project.assets.iter().map(|a| a.id.0).collect();
         self.uploaded_images.retain(|a| live_assets.contains(&a.0));
         gpu.compositor.retain_sources(|k| match k {
-            SourceKey::Clip(c) => keep_streams.contains(&ClipId(*c)),
+            SourceKey::Clip(c) => keep_streams.contains(&ClipId(*c)) || keep_text.contains(&ClipId(*c)),
             SourceKey::Asset(a) => live_assets.contains(a),
         });
 

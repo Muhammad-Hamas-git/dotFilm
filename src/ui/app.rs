@@ -81,6 +81,7 @@ impl EditorApp {
             audio_signature: 0,
             window_title: String::new(),
         };
+        app.preview.text.warm_up();
         // Check for hardware encoders without blocking startup.
         {
             let enc = app.encoders.clone();
@@ -280,6 +281,7 @@ impl EditorApp {
                         has_audio: info.has_audio,
                         codec: info.codec,
                         color: info.color,
+                        generator: None,
                     };
                     self.media.load(&asset);
                     self.proxies.request(&asset);

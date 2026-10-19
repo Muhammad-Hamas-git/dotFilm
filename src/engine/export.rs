@@ -4,7 +4,8 @@
 
 use super::audio::{audio_clip, mix_clips};
 use super::stretch;
-use super::gpu::{self, compositor::{Compositor, LayerDraw, SourceKey}};
+use super::gpu::{self, compositor::{Compositor, DrawItem, EffectDraw, LayerDraw, Paint, SourceKey}};
+use super::text::TextEngine;
 use super::scene;
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
 use crate::media::{ffmpeg, probe, video::SequentialStream};
@@ -252,6 +253,8 @@ pub fn run(
 
     let mut streams: HashMap<ClipId, (SequentialStream, f64)> = HashMap::new();
     let mut images: HashSet<AssetId> = HashSet::new();
+    let mut text_engine = TextEngine::default();
+    let mut uploaded_text: HashMap<ClipId, u64> = HashMap::new();
     let started = Instant::now();
 
     for i in 0..frames {
@@ -272,30 +275,51 @@ pub fn run(
             streams.insert(clip.id, (s, rate));
         }
 
-        let layers = scene::layers_at(project, t);
-        let mut draws = Vec::with_capacity(layers.len());
-        for l in &layers {
-            let key = match l.asset.kind {
-                AssetKind::Video => {
-                    let Some((stream, rate)) = streams.get_mut(&l.clip.id) else { continue };
-                    let index = ((l.source_time - l.clip.source_in) * *rate).round().max(0.0) as u64;
-                    let (sw, sh) = (stream.width, stream.height);
-                    let Some(frame) = stream.frame(index) else { continue };
-                    let key = SourceKey::Clip(l.clip.id.0);
-                    comp.upload_yuv420(key, sw, sh, frame, super::color::yuv_to_rgb(l.asset.color, l.asset.height));
-                    key
+        let items = scene::items_at(project, t, &mut text_engine, 1.0);
+        let seed = scene::frame_seed(project, t);
+        let mut draws = Vec::with_capacity(items.len());
+        for item in &items {
+            let l = match item {
+                scene::SceneItem::Effect(e) => {
+                    draws.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed }));
+                    continue;
                 }
-                AssetKind::Image => {
-                    let key = SourceKey::Asset(l.asset.id.0);
-                    if images.insert(l.asset.id) {
-                        let (iw, ih, px) = probe::load_image(&l.asset.path, IMAGE_MAX_SIDE, IMAGE_MAX_SIDE).map_err(|e| fail(e, &mut enc))?;
-                        comp.upload_rgba(key, iw, ih, &px);
-                    }
-                    key
-                }
-                AssetKind::Audio => continue,
+                scene::SceneItem::Layer(l) => l,
             };
-            draws.push(LayerDraw { source: key, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend });
+            let paint = match &l.paint {
+                scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
+                    Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
+                }
+                scene::ScenePaint::Text { mask, fill, outline } => {
+                    let key = SourceKey::Clip(l.clip.id.0);
+                    if uploaded_text.get(&l.clip.id) != Some(&mask.key) {
+                        comp.upload_rgba(key, mask.width, mask.height, &mask.rgba);
+                        uploaded_text.insert(l.clip.id, mask.key);
+                    }
+                    Paint::Text { mask: key, fill: *fill, outline: *outline }
+                }
+                scene::ScenePaint::Media => match l.asset.kind {
+                    AssetKind::Video => {
+                        let Some((stream, rate)) = streams.get_mut(&l.clip.id) else { continue };
+                        let index = ((l.source_time - l.clip.source_in) * *rate).round().max(0.0) as u64;
+                        let (sw, sh) = (stream.width, stream.height);
+                        let Some(frame) = stream.frame(index) else { continue };
+                        let key = SourceKey::Clip(l.clip.id.0);
+                        comp.upload_yuv420(key, sw, sh, frame, super::color::yuv_to_rgb(l.asset.color, l.asset.height));
+                        Paint::Source(key)
+                    }
+                    AssetKind::Image => {
+                        let key = SourceKey::Asset(l.asset.id.0);
+                        if images.insert(l.asset.id) {
+                            let (iw, ih, px) = probe::load_image(&l.asset.path, IMAGE_MAX_SIDE, IMAGE_MAX_SIDE).map_err(|e| fail(e, &mut enc))?;
+                            comp.upload_rgba(key, iw, ih, &px);
+                        }
+                        Paint::Source(key)
+                    }
+                    _ => continue,
+                },
+            };
+            draws.push(DrawItem::Layer(LayerDraw { paint, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }));
         }
 
         comp.render(&draws);
@@ -420,7 +444,7 @@ mod tests {
     fn add_asset(p: &mut Project, path: &Path, d: f64, w: u32, h: u32, audio: bool) -> AssetId {
         let id = AssetId(p.alloc_id());
         let color = probe::probe(path).map(|i| i.color).unwrap_or_default();
-        p.assets.push(Asset { id, path: path.into(), name: "x".into(), kind: AssetKind::Video, duration: d, width: w, height: h, has_audio: audio, codec: "h264".into(), color });
+        p.assets.push(Asset { id, path: path.into(), name: "x".into(), kind: AssetKind::Video, duration: d, width: w, height: h, has_audio: audio, codec: "h264".into(), color, generator: None });
         id
     }
 
@@ -599,5 +623,22 @@ mod tests {
         let (d, h, w) = probe_size(&out);
         assert_eq!((w, h), (322, 242));
         assert!((d - 2.0).abs() < 0.4, "duration {d}");
+    }
+}
+
+#[cfg(test)]
+mod manual {
+    /// Exports the project in $DOTFILM_PROJECT to $DOTFILM_OUT. Run with --ignored.
+    #[test]
+    #[ignore]
+    fn export_project_from_env() {
+        let p = crate::core::model::Project::load(std::env::var("DOTFILM_PROJECT").unwrap().as_ref()).unwrap();
+        let s = super::ExportSettings {
+            path: std::env::var("DOTFILM_OUT").unwrap().into(),
+            encoder: super::Encoder::X264,
+            rate: super::RateControl::Quality(16),
+            speed: super::Speed::Fast,
+        };
+        super::run(&p, &std::collections::HashMap::new(), &s, |_, _| true).unwrap();
     }
 }

@@ -8,6 +8,7 @@ use super::timeline::format_time;
 use crate::core::geometry::Quad;
 use crate::core::model::{ClipId, Param};
 use crate::engine::preview::QUALITIES;
+use crate::engine::scene;
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 // ----- Values you can tune -----
@@ -69,12 +70,14 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     // Outlines of visible pictures, bottom first.
     let t = app.playhead;
+    let frame_scale = app.preview.frame_scale(&app.project);
     let shown: Vec<OnScreen> = app
         .project
         .visible_clips_at(t)
         .iter()
         .filter_map(|c| {
-            let quad = app.project.clip_quad(c, t)?;
+            // Text is measured by the text engine; effects have no outline.
+            let quad = scene::clip_quad(&app.project, c, t, &mut app.preview.text, frame_scale)?;
             let corners = quad.pts.map(|[x, y]| to_screen(x, y));
             Some(OnScreen { clip: c.id, corners, quad })
         })

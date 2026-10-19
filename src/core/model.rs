@@ -2,6 +2,7 @@
 //! Everything the user edits lives here, and the whole thing saves to JSON.
 
 use super::anim::Anim;
+use super::content::Content;
 use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,15 @@ pub enum AssetKind {
     Video,
     Image,
     Audio,
+    /// Made inside dotFilm: color, gradient, text or effect (see `Asset::generator`).
+    Generated,
+}
+
+impl AssetKind {
+    /// Has a fixed length (video and audio files). Others can be any length.
+    pub fn is_timed(self) -> bool {
+        matches!(self, AssetKind::Video | AssetKind::Audio)
+    }
 }
 
 /// Which YUV standard a video's pixels use. Read from the file at import.
@@ -70,6 +80,9 @@ pub struct Asset {
     /// Video color standard. Decoding keeps it; the GPU converts exactly.
     #[serde(default)]
     pub color: VideoColor,
+    /// For generated assets: the content new clips start with.
+    #[serde(default)]
+    pub generator: Option<Content>,
 }
 
 /// Plain (evaluated) color adjustments, used by the color math.
@@ -225,6 +238,8 @@ pub enum Param {
     Value,
     Volume,
     Speed,
+    /// The i-th number of the clip's content (color channels, text size, effect settings...).
+    Content(u8),
 }
 
 impl Param {
@@ -261,6 +276,7 @@ impl Param {
             Param::Value => "Value",
             Param::Volume => "Volume",
             Param::Speed => "Speed",
+            Param::Content(_) => "Value",
         }
     }
 
@@ -300,6 +316,9 @@ pub struct Clip {
     /// When off, the audio is time-stretched and keeps its pitch.
     #[serde(default)]
     pub speed_affects_pitch: bool,
+    /// Color, gradient, text or effect settings for generated clips.
+    #[serde(default)]
+    pub content: Option<Content>,
 }
 
 /// Slowest allowed speed (keeps the time math well behaved).
@@ -327,6 +346,15 @@ impl Clip {
     pub fn contains(&self, t: f64) -> bool {
         t >= self.start && t < self.end()
     }
+    /// Every parameter this clip has: the standard ones plus its content's.
+    pub fn params(&self) -> Vec<Param> {
+        let mut v = Param::ALL.to_vec();
+        if let Some(c) = &self.content {
+            v.extend((0..c.anims().len()).map(|i| Param::Content(i as u8)));
+        }
+        v
+    }
+
     /// Timeline time -> clip time (what keyframes use).
     pub fn local(&self, t: f64) -> f64 {
         t - self.start
@@ -380,7 +408,7 @@ impl Clip {
     /// Keyframes stay on the same footage moments.
     pub fn trim_start(&mut self, delta: f64) {
         let new_source_in = self.source_in + self.source_elapsed(delta);
-        for p in Param::ALL {
+        for p in self.params() {
             self.param_mut(p).shift(-delta);
         }
         self.source_in = new_source_in;
@@ -389,7 +417,7 @@ impl Clip {
     }
     /// Removes all keyframes, keeping each value as it is at clip time `at`.
     pub fn clear_keyframes(&mut self, at: f64) {
-        for p in Param::ALL {
+        for p in self.params() {
             let a = self.param_mut(p);
             if a.is_animated() {
                 a.value = a.eval(at);
@@ -414,6 +442,7 @@ impl Clip {
             Param::Value => &self.adjust.value,
             Param::Volume => &self.volume,
             Param::Speed => &self.speed,
+            Param::Content(i) => self.content.as_ref().and_then(|c| c.anims().get(i as usize).copied()).expect("content param exists"),
         }
     }
 
@@ -433,6 +462,7 @@ impl Clip {
             Param::Value => &mut self.adjust.value,
             Param::Volume => &mut self.volume,
             Param::Speed => &mut self.speed,
+            Param::Content(i) => self.content.as_mut().and_then(|c| c.anims_mut().into_iter().nth(i as usize)).expect("content param exists"),
         }
     }
 
@@ -460,7 +490,7 @@ impl Clip {
 
     /// Clip times of all keyframes on any parameter, sorted, without duplicates.
     pub fn keyframe_times(&self, tol: f64) -> Vec<f64> {
-        let mut times: Vec<f64> = Param::ALL.iter().flat_map(|p| self.param(*p).keys.iter().map(|k| k.t)).collect();
+        let mut times: Vec<f64> = self.params().iter().flat_map(|p| self.param(*p).keys.iter().map(|k| k.t)).collect();
         times.sort_by(f64::total_cmp);
         times.dedup_by(|a, b| (*a - *b).abs() <= tol);
         times
@@ -547,7 +577,7 @@ impl Project {
     /// Longest a clip can be, given where it starts in the source and its speed.
     pub fn max_duration(&self, clip: &Clip) -> f64 {
         match self.asset(clip.asset) {
-            Some(a) if a.kind != AssetKind::Image => clip.local_at_source(a.duration).max(MIN_CLIP),
+            Some(a) if a.kind.is_timed() => clip.local_at_source(a.duration).max(MIN_CLIP),
             _ => f64::INFINITY,
         }
     }
@@ -555,7 +585,7 @@ impl Project {
     /// Earliest timeline time the clip's start can be trimmed back to.
     pub fn earliest_start(&self, clip: &Clip) -> f64 {
         match self.asset(clip.asset) {
-            Some(a) if a.kind != AssetKind::Image => clip.timeline(clip.local_at_source(0.0)),
+            Some(a) if a.kind.is_timed() => clip.timeline(clip.local_at_source(0.0)),
             _ => f64::NEG_INFINITY,
         }
     }
@@ -604,16 +634,33 @@ impl Project {
         (aw * k, ah * k)
     }
 
-    /// Where a clip's corners land in the frame at timeline time `t`.
-    pub fn clip_quad(&self, clip: &Clip, t: f64) -> Option<Quad> {
-        let asset = self.asset(clip.asset)?;
-        if asset.kind == AssetKind::Audio {
-            return None;
-        }
+    /// Creates a generated asset (color, gradient, text, effect). Returns its id.
+    pub fn add_generated_asset(&mut self, content: Content) -> AssetId {
+        let id = AssetId(self.alloc_id());
+        let base = content.default_name();
+        let n = self.assets.iter().filter(|a| a.name == base || a.name.starts_with(&format!("{base} "))).count();
+        let name = if n == 0 { base } else { format!("{base} {}", n + 1) };
+        self.assets.push(Asset {
+            id,
+            path: PathBuf::new(),
+            name,
+            kind: AssetKind::Generated,
+            duration: 0.0,
+            width: self.width,
+            height: self.height,
+            has_audio: false,
+            codec: String::new(),
+            color: VideoColor::default(),
+            generator: Some(content),
+        });
+        id
+    }
+
+    /// Where a clip's corners land, given its unscaled size `base` (project pixels).
+    pub fn quad_for(&self, clip: &Clip, t: f64, base: (f32, f32)) -> Quad {
         let v = clip.values_at(t);
-        let (fw, fh) = self.fit_size(asset);
-        let placement = Placement { cx: v.x, cy: v.y, width: fw * v.scale, height: fh * v.scale, pitch: v.pitch, yaw: v.yaw, roll: v.roll };
-        Some(geometry::project(&placement, self.width as f32, self.height as f32))
+        let placement = Placement { cx: v.x, cy: v.y, width: base.0 * v.scale, height: base.1 * v.scale, pitch: v.pitch, yaw: v.yaw, roll: v.roll };
+        geometry::project(&placement, self.width as f32, self.height as f32)
     }
 
     /// Would a clip with this span overlap anything else on the track?
@@ -639,10 +686,7 @@ impl Project {
     /// next free track above it, adding a new track if none fits.
     pub fn add_clip(&mut self, asset_id: AssetId, track: usize, start: f64) -> Option<ClipId> {
         let asset = self.asset(asset_id)?.clone();
-        let duration = match asset.kind {
-            AssetKind::Image => DEFAULT_IMAGE_DURATION,
-            _ => asset.duration.max(MIN_CLIP),
-        };
+        let duration = if asset.kind.is_timed() { asset.duration.max(MIN_CLIP) } else { DEFAULT_IMAGE_DURATION };
         let start = start.max(0.0);
         let mut track = track.min(self.tracks.len().saturating_sub(1));
         while !self.is_free(track, start, start + duration, None) {
@@ -673,6 +717,7 @@ impl Project {
             volume: Anim::new(1.0),
             speed: Anim::new(1.0),
             speed_affects_pitch: false,
+            content: asset.generator.clone(),
         });
         Some(id)
     }
@@ -767,7 +812,7 @@ impl Project {
             // Version 2 stored keyframe times in source time; now they're clip time.
             for c in &mut self.clips {
                 let offset = c.source_in;
-                for p in Param::ALL {
+                for p in c.params() {
                     c.param_mut(p).shift(-offset);
                 }
             }
@@ -801,6 +846,7 @@ mod tests {
             has_audio: true,
             codec: "h264".into(),
             color: Default::default(),
+            generator: None,
         });
         (p, id)
     }
