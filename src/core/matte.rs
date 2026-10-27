@@ -113,6 +113,7 @@ impl Matte {
 /// The edge sits where the matte crosses 0.5. Shrinking moves that crossing towards
 /// 1 (only the solid core stays), growing towards 0. Combined with edge softness
 /// (a blur before this step) this moves the edge by up to about the blur radius.
+#[cfg(test)]
 pub fn refine(a: f32, shrink: f32) -> f32 {
     let s = shrink.clamp(-1.0, 1.0);
     let center = 0.5 + 0.49 * s;

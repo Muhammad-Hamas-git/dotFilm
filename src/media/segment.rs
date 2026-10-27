@@ -135,7 +135,14 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut h = Sha256::new();
-    std::io::copy(&mut f, &mut h).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 

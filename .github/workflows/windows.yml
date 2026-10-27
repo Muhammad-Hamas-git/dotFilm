@@ -24,7 +24,16 @@ jobs:
           $bin | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Build
-        run: cargo build --release
+        shell: pwsh
+        run: |
+          cargo build --release 2>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          # Report compile errors as an annotation (readable through the GitHub API without logs access).
+          if ($code -ne 0) {
+            $errs = (Select-String -Path build.log -Pattern "^(error|warning)" -Context 0,12 | ForEach-Object { $_.Line; $_.Context.PostContext }) | Select-Object -First 120
+            Write-Output "::error title=Build failed::$($errs -join '%0A')"
+            exit $code
+          }
 
       - name: Test
         shell: pwsh
