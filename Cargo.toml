@@ -15,6 +15,18 @@ bytemuck = { version = "1", features = ["derive"] }  # GPU uniform structs
 pollster = "0.4"              # wait for GPU setup on export threads
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 cosmic-text = "0.19.0"
+sha2 = "0.11"                   # checks the downloaded AI model
+
+# AI background removal runs the model with ONNX Runtime.
+# Windows: linked in, GPU through DirectML (any DirectX 12 card). The build puts
+# DirectML.dll next to dotfilm.exe; ship it with the exe.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "api-24", "download-binaries", "tls-native", "copy-dylibs", "directml"] }
+
+# Elsewhere (development only): loads the ONNX Runtime library at run time from
+# ORT_DYLIB_PATH, e.g. the one inside `pip install onnxruntime`.
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "api-24", "load-dynamic"] }
 
 # Debug builds: optimize dependencies so playback is usable while developing.
 [profile.dev]

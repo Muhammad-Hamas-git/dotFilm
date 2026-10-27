@@ -32,6 +32,14 @@ A desktop video editor written in Rust, rendered on the GPU.
 - **Color grading** on every picture clip: white balance (temperature, tint), three **color wheels**
   (shadows, midtones, highlights: tint plus luminance), and **HSL by color** (hue, saturation and
   luminance for red, orange, yellow, green, blue, indigo, violet). All keyframeable.
+- **Remove background (AI)**: no green screen needed. Select a video clip, open **Remove background (AI)**
+  in the Adjustments panel and click **Remove BG**. The video is analyzed once in the background (progress bar,
+  cancel button) on your GPU through DirectML (any DirectX 12 card), or on the CPU if that fails. After that it
+  plays in real time. **Shrink / grow** and **Edge softness** refine the edge live and are keyframeable;
+  **Keep the background instead** inverts it. Fix mistakes with the clip's **masks**, which apply on top of
+  the AI result: Add brings back missed parts, Subtract removes extra parts, Intersect keeps only one area.
+  The first use downloads the AI model (ISNet, about 180 MB) into the cache folder. Results are cached per
+  video, so other clips of the same file reuse them.
 - **Chroma key**: remove a green (or any) screen. Click **Pick** and then the background in the player,
   or set the color by hand. Similarity, softness and spill removal. Runs on the GPU like everything else.
 - **Copy and paste clips** (Ctrl+C / Ctrl+V or right-click): pastes at the playhead with all its
@@ -78,7 +86,8 @@ cargo build --release
 ```
 
 The program is `target\release\dotfilm.exe`. Put `ffmpeg.exe` and `ffprobe.exe` next to it to run it
-on a PC without FFmpeg installed.
+on a PC without FFmpeg installed. Always ship **`DirectML.dll`** (also in `target\release`) next to the exe:
+dotFilm doesn't start without it.
 
 ## Keyframes
 
@@ -121,6 +130,7 @@ src/
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
     transition.rs      transitions on clip edges and where they play on the timeline
     mask.rs            mask shapes, their math, and packing for the GPU
+    matte.rs           AI background removal settings (shrink, softness, invert)
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -128,6 +138,8 @@ src/
     probe.rs           file info, thumbnails, images, audio decoding
     video.rs           decoding video frames (YUV) for preview and export
     proxy.rs           building and caching proxy files
+    segment.rs         the AI background removal model: download, GPU/CPU inference
+    matte.rs           analyzing videos into cached mattes (background jobs)
     cache.rs           background loading
   engine/            turning the project into picture and sound
     scene.rs           what to draw at a given time (shared by preview and export)
@@ -139,7 +151,7 @@ src/
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector (+ grading, masks, transitions), timeline, export_dialog
+  ui/                the window: app.rs, assets, player, inspector (+ grading, matte, masks, transitions), timeline, export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -194,6 +206,10 @@ Example: a new animatable parameter "blur radius".
 | Masks per clip, shape points per clip | `MAX_MASKS`, `MAX_POINTS` in `core/mask.rs` (the shader has room for exactly this) |
 | Mask value ranges and defaults | `info` and `Mask::new` in `core/mask.rs` |
 | Mask handle size, grab distance, outline color | top of `ui/masks.rs` |
+| AI matte size, flicker smoothing, analysis frame rate cap | `MATTE_MAX_SIDE`, `SMOOTHING`, `MOTION_THRESHOLD`, `MAX_FPS` in `media/matte.rs` |
+| Which AI model removes backgrounds | `MODEL` in `media/segment.rs` (set `DOTFILM_MATTE_MODEL` to a local .onnx to skip the download) |
+| Shrink / grow strength, edge softness range | `info` and `refine` in `core/matte.rs` (keep `refine` in step with `matte_refine` in `gpu/shaders.wgsl`) |
+| Edge softness quality (blur taps) | `matte_at` in `gpu/shaders.wgsl` |
 | Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
 | Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
@@ -208,3 +224,7 @@ Example: a new animatable parameter "blur radius".
   the video) is not detected.
 - Transitions mix pictures only; audio at a cut stays a hard cut.
 - Odd frame sizes get one black pixel row/column on MP4 export (H.264 requires even sizes).
+- AI background removal works on video clips (not still images yet). It finds the most prominent subject;
+  with several people it may pick the wrong one or all of them, so use Intersect or Subtract masks.
+  Low-contrast edges (white feathers on snow) can come out partly see-through; an Add mask fixes them.
+  The matte is stored at up to 1024 px, so very fine hair on 4K footage is softer than the picture.

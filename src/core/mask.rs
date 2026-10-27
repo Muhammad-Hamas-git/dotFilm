@@ -315,9 +315,16 @@ pub fn polygon_distance(pts: &[[f32; 2]], p: [f32; 2]) -> f32 {
 /// Coverage 0..1 of all masks at `p` (CPU twin of the shader's `mask_value`, for tests).
 #[cfg(test)]
 pub fn coverage(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2]) -> f32 {
+    coverage_over(masks, t, size, p, None)
+}
+
+/// Like `coverage`, starting from `base` (the AI matte) instead of "nothing" or
+/// "everything": the masks then add to, cut from or limit the matte.
+#[cfg(test)]
+pub fn coverage_over(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base: Option<f32>) -> f32 {
     let usable: Vec<&Mask> = masks.iter().take(MAX_MASKS).filter(|m| m.kind != MaskKind::Shape || m.points.len() >= 3).collect();
-    let Some(first) = usable.first() else { return 1.0 };
-    let mut acc = if first.mode == MaskMode::Add { 0.0 } else { 1.0 };
+    let Some(first) = usable.first() else { return base.unwrap_or(1.0) };
+    let mut acc = base.unwrap_or(if first.mode == MaskMode::Add { 0.0 } else { 1.0 });
     for m in usable {
         let d = distance(m, t, size, p);
         let f = m.value(idx::FEATHER, t).max(1.0);
@@ -392,6 +399,27 @@ mod tests {
         assert_eq!(f.masks[0][..2], [0.0, 3.0]);
         assert_eq!(f.points[0], [100.0, 50.0, 500.0, 50.0]);
         assert_eq!(f.points[1][..2], [500.0, 450.0]);
+    }
+
+    #[test]
+    fn masks_add_to_and_cut_from_a_matte() {
+        let inside = [500.0, 250.0];
+        let outside = [10.0, 10.0];
+        let mut add = Mask::new(MaskKind::Rectangle, SIZE);
+        add.mode = MaskMode::Add;
+        // An Add mask brings back what the matte missed, and keeps what it found.
+        assert_eq!(coverage_over(&[add.clone()], 0.0, SIZE, inside, Some(0.0)), 1.0);
+        assert_eq!(coverage_over(&[add.clone()], 0.0, SIZE, outside, Some(0.7)), 0.7);
+        let mut sub = add.clone();
+        sub.mode = MaskMode::Subtract;
+        assert_eq!(coverage_over(&[sub.clone()], 0.0, SIZE, inside, Some(1.0)), 0.0);
+        assert_eq!(coverage_over(&[sub], 0.0, SIZE, outside, Some(1.0)), 1.0);
+        let mut only = add;
+        only.mode = MaskMode::Intersect;
+        assert_eq!(coverage_over(&[only.clone()], 0.0, SIZE, outside, Some(1.0)), 0.0);
+        assert_eq!(coverage_over(&[only], 0.0, SIZE, inside, Some(0.6)), 0.6);
+        // No masks: just the matte.
+        assert_eq!(coverage_over(&[], 0.0, SIZE, inside, Some(0.3)), 0.3);
     }
 
     #[test]

@@ -2,7 +2,7 @@ name: Windows build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
   pull_request:
   workflow_dispatch:
 
@@ -49,6 +49,9 @@ jobs:
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/dotfilm.exe dist/
+          # ONNX Runtime's GPU backend (AI background removal); dotfilm.exe needs it to start.
+          Get-ChildItem target/release -Filter *.dll | ForEach-Object { Copy-Item $_.FullName dist/ }
+          if (-not (Test-Path dist/DirectML.dll)) { Write-Output "::error title=Package::DirectML.dll missing"; exit 1 }
           Copy-Item "$env:FFMPEG_BIN/ffmpeg.exe" dist/
           Copy-Item "$env:FFMPEG_BIN/ffprobe.exe" dist/
           Copy-Item README.md dist/

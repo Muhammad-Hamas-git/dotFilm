@@ -52,6 +52,9 @@ struct Layer {
     mask_points: array<vec4<f32>, 16>,
     // (mask count, layer width, layer height, _).
     mask_info: vec4<f32>,
+    // AI matte, packed by core::matte::Matte::frame:
+    // (mode: 0 off, 1 on, 2 inverted; shrink -1..1; edge softness in layer px; _).
+    matte: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> L: Layer;
@@ -60,6 +63,10 @@ struct Layer {
 @group(1) @binding(1) var plane1: texture_2d<f32>;
 @group(1) @binding(2) var plane2: texture_2d<f32>;
 @group(1) @binding(3) var samp: sampler;
+
+// The layer's AI matte (a blank texture when it has none).
+@group(2) @binding(0) var matte_tex: texture_2d<f32>;
+@group(2) @binding(1) var matte_samp: sampler;
 
 struct LayerOut {
     @builtin(position) pos: vec4<f32>,
@@ -317,13 +324,17 @@ fn mask_distance(i: u32, p: vec2<f32>) -> f32 {
 }
 
 // How much of the layer shows at p (layer px), 0..1. `aa` = layer px per output px,
-// so hard edges stay smooth. Matches core::mask::coverage.
-fn mask_value(p: vec2<f32>, aa: f32) -> f32 {
+// so hard edges stay smooth. With `has_base` the masks start from `base` (the AI
+// matte) and add to, cut from or limit it. Matches core::mask::coverage_over.
+fn mask_value(p: vec2<f32>, aa: f32, base: f32, has_base: bool) -> f32 {
     let n = u32(L.mask_info.x + 0.5);
     if (n == 0u) {
-        return 1.0;
+        return select(1.0, base, has_base);
     }
     var acc = select(1.0, 0.0, L.masks[2].z < 0.5);
+    if (has_base) {
+        acc = base;
+    }
     for (var i = 0u; i < n; i = i + 1u) {
         let v1 = L.masks[i * 3u + 1u];
         let v2 = L.masks[i * 3u + 2u];
@@ -352,7 +363,38 @@ fn effect_mask(xy: vec2<f32>) -> f32 {
     }
     let size = out_size();
     let k = L.mask_info.y / size.x;
-    return mask_value(xy / size * L.mask_info.yz, k);
+    return mask_value(xy / size * L.mask_info.yz, k, 1.0, false);
+}
+
+// ---------------------------------------------------------------- AI matte
+
+// Shrink/grow: moves where the matte crosses 0.5. Matches core::matte::refine.
+fn matte_refine(a: f32, shrink: f32) -> f32 {
+    let s = clamp(shrink, -1.0, 1.0);
+    let center = 0.5 + 0.49 * s;
+    let half = max(min(center, 1.0 - center), 1e-3);
+    return clamp((a - (center - half)) / (2.0 * half), 0.0, 1.0);
+}
+
+// The matte at `uv`, softened by `L.matte.z` layer px (17 taps: center and two rings).
+fn matte_at(uv: vec2<f32>) -> f32 {
+    let r = vec2(L.matte.z) / max(L.mask_info.yz, vec2(1.0));
+    var sum = textureSampleLevel(matte_tex, matte_samp, uv, 0.0).r;
+    var weight = 1.0;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let ang = f32(i) * 0.7853982;
+        let d = vec2(cos(ang), sin(ang));
+        // Inner ring offset by half a step so the taps interleave.
+        let d2 = vec2(cos(ang + 0.3926991), sin(ang + 0.3926991));
+        sum = sum + 0.6 * textureSampleLevel(matte_tex, matte_samp, uv + d2 * r * 0.5, 0.0).r;
+        sum = sum + 0.25 * textureSampleLevel(matte_tex, matte_samp, uv + d * r, 0.0).r;
+        weight = weight + 0.85;
+    }
+    var a = matte_refine(sum / weight, L.matte.y);
+    if (L.matte.x > 1.5) {
+        a = 1.0 - a;
+    }
+    return a;
 }
 
 @fragment
@@ -404,7 +446,13 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
 
     // Masks, in the layer's own pixels so they move with it.
     let lp = in.uv * L.mask_info.yz;
-    let m = mask_value(lp, max(length(fwidth(lp)) * 0.7071, 1e-3));
+    let aa_px = max(length(fwidth(lp)) * 0.7071, 1e-3);
+    let has_matte = L.matte.x > 0.5;
+    var matte = 1.0;
+    if (has_matte) {
+        matte = matte_at(in.uv);
+    }
+    let m = mask_value(lp, aa_px, matte, has_matte);
 
     let a = src.a * key_alpha * m * L.opacity * aa;
     return vec4(rgb * a, a);

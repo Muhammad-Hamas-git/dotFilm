@@ -13,6 +13,7 @@ use super::{color, scene};
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
 use crate::core::transition;
 use crate::media::cache::MediaCache;
+use crate::media::matte::{self, Mattes};
 use crate::media::proxy::{self, Proxies};
 use crate::media::video::VideoStream;
 use std::collections::hash_map::DefaultHasher;
@@ -43,6 +44,8 @@ const PICK_RADIUS: u32 = 2;
 pub struct PreviewRenderer {
     gpu: Option<Gpu>,
     streams: HashMap<ClipId, VideoStream>,
+    /// AI matte decoders, per clip (see media/matte.rs).
+    matte_streams: HashMap<ClipId, VideoStream>,
     uploaded_images: HashSet<AssetId>,
     /// Text mask currently uploaded for each text clip (by mask key).
     uploaded_text: HashMap<ClipId, u64>,
@@ -69,6 +72,7 @@ impl PreviewRenderer {
         Self {
             gpu,
             streams: HashMap::new(),
+            matte_streams: HashMap::new(),
             uploaded_images: HashSet::new(),
             uploaded_text: HashMap::new(),
             text: TextEngine::default(),
@@ -82,6 +86,7 @@ impl PreviewRenderer {
     /// Drops all decoders and uploads (e.g. after loading another project).
     pub fn reset(&mut self) {
         self.streams.clear();
+        self.matte_streams.clear();
         self.uploaded_images.clear();
         self.uploaded_text.clear();
         if let Some(g) = &mut self.gpu {
@@ -126,7 +131,7 @@ impl PreviewRenderer {
     }
 
     /// Renders the frame at `t`. Returns the texture to show, or None without a GPU.
-    pub fn update(&mut self, project: &Project, media: &MediaCache, proxies: &Proxies, t: f64, playing: bool) -> Option<egui::TextureId> {
+    pub fn update(&mut self, project: &Project, media: &MediaCache, proxies: &Proxies, mattes: &Mattes, t: f64, playing: bool) -> Option<egui::TextureId> {
         let size = self.preview_size(project);
         let frame_scale = size.0 as f32 / project.width as f32;
         let gpu = self.gpu.as_mut()?;
@@ -136,6 +141,7 @@ impl PreviewRenderer {
         self.waiting = false;
 
         let mut keep_streams: HashSet<ClipId> = HashSet::new();
+        let mut keep_mattes: HashSet<ClipId> = HashSet::new();
 
         // Pre-roll upcoming video clips so they start without a gap.
         if playing {
@@ -149,6 +155,11 @@ impl PreviewRenderer {
                         let at = clip.source_time(first).max(0.0);
                         ensure_stream(&mut self.streams, clip.id, path, w, h, clip.decode_rate(project.fps), asset.color.full_range).update(at);
                         keep_streams.insert(clip.id);
+                        if let Some(path) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|_| mattes.ready(asset.id)) {
+                            let (mw, mh) = matte::matte_size(asset);
+                            ensure_stream(&mut self.matte_streams, clip.id, path, mw, mh, clip.decode_rate(project.fps), true).update(at);
+                            keep_mattes.insert(clip.id);
+                        }
                     }
                 }
             }
@@ -161,6 +172,7 @@ impl PreviewRenderer {
         let mut keep_text: HashSet<ClipId> = HashSet::new();
         let picking = self.picking_key;
         let streams = &mut self.streams;
+        let matte_streams = &mut self.matte_streams;
         let uploaded_text = &mut self.uploaded_text;
         let uploaded_images = &mut self.uploaded_images;
         let compositor = &mut gpu.compositor;
@@ -213,6 +225,28 @@ impl PreviewRenderer {
                 },
             };
             let mut d = scene::layer_draw(l, paint);
+            // The AI matte: decoded like a video, from the cached grayscale file.
+            if l.matte.is_on() {
+                if let Some(path) = mattes.ready(l.asset.id) {
+                    let (mw, mh) = matte::matte_size(l.asset);
+                    let stream = ensure_stream(matte_streams, l.clip.id, path, mw, mh, l.clip.decode_rate(project.fps), true);
+                    keep_mattes.insert(l.clip.id);
+                    let changed = stream.update(l.source_time);
+                    if stream.is_stale() {
+                        waiting = true;
+                    }
+                    let key = SourceKey::Matte(l.clip.id.0);
+                    if let Some(f) = stream.current() {
+                        if changed || !compositor.has_source(key) {
+                            // Gray decodes as full-range YUV: the Y plane is the matte.
+                            compositor.upload_matte(key, stream.width, stream.height, &f.data);
+                        }
+                        (f.pts.to_bits(), stream.width).hash(&mut sig);
+                    }
+                    // Until its first frame arrives the layer waits instead of showing its background.
+                    d.matte_src = Some(key);
+                }
+            }
             // While picking a key color, show that clip as the keyer sees it: no key and
             // no color changes, so the picked pixel is the real source color.
             if picking == Some(l.clip.id) {
@@ -228,12 +262,14 @@ impl PreviewRenderer {
 
         // Free decoders, video textures, text masks and images that are gone.
         self.streams.retain(|id, _| keep_streams.contains(id));
+        self.matte_streams.retain(|id, _| keep_mattes.contains(id));
         self.uploaded_text.retain(|id, _| keep_text.contains(id));
         let live_assets: HashSet<u64> = project.assets.iter().map(|a| a.id.0).collect();
         self.uploaded_images.retain(|a| live_assets.contains(&a.0));
         gpu.compositor.retain_sources(|k| match k {
             SourceKey::Clip(c) => keep_streams.contains(&ClipId(*c)) || keep_text.contains(&ClipId(*c)),
             SourceKey::Asset(a) => live_assets.contains(a),
+            SourceKey::Matte(c) => keep_mattes.contains(&ClipId(*c)),
         });
 
         // Skip the GPU entirely when the picture would be identical.
