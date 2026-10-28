@@ -86,10 +86,58 @@ pub enum EffectKind {
     DoubleExposure,
     /// Blurs movement of everything below (re-rendered at several moments per frame).
     MotionBlur,
+    /// Old tape: scanlines, noise, line jitter, color bleed, CRT curve, tracking band.
+    Vhs,
+    /// Random shake: the picture jumps around a little every few frames.
+    Jitter,
+    /// Big square pixels.
+    Pixelate,
+    /// Few colors with an ordered (Bayer) or noise dither pattern.
+    Dither,
+    /// Printed dots: black, or cyan / magenta / yellow screens.
+    Halftone,
+    /// Swells (or pinches) a round area around a center you place.
+    Bulge,
+    /// Wide-angle lens: barrel (or pincushion) distortion.
+    Fisheye,
+    /// Curved TV glass: bulges the picture, rounds the corners, darkens the edges.
+    CrtBulge,
+    /// Push pixels around with a brush in the player.
+    Liquify,
+    /// God rays: bright parts streak out from a light source you place.
+    LightRays,
+    /// Star-shaped glints on the brightest spots.
+    Sparkles,
 }
 
+/// Groups of effects (for menus).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectGroup {
+    Blur,
+    Retro,
+    Distort,
+    Light,
+    Color,
+}
+
+impl EffectGroup {
+    pub const ALL: [EffectGroup; 5] = [EffectGroup::Blur, EffectGroup::Retro, EffectGroup::Distort, EffectGroup::Light, EffectGroup::Color];
+    pub fn label(self) -> &'static str {
+        match self {
+            EffectGroup::Blur => "Blur",
+            EffectGroup::Retro => "Retro",
+            EffectGroup::Distort => "Distort",
+            EffectGroup::Light => "Light",
+            EffectGroup::Color => "Look",
+        }
+    }
+}
+
+/// Number of settings an effect can have.
+pub const EFFECT_PARAMS: usize = 8;
+
 impl EffectKind {
-    pub const ALL: [EffectKind; 10] = [
+    pub const ALL: [EffectKind; 21] = [
         EffectKind::GaussianBlur,
         EffectKind::LensBlur,
         EffectKind::RadialBlur,
@@ -100,6 +148,17 @@ impl EffectKind {
         EffectKind::Grain,
         EffectKind::ChromaticAberration,
         EffectKind::DoubleExposure,
+        EffectKind::Vhs,
+        EffectKind::Jitter,
+        EffectKind::Pixelate,
+        EffectKind::Dither,
+        EffectKind::Halftone,
+        EffectKind::Bulge,
+        EffectKind::Fisheye,
+        EffectKind::CrtBulge,
+        EffectKind::Liquify,
+        EffectKind::LightRays,
+        EffectKind::Sparkles,
     ];
 
     pub fn label(self) -> &'static str {
@@ -114,6 +173,27 @@ impl EffectKind {
             EffectKind::SpinBlur => "Spin blur",
             EffectKind::DoubleExposure => "Double exposure",
             EffectKind::MotionBlur => "Motion blur",
+            EffectKind::Vhs => "VHS",
+            EffectKind::Jitter => "Jitter",
+            EffectKind::Pixelate => "Pixelate",
+            EffectKind::Dither => "Dither",
+            EffectKind::Halftone => "Halftone",
+            EffectKind::Bulge => "Bulge / pinch",
+            EffectKind::Fisheye => "Fisheye",
+            EffectKind::CrtBulge => "CRT bulge",
+            EffectKind::Liquify => "Liquify",
+            EffectKind::LightRays => "Light rays",
+            EffectKind::Sparkles => "Star sparkles",
+        }
+    }
+
+    pub fn group(self) -> EffectGroup {
+        match self {
+            EffectKind::GaussianBlur | EffectKind::LensBlur | EffectKind::RadialBlur | EffectKind::SpinBlur | EffectKind::MotionBlur => EffectGroup::Blur,
+            EffectKind::Vhs | EffectKind::Jitter | EffectKind::Pixelate | EffectKind::Dither | EffectKind::Halftone | EffectKind::Grain => EffectGroup::Retro,
+            EffectKind::Bulge | EffectKind::Fisheye | EffectKind::CrtBulge | EffectKind::Liquify => EffectGroup::Distort,
+            EffectKind::Bloom | EffectKind::LightRays | EffectKind::Sparkles => EffectGroup::Light,
+            EffectKind::Vignette | EffectKind::ChromaticAberration | EffectKind::DoubleExposure => EffectGroup::Color,
         }
     }
 
@@ -131,65 +211,135 @@ impl EffectKind {
             EffectKind::DoubleExposure => 8,
             // Never reaches the shader: the scene re-renders the layers below instead.
             EffectKind::MotionBlur => 9,
+            EffectKind::Vhs => 10,
+            EffectKind::Jitter => 11,
+            EffectKind::Pixelate => 12,
+            EffectKind::Dither => 13,
+            EffectKind::Halftone => 14,
+            EffectKind::Bulge => 15,
+            EffectKind::Fisheye => 16,
+            EffectKind::CrtBulge => 17,
+            EffectKind::Liquify => 18,
+            EffectKind::LightRays => 19,
+            EffectKind::Sparkles => 20,
         }
     }
 
-    /// Description of each parameter (up to 4). `None` = unused.
-    pub fn params(self) -> [Option<ParamInfo>; 4] {
-        let p = |label, min, max, default, decimals, suffix| Some(ParamInfo { label, min, max, default, decimals, suffix, log: false });
+    /// Which settings place a center in the frame (dragged in the player): (x, y).
+    pub fn center_params(self) -> Option<(u8, u8)> {
         match self {
-            EffectKind::GaussianBlur => [p("Radius", 0.0, 200.0, 20.0, 1, " px"), None, None, None],
-            EffectKind::Vignette => [
+            EffectKind::RadialBlur | EffectKind::SpinBlur => Some((1, 2)),
+            EffectKind::Bulge | EffectKind::Fisheye => Some((2, 3)),
+            EffectKind::LightRays => Some((2, 3)),
+            _ => None,
+        }
+    }
+
+    /// Description of each setting (up to `EFFECT_PARAMS`). `None` = unused.
+    pub fn params(self) -> [Option<ParamInfo>; EFFECT_PARAMS] {
+        let p = |label, min, max, default, decimals, suffix| Some(ParamInfo { label, min, max, default, decimals, suffix, log: false });
+        let pad = |v: [Option<ParamInfo>; 4]| [v[0], v[1], v[2], v[3], None, None, None, None];
+        match self {
+            EffectKind::GaussianBlur => pad([p("Radius", 0.0, 200.0, 20.0, 1, " px"), None, None, None]),
+            EffectKind::Vignette => pad([
                 p("Amount", -1.0, 1.0, 0.6, 2, ""),
                 p("Size", 0.0, 1.5, 0.55, 2, ""),
                 p("Softness", 0.01, 1.5, 0.6, 2, ""),
                 p("Roundness", 0.0, 1.0, 0.5, 2, ""),
-            ],
-            EffectKind::Grain => [
+            ]),
+            EffectKind::Grain => pad([
                 p("Size", 0.5, 6.0, 1.5, 2, " px"),
                 p("Intensity", 0.0, 1.0, 0.35, 2, ""),
                 p("Amount", 0.0, 1.0, 0.8, 2, ""),
                 p("Color", 0.0, 1.0, 0.0, 2, ""),
-            ],
-            EffectKind::ChromaticAberration => [
+            ]),
+            EffectKind::ChromaticAberration => pad([
                 p("Amount", 0.0, 60.0, 6.0, 1, " px"),
                 p("Angle", -180.0, 180.0, 0.0, 0, " deg"),
                 p("Radial", 0.0, 1.0, 1.0, 2, ""),
                 None,
-            ],
-            EffectKind::Bloom => [
+            ]),
+            EffectKind::Bloom => pad([
                 p("Threshold", 0.0, 1.0, 0.7, 2, ""),
                 p("Intensity", 0.0, 3.0, 0.6, 2, ""),
                 p("Radius", 1.0, 400.0, 60.0, 0, " px"),
                 p("Softness", 0.0, 1.0, 0.3, 2, ""),
-            ],
-            EffectKind::LensBlur => [
-                p("Radius", 0.0, 120.0, 16.0, 1, " px"),
-                p("Bokeh", 0.0, 1.0, 0.5, 2, ""),
-                None,
-                None,
-            ],
-            EffectKind::RadialBlur => [
-                p("Amount", 0.0, 1.0, 0.25, 2, ""),
-                p("Center X", 0.0, 1.0, 0.5, 2, ""),
-                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
-                None,
-            ],
-            EffectKind::SpinBlur => [
-                p("Angle", 0.0, 90.0, 10.0, 1, " deg"),
-                p("Center X", 0.0, 1.0, 0.5, 2, ""),
-                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
-                None,
-            ],
-            EffectKind::DoubleExposure => [
+            ]),
+            EffectKind::LensBlur => pad([p("Radius", 0.0, 120.0, 16.0, 1, " px"), p("Bokeh", 0.0, 1.0, 0.5, 2, ""), None, None]),
+            EffectKind::RadialBlur => pad([p("Amount", 0.0, 1.0, 0.25, 2, ""), p("Center X", 0.0, 1.0, 0.5, 2, ""), p("Center Y", 0.0, 1.0, 0.5, 2, ""), None]),
+            EffectKind::SpinBlur => pad([p("Angle", 0.0, 90.0, 10.0, 1, " deg"), p("Center X", 0.0, 1.0, 0.5, 2, ""), p("Center Y", 0.0, 1.0, 0.5, 2, ""), None]),
+            EffectKind::DoubleExposure => pad([
                 p("Offset X", -1000.0, 1000.0, 80.0, 0, " px"),
                 p("Offset Y", -1000.0, 1000.0, 0.0, 0, " px"),
                 p("Zoom", 0.5, 2.0, 1.1, 2, ""),
                 p("Amount", 0.0, 1.0, 0.6, 2, ""),
+            ]),
+            EffectKind::MotionBlur => pad([p("Shutter", 0.0, 720.0, 180.0, 0, " deg"), p("Samples", 2.0, 32.0, 12.0, 0, ""), None, None]),
+            EffectKind::Vhs => [
+                p("Scanlines", 0.0, 1.0, 0.35, 2, ""),
+                p("Line count", 60.0, 1080.0, 240.0, 0, ""),
+                p("Noise", 0.0, 1.0, 0.25, 2, ""),
+                p("Jitter", 0.0, 1.0, 0.3, 2, ""),
+                p("Color bleed", 0.0, 30.0, 5.0, 1, " px"),
+                p("CRT curve", 0.0, 1.0, 0.15, 2, ""),
+                p("Tracking", 0.0, 1.0, 0.25, 2, ""),
+                p("Softness", 0.0, 1.0, 0.3, 2, ""),
             ],
-            EffectKind::MotionBlur => [
-                p("Shutter", 0.0, 720.0, 180.0, 0, " deg"),
-                p("Samples", 2.0, 32.0, 12.0, 0, ""),
+            EffectKind::Jitter => pad([
+                p("Amount", 0.0, 200.0, 12.0, 0, " px"),
+                p("Rotation", 0.0, 20.0, 1.0, 1, " deg"),
+                p("Zoom", 1.0, 1.5, 1.04, 2, ""),
+                p("Hold frames", 1.0, 12.0, 2.0, 0, ""),
+            ]),
+            EffectKind::Pixelate => pad([p("Size", 1.0, 200.0, 16.0, 0, " px"), None, None, None]),
+            EffectKind::Dither => pad([
+                p("Colors", 2.0, 16.0, 4.0, 0, ""),
+                p("Pattern size", 1.0, 8.0, 1.0, 0, " px"),
+                p("Noise pattern", 0.0, 1.0, 0.0, 0, ""),
+                p("Monochrome", 0.0, 1.0, 0.0, 2, ""),
+            ]),
+            EffectKind::Halftone => pad([
+                p("Dot size", 2.0, 80.0, 10.0, 1, " px"),
+                p("Angle", -90.0, 90.0, 45.0, 0, " deg"),
+                p("Color", 0.0, 1.0, 1.0, 2, ""),
+                p("Softness", 0.0, 1.0, 0.3, 2, ""),
+            ]),
+            EffectKind::Bulge => pad([
+                p("Amount", -1.0, 1.0, 0.5, 2, ""),
+                p("Radius", 0.02, 1.5, 0.35, 2, ""),
+                p("Center X", 0.0, 1.0, 0.5, 2, ""),
+                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
+            ]),
+            EffectKind::Fisheye => pad([
+                p("Amount", -1.0, 1.0, 0.5, 2, ""),
+                p("Zoom", 0.5, 2.0, 1.0, 2, ""),
+                p("Center X", 0.0, 1.0, 0.5, 2, ""),
+                p("Center Y", 0.0, 1.0, 0.5, 2, ""),
+            ]),
+            EffectKind::CrtBulge => pad([
+                p("Curve", 0.0, 1.0, 0.35, 2, ""),
+                p("Corners", 0.0, 1.0, 0.3, 2, ""),
+                p("Edge shade", 0.0, 1.0, 0.4, 2, ""),
+                p("Zoom", 0.5, 1.5, 1.0, 2, ""),
+            ]),
+            EffectKind::Liquify => pad([p("Amount", 0.0, 2.0, 1.0, 2, ""), None, None, None]),
+            EffectKind::LightRays => [
+                p("Intensity", 0.0, 3.0, 0.9, 2, ""),
+                p("Length", 0.0, 1.0, 0.5, 2, ""),
+                p("Center X", 0.0, 1.0, 0.5, 2, ""),
+                p("Center Y", 0.0, 1.0, 0.15, 2, ""),
+                p("Threshold", 0.0, 1.0, 0.55, 2, ""),
+                p("Warmth", -1.0, 1.0, 0.3, 2, ""),
+                None,
+                None,
+            ],
+            EffectKind::Sparkles => [
+                p("Threshold", 0.0, 1.0, 0.8, 2, ""),
+                p("Size", 2.0, 300.0, 50.0, 0, " px"),
+                p("Intensity", 0.0, 3.0, 1.0, 2, ""),
+                p("Angle", -90.0, 90.0, 45.0, 0, " deg"),
+                p("Points", 4.0, 8.0, 4.0, 0, ""),
+                p("Twinkle", 0.0, 1.0, 0.5, 2, ""),
                 None,
                 None,
             ],
@@ -201,7 +351,17 @@ impl EffectKind {
 pub struct EffectParams {
     pub kind: EffectKind,
     /// Meaning depends on the kind; see `EffectKind::params`.
-    pub p: [Anim; 4],
+    #[serde(deserialize_with = "pad_params")]
+    pub p: [Anim; EFFECT_PARAMS],
+    /// Liquify: how the brush moved pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<super::warp::WarpGrid>,
+}
+
+/// Older projects stored 4 settings per effect.
+fn pad_params<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[Anim; EFFECT_PARAMS], D::Error> {
+    let v: Vec<Anim> = Vec::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).cloned().unwrap_or_else(|| Anim::new(0.0))))
 }
 
 /// An effect applied to one clip only (its own effect stack), instead of an effect
@@ -224,9 +384,9 @@ fn enabled() -> bool {
     true
 }
 
-/// Keyframeable values of a clip effect: the 4 effect settings, then the mix.
-pub const CLIP_EFFECT_VALUES: usize = 5;
-pub const CLIP_EFFECT_MIX: u8 = 4;
+/// Keyframeable values of a clip effect: the effect settings, then the mix.
+pub const CLIP_EFFECT_VALUES: usize = EFFECT_PARAMS + 1;
+pub const CLIP_EFFECT_MIX: u8 = EFFECT_PARAMS as u8;
 
 impl ClipEffect {
     pub fn new(kind: EffectKind) -> Self {
@@ -261,6 +421,8 @@ pub enum Content {
     Gradient(GradientParams),
     Text(TextParams),
     Effect(EffectParams),
+    /// Several clips grouped into one (see core/compound.rs).
+    Compound(Box<super::compound::Compound>),
 }
 
 impl Content {
@@ -294,7 +456,7 @@ impl Content {
 
     pub fn effect(kind: EffectKind) -> Self {
         let defaults = kind.params().map(|p| Anim::new(p.map_or(0.0, |i| i.default)));
-        Content::Effect(EffectParams { kind, p: defaults })
+        Content::Effect(EffectParams { kind, p: defaults, warp: None })
     }
 
     /// Name shown for new assets of this content.
@@ -304,6 +466,7 @@ impl Content {
             Content::Gradient(_) => "Gradient".into(),
             Content::Text(_) => "Text".into(),
             Content::Effect(e) => e.kind.label().into(),
+            Content::Compound(_) => "Compound".into(),
         }
     }
 
@@ -329,6 +492,7 @@ impl Content {
                 v
             }
             Content::Effect(e) => e.p.iter().collect(),
+            Content::Compound(_) => Vec::new(),
         }
     }
 
@@ -351,6 +515,7 @@ impl Content {
                 v
             }
             Content::Effect(e) => e.p.iter_mut().collect(),
+            Content::Compound(_) => Vec::new(),
         }
     }
 }
@@ -394,6 +559,15 @@ mod tests {
         }
         assert_eq!(Content::text().anims().len(), 11);
         assert_eq!(Content::gradient().anims().len(), 16);
+    }
+
+    #[test]
+    fn old_four_value_effects_still_load() {
+        let json = r#"{"kind":"Vignette","p":[{"value":0.3,"keys":[]},{"value":0.5,"keys":[]},{"value":0.6,"keys":[]},{"value":0.5,"keys":[]}]}"#;
+        let e: EffectParams = serde_json::from_str(json).unwrap();
+        assert_eq!(e.p[0].value, 0.3);
+        assert_eq!(e.p.len(), EFFECT_PARAMS);
+        assert!(EffectKind::ALL.iter().all(|k| k.params().len() == EFFECT_PARAMS));
     }
 
     #[test]

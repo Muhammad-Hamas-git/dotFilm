@@ -32,6 +32,8 @@ pub struct PlayerState {
     pub pan: egui::Vec2,
     /// Mask being edited on the player.
     pub masks: super::masks::MaskUi,
+    /// Effect centers and the liquify brush.
+    pub effects: super::effect_tools::EffectTools,
     /// Shown while a moved clip is snapped to the center.
     guides: (bool, bool),
 }
@@ -151,6 +153,10 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
 
     // --- editing a mask takes over the mouse ---
     if super::masks::player(app, ui, &response, &painter, &to_screen, &to_project) {
+        return;
+    }
+    // --- effect centers and the liquify brush ---
+    if super::effect_tools::player(app, ui, &response, &painter, &to_screen, &to_project) {
         return;
     }
 

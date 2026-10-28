@@ -202,8 +202,14 @@ impl EffectFrame {
         Self { to_frame: f(to), from_frame: f(from), size: [size[0].max(1.0), size[1].max(1.0)] }
     }
 
+    /// Effect frame (0..1) -> project frame (0..1).
+    pub fn from_local(&self, u: f32, v: f32) -> [f32; 2] {
+        let m = &self.from_frame;
+        let w = m[2][0] * u + m[2][1] * v + m[2][2];
+        [(m[0][0] * u + m[0][1] * v + m[0][2]) / w, (m[1][0] * u + m[1][1] * v + m[1][2]) / w]
+    }
+
     /// Project frame (0..1) -> effect frame (0..1).
-    #[cfg(test)]
     pub fn to_local(&self, u: f32, v: f32) -> [f32; 2] {
         let m = &self.to_frame;
         let w = m[2][0] * u + m[2][1] * v + m[2][2];
@@ -224,6 +230,24 @@ pub fn union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 
 /// The whole layer, as a rectangle in its own 0..1 space.
 pub const FULL_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// The part of a layer that shows, in its own 0..1 space: `masks` = where its masks
+/// leave it visible (None = no masks), `matte` = where its AI cut-out shows the
+/// subject (None = no matte in use, Some(None) = nowhere). With `restore` the masks
+/// bring the background back (union); otherwise they cut the subject out further.
+pub fn visible_rect(masks: Option<[f32; 4]>, matte: Option<Option<[f32; 4]>>, restore: bool) -> [f32; 4] {
+    let m = masks.unwrap_or(FULL_RECT);
+    let rect = match matte {
+        None => Some(m),
+        Some(mt) if restore => match (mt, masks) {
+            (Some(a), Some(b)) => Some(union(a, b)),
+            (a, None) => a.or(Some(m)),
+            (None, Some(b)) => Some(b),
+        },
+        Some(mt) => mt.and_then(|a| intersect(a, m)),
+    };
+    rect.filter(|r| r[2] > r[0] && r[3] > r[1]).unwrap_or(FULL_RECT)
+}
 
 #[cfg(test)]
 mod tests {

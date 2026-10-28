@@ -1,5 +1,6 @@
 //! The main window: owns all state and lays out the panels.
 
+use crate::core::content::Content;
 use super::{assets, export_dialog::ExportDialog, inspector, player, timeline};
 use crate::core::history::History;
 use crate::core::model::{Asset, AssetId, AssetKind, Clip, ClipId, Project};
@@ -35,6 +36,15 @@ pub struct SourceView {
     pub time: f64,
 }
 
+/// A compound clip open for editing: the project around it, waiting.
+pub struct OpenCompound {
+    pub outer: Project,
+    pub clip: ClipId,
+    history: History,
+    /// Playhead in the outer timeline, restored on the way out.
+    playhead: f64,
+}
+
 pub struct EditorApp {
     pub project: Project,
     pub history: History,
@@ -56,6 +66,10 @@ pub struct EditorApp {
     /// The player fills the whole window (and the screen).
     pub fullscreen: bool,
     pub selected: Option<ClipId>,
+    /// More selected clips (Ctrl+click on the timeline), besides `selected`.
+    pub multi: Vec<ClipId>,
+    /// Compound clips opened for editing, outermost first (see `open_compound`).
+    pub compound_stack: Vec<OpenCompound>,
     /// Asset currently being dragged from the assets panel.
     pub dragged_asset: Option<AssetId>,
     pub timeline: timeline::TimelineState,
@@ -90,6 +104,8 @@ impl EditorApp {
             source: None,
             fullscreen: false,
             selected: None,
+            multi: Vec::new(),
+            compound_stack: Vec::new(),
             dragged_asset: None,
             timeline: Default::default(),
             player: Default::default(),
@@ -260,10 +276,128 @@ impl EditorApp {
     }
 
     pub fn delete_selected(&mut self) {
-        if let Some(id) = self.selected.take() {
-            self.history.checkpoint(&self.project);
+        let ids = self.selection();
+        if ids.is_empty() {
+            return;
+        }
+        self.history.checkpoint(&self.project);
+        for id in ids {
             self.project.remove_clip(id);
         }
+        self.selected = None;
+        self.multi.clear();
+    }
+
+    /// Every selected clip: `selected` plus the Ctrl+clicked ones.
+    pub fn selection(&self) -> Vec<ClipId> {
+        let mut v: Vec<ClipId> = self.selected.into_iter().collect();
+        v.extend(self.multi.iter().copied().filter(|id| Some(*id) != self.selected));
+        v
+    }
+
+    /// Ctrl+click on a clip: adds it to the selection, or takes it out.
+    pub fn toggle_selected(&mut self, id: ClipId) {
+        if self.selected == Some(id) {
+            self.selected = self.multi.pop();
+        } else if let Some(i) = self.multi.iter().position(|m| *m == id) {
+            self.multi.remove(i);
+        } else {
+            if let Some(s) = self.selected {
+                self.multi.push(s);
+            }
+            self.selected = Some(id);
+        }
+    }
+
+    /// Groups the selected clips into one compound clip.
+    pub fn make_compound(&mut self) {
+        let ids = self.selection();
+        if ids.is_empty() {
+            return;
+        }
+        self.history.checkpoint(&self.project);
+        self.selected = self.project.make_compound(&ids);
+        self.multi.clear();
+    }
+
+    /// Puts a compound clip's contents back on the timeline.
+    pub fn release_compound(&mut self, id: ClipId) {
+        self.history.checkpoint(&self.project);
+        let ids = self.project.release_compound(id);
+        self.selected = ids.first().copied();
+        self.multi = ids.into_iter().skip(1).collect();
+    }
+
+    /// Opens a compound clip: the timeline, player and panels show what's inside until
+    /// `close_compound`. Edits inside have their own undo steps.
+    pub fn open_compound(&mut self, id: ClipId) {
+        let Some(clip) = self.project.clip(id).cloned() else { return };
+        let Some(Content::Compound(c)) = &clip.content else { return };
+        if self.playing {
+            self.toggle_play();
+        }
+        let mut inner = c.project.clone();
+        inner.next_id = inner.next_id.max(self.project.next_id);
+        inner.set_resolution(self.project.width, self.project.height);
+        inner.fps = self.project.fps;
+        // Everything in the asset panel stays usable inside.
+        for a in &self.project.assets {
+            if inner.asset(a.id).is_none() {
+                inner.assets.push(a.clone());
+            }
+        }
+        let t = clip.inner_time(self.playhead.clamp(clip.start, clip.end()));
+        let outer = std::mem::replace(&mut self.project, inner);
+        let history = std::mem::take(&mut self.history);
+        self.compound_stack.push(OpenCompound { outer, clip: id, history, playhead: self.playhead });
+        self.selected = None;
+        self.multi.clear();
+        self.seek(t);
+    }
+
+    /// Back out of the innermost open compound clip, keeping the changes. False if
+    /// none is open.
+    pub fn close_compound(&mut self) -> bool {
+        let Some(open) = self.compound_stack.pop() else { return false };
+        if self.playing {
+            self.toggle_play();
+        }
+        let mut inner = std::mem::replace(&mut self.project, open.outer);
+        self.history = open.history;
+        self.history.checkpoint(&self.project);
+        // Media imported while inside joins the project.
+        for a in &inner.assets {
+            if self.project.asset(a.id).is_none() {
+                self.project.assets.push(a.clone());
+            }
+        }
+        self.project.next_id = self.project.next_id.max(inner.next_id);
+        let used: Vec<AssetId> = inner.clips.iter().map(|c| c.asset).collect();
+        inner.assets.retain(|a| used.contains(&a.id));
+        let content = Content::Compound(Box::new(crate::core::compound::Compound { project: inner }));
+        if let Some(c) = self.project.clip_mut(open.clip) {
+            c.content = Some(content.clone());
+            let asset = c.asset;
+            if let Some(a) = self.project.assets.iter_mut().find(|a| a.id == asset) {
+                a.generator = Some(content);
+            }
+        }
+        // The compound can't run past what's inside any more.
+        if let Some(c) = self.project.clip(open.clip).cloned() {
+            let d = self.project.allowed_duration(&c, c.duration);
+            if let Some(c) = self.project.clip_mut(open.clip) {
+                c.duration = d;
+            }
+        }
+        self.selected = Some(open.clip);
+        self.multi.clear();
+        self.seek(open.playhead);
+        true
+    }
+
+    /// Closes every open compound (before saving or exporting the whole project).
+    pub fn close_all_compounds(&mut self) {
+        while self.close_compound() {}
     }
 
     pub fn undo(&mut self) {
@@ -282,6 +416,8 @@ impl EditorApp {
         if self.selected.is_some_and(|id| self.project.clip(id).is_none()) {
             self.selected = None;
         }
+        let project = &self.project;
+        self.multi.retain(|id| project.clip(*id).is_some());
     }
 
     pub fn remove_asset(&mut self, id: AssetId) {
@@ -302,6 +438,8 @@ impl EditorApp {
         }
         self.project = project;
         self.project_path = path;
+        self.compound_stack.clear();
+        self.multi.clear();
         self.history.clear();
         self.media.clear();
         self.proxies.clear();
@@ -338,6 +476,8 @@ impl EditorApp {
     }
 
     fn save(&mut self, save_as: bool) {
+        // Save the whole project, not the compound clip being edited.
+        self.close_all_compounds();
         let path = match (&self.project_path, save_as) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new()
@@ -436,6 +576,7 @@ impl EditorApp {
             self.import_dialog();
         }
         if pressed(cmd, Key::E) {
+            self.close_all_compounds();
             self.export.open = true;
         }
         if pressed(Modifiers::NONE, Key::Space) {
@@ -481,8 +622,11 @@ impl EditorApp {
                 self.preview.picking_key = None;
             } else if self.player.masks.edit.is_some() {
                 self.player.masks.edit = None;
-            } else {
+            } else if self.selected.is_some() || !self.multi.is_empty() {
                 self.selected = None;
+                self.multi.clear();
+            } else {
+                self.close_compound();
             }
         }
         if pressed(Modifiers::NONE, Key::Plus) || pressed(Modifiers::NONE, Key::Equals) {
@@ -514,8 +658,12 @@ impl EditorApp {
         let mut h = DefaultHasher::new();
         let project = self.source.as_ref().map_or(&self.project, |s| &s.project);
         self.source.as_ref().map(|s| s.asset.0).hash(&mut h);
-        for c in &project.clips {
+        // Compound clips' sound is played from their inner clips.
+        let sounds = crate::core::compound::sound_clips(project);
+        for (c, fades) in &sounds {
+            (fades.0.to_bits(), fades.1.to_bits()).hash(&mut h);
             (c.id.0, c.track, c.start.to_bits(), c.source_in.to_bits(), c.duration.to_bits(), c.speed_affects_pitch).hash(&mut h);
+            (c.audio.pitch.to_bits(), c.audio.fade_in.to_bits(), c.audio.fade_out.to_bits(), c.audio.muted).hash(&mut h);
             for a in [&c.volume, &c.speed] {
                 a.value.to_bits().hash(&mut h);
                 for k in &a.keys {
@@ -535,11 +683,7 @@ impl EditorApp {
         self.audio_signature = sig;
         let mut clips = Vec::new();
         let mut keys = std::collections::HashSet::new();
-        let project = self.source.as_ref().map_or(&self.project, |s| &s.project);
-        for c in &project.clips {
-            if !project.tracks.get(c.track).is_some_and(|t| !t.muted) {
-                continue;
-            }
+        for (c, fades) in &sounds {
             let Some(pcm) = self.media.audio.get(&c.asset).cloned() else { continue };
             // Pitch-kept audio is made in the background; until then play the direct version.
             let stretched = if stretch::needed(c) {
@@ -548,7 +692,7 @@ impl EditorApp {
             } else {
                 None
             };
-            clips.push(audio_clip(c, pcm, stretched, crate::core::transition::audio_fades(project, c)));
+            clips.push(audio_clip(c, pcm, stretched, *fades));
         }
         self.stretch.retain(&keys);
         self.audio.set_clips(clips);
@@ -620,6 +764,7 @@ impl EditorApp {
                     self.import_dialog();
                 }
                 if ui.button("Export video...      Ctrl+E").clicked() {
+                    self.close_all_compounds();
                     self.export.open = true;
                 }
             });

@@ -1,5 +1,6 @@
 //! Project data, keyframes, geometry and undo. No UI, no video code: plain Rust.
 pub mod anim;
+pub mod compound;
 pub mod content;
 pub mod geometry;
 pub mod grade;
@@ -10,3 +11,4 @@ pub mod matte;
 pub mod model;
 pub mod tone;
 pub mod transition;
+pub mod warp;

@@ -123,6 +123,12 @@ impl PreviewRenderer {
         (n > 0).then(|| sum.map(|s| (s / n) as u8))
     }
 
+    /// Where a clip's AI matte shows the subject in the last frame (outer None: no
+    /// matte uploaded for it).
+    pub fn matte_bounds(&self, clip: ClipId) -> Option<Option<[f32; 4]>> {
+        self.gpu.as_ref()?.compositor.matte_bounds(SourceKey::Matte(clip.0))
+    }
+
     /// Bakes a clip's color at timeline time `t` into a LUT (see `lut::bake`).
     pub fn bake_lut(&mut self, clip: &crate::core::model::Clip, t: f64) -> Option<crate::core::tone::Lut3D> {
         let own = clip.tone.lut.as_ref().and_then(|p| self.luts.get(p));
@@ -159,7 +165,7 @@ impl PreviewRenderer {
         if playing {
             for clip in &project.clips {
                 let first = clip.start;
-                if first > t && first <= t + PREROLL {
+                if first > t && first <= t + PREROLL && !clip.audio.only {
                     if let Some(asset) = project.asset(clip.asset).filter(|a| scene::is_video(a)) {
                         let (path, native) = source_for(asset, proxies);
                         let (w, h) = scene::decode_size(project, asset, clip, frame_scale, native);
@@ -193,6 +199,7 @@ impl PreviewRenderer {
 
         let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
             let paint = match &l.paint {
+                scene::ScenePaint::Group(key) => Paint::Source(SourceKey::Group(*key)),
                 scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
                     Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
                 }
@@ -294,6 +301,7 @@ impl PreviewRenderer {
             SourceKey::Clip(c) => keep_streams.contains(&ClipId(*c)) || keep_text.contains(&ClipId(*c)),
             SourceKey::Asset(a) => live_assets.contains(a),
             SourceKey::Matte(c) => keep_mattes.contains(&ClipId(*c)),
+            SourceKey::Group(_) => true,
         });
 
         // Skip the GPU entirely when the picture would be identical.

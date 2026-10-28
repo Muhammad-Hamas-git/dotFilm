@@ -32,7 +32,8 @@ struct Layer {
     //   [2..5] wheels (hue rad, strength, luminance, _), [5..12] HSL colors (hue rad, sat, lum, _)
     grade: array<vec4<f32>, 12>,
     stage_count: u32,
-    // Layers: 0 = RGBA texture, 1 = YUV 4:2:0 planes, 2 = gradient, 3 = text mask.
+    // Layers: 0 = RGBA texture, 1 = YUV 4:2:0 planes, 2 = gradient, 3 = text mask,
+    // 4 = premultiplied RGBA (a compound clip).
     // Effects: the effect id (see EffectKind::shader_id).
     kind: u32,
     // Blend mode id, see blend() below and BlendMode::shader_id().
@@ -445,6 +446,9 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
         src = vec4(yuv_to_rgb(p0.r, p1, p2), 1.0);
     } else if (L.kind == 2u) {
         src = gradient(in.uv);
+    } else if (L.kind == 4u) {
+        // A compound clip's rendered contents (premultiplied).
+        src = vec4(unpremul(p0), p0.a);
     } else if (L.kind == 3u) {
         // Text mask: red = letters, green = outline. Letters sit on top of the outline.
         let fill = L.gen[0];
@@ -828,6 +832,59 @@ fn fs_transition(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             let zb = side_at(layer_tex, 0.5 + (uv - 0.5) / sb);
             return mix(za, zb, smoothstep(0.0, 1.0, t));
         }
+        case 6u, 7u: {
+            // Glow: blooms up to bright and settles. Blur: blurs out and back in.
+            // Both peak in the middle.
+            let g = sin(t * 3.14159265);
+            let r = g * select(30.0, 45.0, L.kind == 7u) * L.gen[1].x;
+            let m = mix(a, b, smoothstep(0.0, 1.0, t));
+            var avg = vec4(0.0);
+            let n = 16u;
+            let turn = hash3(vec3(u32(p.x), u32(p.y), 5u)) * 6.2831853;
+            for (var i = 0u; i < n; i = i + 1u) {
+                let fi = f32(i) + 0.5;
+                let rr = sqrt(fi / f32(n)) * r;
+                let ang = fi * 2.3999632 + turn;
+                let q = uv + vec2(cos(ang), sin(ang)) * rr / size;
+                avg = avg + mix(side_at(backdrop, q), side_at(layer_tex, q), smoothstep(0.0, 1.0, t));
+            }
+            avg = avg / f32(n);
+            if (L.kind == 7u) {
+                return avg;
+            }
+            let blurred = mix(m, avg, g * 0.7);
+            let glow = avg.rgb * g * 0.9 + vec3(g * g * 0.25) * avg.a;
+            return vec4(blurred.rgb + glow, blurred.a);
+        }
+        case 8u: {
+            // Slide: the incoming clip slides in over the outgoing one.
+            let mv = d / max(abs(d.x), abs(d.y));
+            let pb = side_at(layer_tex, uv + mv * (1.0 - t));
+            return over(pb, a);
+        }
+        case 9u: {
+            // Spin: the outgoing clip spins and grows away, the incoming spins in.
+            let aspect = vec2(size.x / size.y, 1.0);
+            let q = (uv - 0.5) * aspect;
+            let ta = smoothstep(0.0, 1.0, t);
+            let qa = rotate2(q, -ta * 3.14159265) / (1.0 + ta * 1.5);
+            let qb = rotate2(q, (1.0 - ta) * 3.14159265) / (1.0 + (1.0 - ta) * 1.5);
+            let sa = side_at(backdrop, qa / aspect + 0.5);
+            let sb = side_at(layer_tex, qb / aspect + 0.5);
+            return mix(sa, sb, smoothstep(0.35, 0.65, t));
+        }
+        case 10u: {
+            // Light leak: warm light sweeps across while the clips cross over.
+            let g = sin(t * 3.14159265);
+            let s2 = dot(uv - 0.5, d) / (abs(d.x) + abs(d.y)) + 0.5;
+            let pos = t * 1.8 - 0.4;
+            let blob = exp(-pow(s2 - pos, 2.0) / 0.06) * g;
+            let flare = exp(-pow(s2 - pos + 0.25, 2.0) / 0.02) * g * 0.5;
+            let leak = vec3(1.0, 0.55, 0.2) * blob + vec3(1.0, 0.85, 0.6) * flare;
+            let m = mix(a, b, smoothstep(0.3, 0.7, t));
+            let l = clamp(leak, vec3(0.0), vec3(1.0)) * max(m.a, 0.0);
+            return vec4(m.rgb + l - m.rgb * l, m.a);
+        }
         default: {
             // Crossfade.
             return mix(a, b, t);
@@ -894,6 +951,46 @@ fn frame_px() -> vec2<f32> {
 // Straight (not premultiplied) color of a premultiplied pixel.
 fn unpremul(c: vec4<f32>) -> vec3<f32> {
     return select(vec3(0.0), c.rgb / c.a, c.a > 1e-5);
+}
+
+// Ordered dither threshold (8x8 Bayer matrix), 0..1.
+fn bayer8(p: vec2<u32>) -> f32 {
+    let x = p.x & 7u;
+    let y = p.y & 7u;
+    let z = x ^ y;
+    let v = ((z & 1u) << 5u) | ((x & 1u) << 4u) | ((z & 2u) << 2u) | ((x & 2u) << 1u) | ((z & 4u) >> 1u) | ((x & 4u) >> 2u);
+    return (f32(v) + 0.5) / 64.0;
+}
+
+fn rotate2(v: vec2<f32>, a: f32) -> vec2<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+// The picture below at a point of the effect's frame (transparent outside the frame
+// texture).
+fn frame_sample(f: vec2<f32>) -> vec4<f32> {
+    return side_at(backdrop, from_frame(f));
+}
+
+// One halftone screen: how much ink covers this pixel. `fpx` = position in frame
+// pixels, `cell` = dot spacing in pixels, `ch` = channel to read (0..2, 3 = darkness).
+fn halftone_ink(fpx: vec2<f32>, cell: f32, angle: f32, ch: u32, soft: f32) -> f32 {
+    let g = rotate2(fpx, -angle) / cell;
+    let center = floor(g) + 0.5;
+    let d = length(g - center);
+    let c_px = rotate2(center * cell, angle);
+    let src = frame_sample(c_px / frame_px());
+    let col = clamp(unpremul(src), vec3(0.0), vec3(1.0));
+    var v = 1.0 - dot(col, LUMA);
+    if (ch < 3u) {
+        v = 1.0 - col[ch];
+    }
+    v = v * src.a;
+    let r = sqrt(clamp(v, 0.0, 1.0)) * 0.7071;
+    let aa = 0.5 / cell + soft * 0.25;
+    return 1.0 - smoothstep(r - aa, r + aa, d);
 }
 
 // Effects keep transparency intact, so the same passes work on the whole frame
@@ -1005,6 +1102,209 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
                 // Screen works on premultiplied color and alpha alike.
                 res = mix(o4, base + ghost - base * ghost, e.w);
             }
+        }
+        case 10u: {
+            // VHS: e = (scanlines, line count, noise, jitter),
+            // e2 = (color bleed px, CRT curve, tracking, softness).
+            let e2 = L.gen[2];
+            let seed = u32(L.gen[1].y);
+            let fp = frame_px();
+            var f = to_frame(uv);
+            // CRT curve: the picture bulges like old TV glass; outside is black.
+            var d = (f - 0.5) * 2.0;
+            d = d + d * (d.yx * d.yx) * e2.y * 0.35;
+            f = d * 0.5 + 0.5;
+            let lines = max(e.y, 1.0);
+            let row = floor(f.y * lines);
+            // Each line wobbles sideways a little, new every frame.
+            let jit = (hash3(vec3(u32(row + 4096.0), seed, 3u)) - 0.5) * e.w * 8.0 * k / fp.x;
+            // A tracking band rolls down the picture, tearing it sideways.
+            let band_pos = fract(f32(seed) * 0.011 + 0.3);
+            let band = e2.z * smoothstep(0.07, 0.0, abs(f.y - band_pos));
+            let tear = (sin(f.y * 140.0 + f32(seed) * 0.9) * 0.6 + (hash3(vec3(u32(row), seed, 9u)) - 0.5)) * band * 0.03;
+            f.x = f.x + jit + tear;
+            // Brightness stays fairly sharp, color smears sideways (bleed).
+            let soft = (0.5 + e2.w * 3.0) * k / fp.x;
+            let bleed = max(e2.x * k / fp.x, soft);
+            var sharp = vec4(0.0);
+            var wide = vec4(0.0);
+            for (var i = -4; i <= 4; i = i + 1) {
+                let o = f32(i) / 4.0;
+                wide = wide + frame_sample(f + vec2(o * bleed, 0.0));
+                if (abs(i) <= 2) {
+                    sharp = sharp + frame_sample(f + vec2(o * 2.0 * soft, 0.0));
+                }
+            }
+            sharp = sharp / 5.0;
+            wide = wide / 9.0;
+            let sc = unpremul(sharp);
+            let wc = unpremul(wide);
+            var c = clamp(vec3(dot(sc, LUMA)) + (wc - vec3(dot(wc, LUMA))), vec3(0.0), vec3(1.0));
+            // Tape noise: fine static plus faint colored streaks along lines.
+            let n = hash3(vec3(u32(p.x), u32(p.y), seed)) - 0.5;
+            let streak = hash3(vec3(u32(row), u32(p.x / (8.0 * k)), seed + 77u)) - 0.5;
+            c = c + vec3(n) * e.z * 0.35 + vec3(streak * 0.6, streak * 0.2, -streak * 0.4) * e.z * 0.25 + vec3(band * 0.25 * n);
+            // Scanlines.
+            let sl = 0.5 + 0.5 * cos(f.y * lines * 6.2831853);
+            c = c * (1.0 - e.x * (1.0 - sl) * 0.85);
+            // Slightly darker edges with the curve.
+            let edge = smoothstep(1.4, 0.6, length(d * vec2(0.8, 0.9)));
+            c = c * mix(1.0, edge, e2.y);
+            var a = sharp.a;
+            if (any(f < vec2(0.0)) || any(f > vec2(1.0))) {
+                c = vec3(0.0);
+                a = a0;
+            }
+            res = vec4(clamp(c, vec3(0.0), vec3(1.0)) * a, a);
+        }
+        case 11u: {
+            // Jitter: e = (amount px, rotation deg, zoom, hold frames). A new random
+            // position every `hold` frames.
+            let fp = frame_px();
+            let step = u32(max(e.w, 1.0));
+            let s = u32(L.gen[1].y) / step;
+            let r = vec2(hash3(vec3(s, 11u, 1u)), hash3(vec3(s, 13u, 2u))) * 2.0 - 1.0;
+            let ang = radians(e.y) * (hash3(vec3(s, 17u, 3u)) * 2.0 - 1.0);
+            var q = (to_frame(uv) - 0.5) * fp;
+            q = rotate2(q - r * e.x * k, -ang) / max(e.z, 0.1);
+            res = frame_sample(q / fp + 0.5);
+        }
+        case 12u: {
+            // Pixelate: e.x = pixel size (project px), on the frame's own grid.
+            let fp = frame_px();
+            let size = max(e.x * k, 1.0);
+            let cell = (floor(to_frame(uv) * fp / size) + 0.5) * size;
+            let q = size * 0.25;
+            res = (frame_sample((cell + vec2(-q, -q)) / fp) + frame_sample((cell + vec2(q, -q)) / fp)
+                + frame_sample((cell + vec2(-q, q)) / fp) + frame_sample((cell + vec2(q, q)) / fp)) * 0.25;
+        }
+        case 13u: {
+            // Dither: e = (colors per channel, pattern size px, noise pattern, monochrome).
+            let levels = max(round(e.x), 2.0) - 1.0;
+            let cell = max(e.y * k, 1.0);
+            let ip = vec2<u32>(max(to_frame(uv) * frame_px() / cell, vec2(0.0)));
+            var th = bayer8(ip);
+            if (e.z > 0.5) {
+                th = hash3(vec3(ip, u32(L.gen[1].y) % 2u + 41u));
+            }
+            var c = mix(orig, vec3(dot(orig, LUMA)), e.w);
+            c = floor(clamp(c, vec3(0.0), vec3(1.0)) * levels + th) / levels;
+            res = vec4(clamp(c, vec3(0.0), vec3(1.0)) * a0, a0);
+        }
+        case 14u: {
+            // Halftone: e = (dot size px, angle deg, color, softness).
+            let cell = max(e.x * k, 2.0);
+            let fpx = to_frame(uv) * frame_px();
+            let ang = radians(e.y);
+            let mono = 1.0 - halftone_ink(fpx, cell, ang, 3u, e.w);
+            var cmy = vec3(1.0);
+            if (e.z > 0.0) {
+                cmy = vec3(
+                    1.0 - halftone_ink(fpx, cell, ang + radians(15.0), 0u, e.w),
+                    1.0 - halftone_ink(fpx, cell, ang + radians(75.0), 1u, e.w),
+                    1.0 - halftone_ink(fpx, cell, ang, 2u, e.w),
+                );
+            }
+            let c = mix(vec3(mono), cmy, e.z);
+            res = vec4(c * a0, a0);
+        }
+        case 15u: {
+            // Bulge (amount > 0) or pinch (< 0) around a center: e = (amount, radius, cx, cy).
+            let fp = frame_px();
+            let aspect = vec2(fp.x / fp.y, 1.0);
+            let f = to_frame(uv);
+            let q = (f - e.zw) * aspect;
+            let dist = length(q) / max(e.y, 1e-3);
+            var s = 1.0;
+            if (dist < 1.0) {
+                let w = 1.0 - dist * dist;
+                s = 1.0 - e.x * w * w * 0.8;
+            }
+            res = frame_sample(e.zw + q * s / aspect);
+        }
+        case 16u: {
+            // Fisheye (barrel; pincushion when negative): e = (amount, zoom, cx, cy).
+            // Corners stay put, so the frame stays filled.
+            let fp = frame_px();
+            let aspect = vec2(fp.x / fp.y, 1.0);
+            let q = (to_frame(uv) - e.zw) * aspect;
+            let r2 = dot(q, q) / dot(aspect * 0.5, aspect * 0.5);
+            let s = (1.0 + e.x * r2) / (1.0 + max(e.x, 0.0)) / max(e.y, 0.05);
+            res = frame_sample(e.zw + q * s / aspect);
+        }
+        case 17u: {
+            // CRT bulge: e = (curve, corner roundness, edge shade, zoom).
+            var d = (to_frame(uv) - 0.5) * 2.0;
+            d = (d + d * (d.yx * d.yx) * e.x * 0.6) / max(e.w, 0.1);
+            let f = d * 0.5 + 0.5;
+            let src = frame_sample(f);
+            // Rounded screen corners.
+            let rad = e.y * 0.5 + 1e-3;
+            let qd = abs(d) - vec2(1.0 - rad);
+            let sd = length(max(qd, vec2(0.0))) + min(max(qd.x, qd.y), 0.0) - rad;
+            let aa = 2.0 / min(frame_px().x, frame_px().y);
+            let inside = 1.0 - smoothstep(-aa, aa, sd);
+            let shade = 1.0 - e.z * smoothstep(0.3, 1.25, length(d * vec2(0.85, 1.0)));
+            let c = unpremul(src) * shade * inside;
+            // Outside the screen is black glass.
+            let a = mix(a0, src.a, inside);
+            res = vec4(c * a, a);
+        }
+        case 18u: {
+            // Liquify: offsets painted with the brush, from the grid texture. e.x = amount.
+            let f = to_frame(uv);
+            let off = textureSampleLevel(matte_tex, matte_samp, clamp(f, vec2(0.0), vec2(1.0)), 0.0).rg * e.x;
+            res = frame_sample(f - off);
+        }
+        case 19u: {
+            // Light rays: bright parts streak out from a light source.
+            // e = (intensity, length, cx, cy), e2 = (threshold, warmth).
+            let e2 = L.gen[2];
+            let c = from_frame(e.zw);
+            let n = 48u;
+            let jit = hash3(vec3(u32(p.x), u32(p.y), 61u));
+            var sum = vec3(0.0);
+            for (var i = 0u; i < n; i = i + 1u) {
+                let f = (f32(i) + jit) / f32(n);
+                let q = uv + (c - uv) * f * e.y;
+                let s = clamp(side_at(backdrop, q), vec4(0.0), vec4(1.0));
+                let col = unpremul(s);
+                let b = max(dot(col, LUMA) - e2.x, 0.0) / max(1.0 - e2.x, 0.05);
+                sum = sum + col * b * s.a * (1.0 - f);
+            }
+            let warm = select(mix(vec3(1.0), vec3(0.65, 0.8, 1.0), -e2.y), mix(vec3(1.0), vec3(1.0, 0.82, 0.55), e2.y), e2.y >= 0.0);
+            let g = sum / f32(n) * e.x * 2.5 * warm;
+            res = vec4(o4.rgb + g, clamp(o4.a + max(g.r, max(g.g, g.b)), 0.0, 1.0));
+        }
+        case 20u: {
+            // Star sparkles on the brightest spots: e = (threshold, size px, intensity,
+            // angle deg), e2 = (points, twinkle).
+            let e2 = L.gen[2];
+            let lines = max(u32(round(e2.x)) / 2u, 1u);
+            let reach = max(e.y * k, 1.0);
+            let taps = 16u;
+            let seed = u32(L.gen[1].y);
+            var sum = vec3(0.0);
+            for (var j = 0u; j < lines; j = j + 1u) {
+                let a = radians(e.w) + f32(j) * 3.14159265 / f32(lines);
+                let dir = vec2(cos(a), sin(a));
+                for (var i = 1u; i <= taps; i = i + 1u) {
+                    let t = f32(i) / f32(taps);
+                    let w = (1.0 - t) * (1.0 - t);
+                    for (var side = -1.0; side <= 1.0; side = side + 2.0) {
+                        let q = p.xy + dir * side * t * reach;
+                        let s = clamp(side_at(backdrop, q / size), vec4(0.0), vec4(1.0));
+                        let col = unpremul(s);
+                        let b = max(dot(col, LUMA) - e.x, 0.0) / max(1.0 - e.x, 0.02);
+                        // Twinkle: each spot flickers on its own.
+                        let cellk = vec2<u32>(max(q / (12.0 * k), vec2(0.0)));
+                        let fl = mix(1.0, hash3(vec3(cellk, seed)), e2.y);
+                        sum = sum + (col * 0.5 + vec3(0.5)) * b * s.a * w * fl;
+                    }
+                }
+            }
+            let g = sum / f32(taps) * e.z * 4.0;
+            res = vec4(o4.rgb + g, clamp(o4.a + max(g.r, max(g.g, g.b)), 0.0, 1.0));
         }
         default: {}
     }

@@ -26,8 +26,9 @@ pub struct AudioClip {
 pub enum AudioSource {
     /// Reads the file directly; speed changes the pitch like a tape.
     Direct { source_in: f64, speed: SpeedMap, pcm: Arc<Vec<i16>> },
-    /// Already time-stretched audio (pitch kept), aligned to the clip start.
-    Stretched { pcm: Arc<Vec<i16>> },
+    /// Already time-stretched audio, aligned to the clip start, read `rate` times
+    /// faster than real time (1 = pitch kept; 2 = an octave up).
+    Stretched { pcm: Arc<Vec<i16>>, rate: f64 },
 }
 
 /// Clip time -> source seconds played, cheap enough for the audio thread.
@@ -41,10 +42,13 @@ pub enum SpeedMap {
 /// audio when the clip needs it and it's ready; otherwise the file is read directly.
 pub fn audio_clip(clip: &crate::core::model::Clip, pcm: Arc<Vec<i16>>, stretched: Option<Arc<Vec<i16>>>, fades: (f64, f64)) -> AudioClip {
     let source = match stretched {
-        Some(pcm) => AudioSource::Stretched { pcm },
+        Some(pcm) => AudioSource::Stretched { pcm, rate: super::stretch::read_rate(clip) },
         None => AudioSource::Direct { source_in: clip.source_in, speed: SpeedMap::for_clip(clip), pcm },
     };
-    AudioClip { start: clip.start, duration: clip.duration, volume: clip.volume.clone(), fade_in: fades.0, fade_out: fades.1, source }
+    // The clip's own fades, or the crossfade of a cut transition, whichever is longer.
+    let fade_in = fades.0.max(clip.audio.fade_in.clamp(0.0, clip.duration));
+    let fade_out = fades.1.max(clip.audio.fade_out.clamp(0.0, clip.duration));
+    AudioClip { start: clip.start, duration: clip.duration, volume: clip.volume.clone(), fade_in, fade_out, source }
 }
 
 /// Resolution of the speed lookup table, seconds.
@@ -216,7 +220,7 @@ pub fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
             continue;
         }
         let pcm = match &clip.source {
-            AudioSource::Direct { pcm, .. } | AudioSource::Stretched { pcm } => pcm,
+            AudioSource::Direct { pcm, .. } | AudioSource::Stretched { pcm, .. } => pcm,
         };
         let total = pcm.len() / 2;
         for i in 0..frames {
@@ -238,7 +242,7 @@ pub fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
             }
             let seconds = match &clip.source {
                 AudioSource::Direct { source_in, speed, .. } => source_in + speed.elapsed(local),
-                AudioSource::Stretched { .. } => local,
+                AudioSource::Stretched { rate, .. } => local * rate,
             };
             // Linear interpolation also handles devices that don't run at 48 kHz.
             let src = seconds * src_rate;

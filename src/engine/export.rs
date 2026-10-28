@@ -282,18 +282,22 @@ pub fn run(
     let mut text_engine = TextEngine::default();
     let mut uploaded_text: HashMap<ClipId, u64> = HashMap::new();
     let mut luts = super::lut::LutCache::default();
+    // Clips drawn in the last frame (their decoders stay open).
+    let mut used: HashSet<ClipId> = HashSet::new();
     let started = Instant::now();
 
     for i in 0..frames {
         let t = i as f64 / fps as f64;
 
-        // Open decoders for clips that are visible now or start soon; close finished ones.
-        streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < c.end()));
+        // Open decoders for clips that start soon (clips inside compound clips open
+        // when first drawn); close ones no longer drawn.
+        streams.retain(|id, _| used.contains(id) || project.clip(*id).is_some_and(|c| c.start > t && c.start <= t + PREROLL));
         mattes.retain(|id, _| streams.contains_key(id));
+        used.clear();
         for clip in &project.clips {
             let (first, last) = (clip.start, clip.end());
             let soon = first <= t + PREROLL && t < last;
-            let shown = project.tracks.get(clip.track).is_some_and(|tr| !tr.hidden);
+            let shown = project.tracks.get(clip.track).is_some_and(|tr| !tr.hidden) && !clip.audio.only;
             if !soon || !shown || streams.contains_key(&clip.id) {
                 continue;
             }
@@ -316,6 +320,7 @@ pub fn run(
         let mut error: Option<String> = None;
         let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
             let paint = match &l.paint {
+                scene::ScenePaint::Group(key) => Paint::Source(SourceKey::Group(*key)),
                 scene::ScenePaint::Gradient { colors, positions, count, angle_deg, size } => {
                     Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size }
                 }
@@ -329,6 +334,29 @@ pub fn run(
                 }
                 scene::ScenePaint::Media => match l.asset.kind {
                     AssetKind::Video => {
+                        used.insert(l.clip.id);
+                        if !streams.contains_key(&l.clip.id) {
+                            // Not opened ahead (e.g. inside a compound clip): open it here.
+                            let asset = l.asset;
+                            let (dw, dh) = scene::decode_size(project, asset, l.clip, frame_scale, (asset.width.max(2), asset.height.max(2)));
+                            let rate = l.clip.decode_rate(fps);
+                            let from = l.source_time.max(0.0);
+                            match SequentialStream::open(&asset.path, from, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL) {
+                                Ok(s) => {
+                                    streams.insert(l.clip.id, (s, rate, from, None));
+                                }
+                                Err(e) => {
+                                    error = Some(e);
+                                    return None;
+                                }
+                            }
+                            if let Some((path, q)) = l.clip.matte.as_ref().filter(|m| m.enabled).and_then(|m| Some((matte::existing(asset, m.quality)?, m.quality))) {
+                                let (mw, mh) = matte::matte_size(asset, q);
+                                if let Ok(m) = SequentialStream::open(&path, from, mw, mh, rate, true, false) {
+                                    mattes.insert(l.clip.id, (m, rate, from, None));
+                                }
+                            }
+                        }
                         let (stream, rate, from, uploaded) = streams.get_mut(&l.clip.id)?;
                         let index = ((l.source_time - *from) * *rate).round().max(0.0) as u64;
                         let key = SourceKey::Clip(l.clip.id.0);
@@ -424,10 +452,10 @@ fn write_mix(project: &Project, audio: &HashMap<AssetId, Arc<Vec<i16>>>, total: 
     let rate = probe::AUDIO_RATE;
     let mut loaded: HashMap<AssetId, Arc<Vec<i16>>> = HashMap::new();
     let mut clips = Vec::new();
-    for c in &project.clips {
+    for (c, fades) in crate::core::compound::sound_clips(project) {
+        let c = &c;
         let Some(asset) = project.asset(c.asset) else { continue };
-        let audible = asset.has_audio && project.tracks.get(c.track).is_some_and(|t| !t.muted);
-        if !audible {
+        if !asset.has_audio {
             continue;
         }
         let pcm = match audio.get(&asset.id).or_else(|| loaded.get(&asset.id)) {
@@ -440,7 +468,7 @@ fn write_mix(project: &Project, audio: &HashMap<AssetId, Arc<Vec<i16>>>, total: 
             }
         };
         let stretched = stretch::needed(c).then(|| Arc::new(stretch::stretch(&pcm, c)));
-        clips.push(audio_clip(c, pcm, stretched, crate::core::transition::audio_fades(project, c)));
+        clips.push(audio_clip(c, pcm, stretched, fades));
     }
 
     let frames = (total * rate as f64).ceil() as u64;

@@ -78,6 +78,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                 let ctx = ClipCtx {
                     frame_scale,
                     masks: &mut app.player.masks,
+                    tools: &mut app.player.effects,
                     text: &mut app.preview.text,
                     font_search: &mut app.inspector.font_search,
                     grading: &mut app.inspector.grading,
@@ -268,9 +269,16 @@ fn color_row(ui: &mut Ui, clip: &mut Clip, first: u8, label: &str, local: f64, t
 }
 
 /// The color, gradient, text or effect settings of a generated clip.
-fn content_section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Tracker, text: &mut TextEngine, font_search: &mut String) {
+#[allow(clippy::too_many_arguments)]
+fn content_section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Tracker, text: &mut TextEngine, font_search: &mut String, tools: &mut super::effect_tools::EffectTools) {
     let Some(content) = c.content.clone() else { return };
     match content {
+        Content::Compound(comp) => {
+            egui::CollapsingHeader::new("Compound clip").default_open(true).show(ui, |ui| {
+                ui.label(format!("{} clips on {} tracks, {:.2}s long.", comp.project.clips.len(), comp.project.tracks.len(), comp.project.duration()));
+                ui.label(egui::RichText::new("Double-click it on the timeline (or right-click > Open compound) to edit what's inside. Right-click > Release compound puts the clips back.").weak());
+            });
+        }
         Content::Color(_) => {
             egui::CollapsingHeader::new("Fill").default_open(true).show(ui, |ui| {
                 egui::Grid::new("fill").num_columns(3).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
@@ -366,6 +374,15 @@ fn content_section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Trac
                 let mut all = vec![Param::Opacity];
                 all.extend(used);
                 param_grid(ui, "effect", c, &all, local, tol, t);
+                if e.kind.center_params().is_some() {
+                    ui.label(egui::RichText::new("Drag the yellow center in the player to move it.").weak());
+                }
+                if e.kind == crate::core::content::EffectKind::Liquify {
+                    let target = super::effect_tools::Target { clip: c.id, effect: None };
+                    if let Some(Content::Effect(e)) = &mut c.content {
+                        super::effect_tools::liquify_controls(ui, tools, target, &mut e.warp, &mut t.changed);
+                    }
+                }
             });
         }
     }
@@ -383,6 +400,7 @@ fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f
 struct ClipCtx<'a> {
     frame_scale: f32,
     masks: &'a mut super::masks::MaskUi,
+    tools: &'a mut super::effect_tools::EffectTools,
     text: &'a mut TextEngine,
     font_search: &'a mut String,
     grading: &'a mut super::grading::GradingState,
@@ -470,9 +488,11 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
     t.changed |= timing_changed;
 
     let is_effect = c.content.as_ref().is_some_and(|x| x.is_effect());
-    content_section(ui, &mut c, local, tol, t, ctx.text, ctx.font_search);
+    // Audio files and separated sound have no picture settings.
+    let sound_only = asset.kind == AssetKind::Audio || c.audio.only;
+    content_section(ui, &mut c, local, tol, t, ctx.text, ctx.font_search, ctx.tools);
 
-    if asset.kind != AssetKind::Audio && !is_effect {
+    if !sound_only && !is_effect {
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
             param_grid(ui, "transform", &mut c, &[Param::X, Param::Y, Param::Scale, Param::Opacity], local, tol, t);
             ui.horizontal(|ui| {
@@ -517,15 +537,15 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
             super::matte::section(ui, &mut c, &asset, ctx.mattes, local, tol, t);
         }
     }
-    if asset.kind != AssetKind::Audio && !is_effect {
-        super::clip_effects::section(ui, &mut c, local, tol, t);
+    if !sound_only && !is_effect {
+        super::clip_effects::section(ui, &mut c, local, tol, t, ctx.tools);
     }
     if super::masks::supports_masks(project, &c) {
         if let Some((size, _)) = crate::engine::scene::layer_space(project, &c, playhead, ctx.text, ctx.frame_scale) {
             super::masks::section(ui, &mut c, size, local, tol, t, ctx.masks, ctx.picking);
         }
     }
-    let transition_change = super::transitions::section(ui, project, &c, t);
+    let transition_change = if sound_only { None } else { super::transitions::section(ui, project, &c, t) };
     if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
         egui::CollapsingHeader::new("Speed").default_open(true).show(ui, |ui| {
             let before = c.speed.clone();
@@ -553,9 +573,10 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
             }
         });
     }
+    let mut separate = false;
     if asset.has_audio {
         egui::CollapsingHeader::new("Audio").default_open(true).show(ui, |ui| {
-            param_grid(ui, "audio", &mut c, &[Param::Volume], local, tol, t);
+            separate = super::audio::section(ui, &mut c, &asset, local, tol, t);
         });
     }
 
@@ -601,6 +622,11 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
     // Applied after the clip itself: a cut transition moves this and later clips.
     if let Some(change) = transition_change {
         change.apply(project, id);
+    }
+    if separate {
+        // The tracker's checkpoint covers this (it's taken before any change this frame).
+        t.changed = true;
+        project.separate_audio(id);
     }
     tone_action
 }

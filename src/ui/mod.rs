@@ -1,7 +1,9 @@
 //! The window and its panels.
 pub mod app;
 pub mod assets;
+pub mod audio;
 pub mod clip_effects;
+pub mod effect_tools;
 pub mod export_dialog;
 pub mod grading;
 pub mod inspector;

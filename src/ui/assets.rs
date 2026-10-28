@@ -5,7 +5,7 @@
 
 use super::app::EditorApp;
 use super::timeline::format_time;
-use crate::core::content::{Content, EffectKind};
+use crate::core::content::Content;
 use crate::core::model::{AssetId, AssetKind};
 use crate::media::proxy::{self, ProxyState};
 use egui::{vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, Ui};
@@ -32,10 +32,8 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                     made = Some(Content::text());
                 }
                 ui.menu_button("Effect", |ui| {
-                    for k in EffectKind::ALL {
-                        if ui.button(k.label()).clicked() {
-                            made = Some(Content::effect(k));
-                        }
+                    if let Some(k) = super::effect_tools::effect_menu(ui, true) {
+                        made = Some(Content::effect(k));
                     }
                 });
                 if let Some(content) = made {
@@ -198,6 +196,16 @@ fn color32(c: [f32; 4]) -> Color32 {
 /// Preview tile for colors, gradients, text and effects.
 fn generated_thumb(painter: &egui::Painter, r: Rect, content: &Content) {
     match content {
+        Content::Compound(c) => {
+            painter.rect_filled(r, CornerRadius::same(4), Color32::from_rgb(40, 60, 90));
+            // Stacked bars: one per inner track.
+            let n = c.project.tracks.len().clamp(1, 4);
+            for i in 0..n {
+                let y = r.bottom() - 10.0 - i as f32 * 9.0;
+                painter.rect_filled(Rect::from_min_max(egui::pos2(r.left() + 10.0 + i as f32 * 6.0, y - 6.0), egui::pos2(r.right() - 10.0, y)), 2.0, Color32::from_rgb(90, 140, 210));
+            }
+            painter.text(egui::pos2(r.center().x, r.top() + 14.0), egui::Align2::CENTER_CENTER, format!("{} clips", c.project.clips.len()), egui::FontId::proportional(11.0), Color32::WHITE);
+        }
         Content::Color(c) => {
             painter.rect_filled(r, CornerRadius::same(4), color32(c.eval(0.0)));
         }

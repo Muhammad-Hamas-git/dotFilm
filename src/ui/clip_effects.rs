@@ -3,24 +3,19 @@
 //! processed on its own, then put on the stack with the track's blend mode).
 
 use super::inspector::{param_row, Tracker};
+use super::effect_tools::{self, EffectTools, Target};
 use crate::core::content::{ClipEffect, EffectKind, CLIP_EFFECT_MIX};
 use crate::core::model::{Clip, Param};
 use egui::{vec2, Ui};
 
-/// Effects offered per clip (motion blur needs the whole stack, so it's layer-only).
-fn offered() -> impl Iterator<Item = EffectKind> {
-    EffectKind::ALL.into_iter().filter(|k| *k != EffectKind::MotionBlur)
-}
-
-pub(super) fn section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Tracker) {
+pub(super) fn section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut Tracker, tools: &mut EffectTools) {
     egui::CollapsingHeader::new("Effects").default_open(!c.effects.is_empty()).show(ui, |ui| {
+        // Motion blur needs the whole stack, so it's only offered as an effect layer.
         ui.menu_button("Add effect", |ui| {
-            for k in offered() {
-                if ui.button(k.label()).clicked() {
-                    c.effects.push(ClipEffect::new(k));
-                    t.changed = true;
-                    ui.close();
-                }
+            if let Some(k) = effect_tools::effect_menu(ui, false) {
+                c.effects.push(ClipEffect::new(k));
+                t.changed = true;
+                ui.close();
             }
         });
         if c.effects.is_empty() {
@@ -58,6 +53,13 @@ pub(super) fn section(ui: &mut Ui, c: &mut Clip, local: f64, tol: f64, t: &mut T
                 }
                 param_row(ui, c, Param::ClipEffect(e as u8, CLIP_EFFECT_MIX), local, tol, t);
             });
+            if kind.center_params().is_some() {
+                ui.label(egui::RichText::new("Drag the yellow center in the player to move it.").weak());
+            }
+            if kind == EffectKind::Liquify {
+                let target = Target { clip: c.id, effect: Some(e) };
+                effect_tools::liquify_controls(ui, tools, target, &mut c.effects[e].effect.warp, &mut t.changed);
+            }
         }
         if let Some((e, a)) = action {
             match a {

@@ -68,6 +68,8 @@ pub enum SourceKey {
     Clip(u64),
     Asset(u64),
     Matte(u64),
+    /// A compound clip's contents, rendered this frame (see `DrawItem::Group`).
+    Group(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,6 +78,8 @@ enum SourceKind {
     Yuv420,
     /// One 8-bit channel (an AI matte), bound as the layer's matte.
     Gray,
+    /// A rendered stack (premultiplied, 16-bit float): a compound clip.
+    Premul,
 }
 
 struct Source {
@@ -108,7 +112,7 @@ pub enum Paint {
 pub struct EffectDraw {
     /// EffectKind::shader_id.
     pub kind: u32,
-    pub params: [f32; 4],
+    pub params: [f32; 8],
     /// Mix with the unprocessed picture, 0..1.
     pub opacity: f32,
     /// Changes every frame (animated grain).
@@ -118,6 +122,17 @@ pub struct EffectDraw {
     /// What the effect treats as the picture (vignette edges, distortion centers).
     /// None = the whole frame. A clip's own effects get theirs from the clip.
     pub frame: Option<EffectFrame>,
+    /// Liquify offsets.
+    pub warp: Option<WarpDraw>,
+}
+
+/// A liquify grid (see core::warp), uploaded once per change and kept by `key`.
+#[derive(Clone, Debug)]
+pub struct WarpDraw {
+    pub key: u64,
+    /// Points per side.
+    pub size: u32,
+    pub offsets: std::sync::Arc<Vec<[f32; 2]>>,
 }
 
 /// Two clips (or one, at a free edge) mixed by a transition, then put on the stack
@@ -146,6 +161,9 @@ pub enum DrawItem {
     /// Motion blur: draws `prefix` once, then each list on top of it, and averages
     /// the results. Replaces whatever was drawn before it, so it comes first.
     Samples { prefix: Vec<DrawItem>, lists: Vec<Vec<DrawItem>> },
+    /// A compound clip's contents: rendered first, on transparent, into the picture
+    /// `SourceKey::Group(key)`, which a later layer draws. Draws nothing by itself.
+    Group { key: u64, items: Vec<DrawItem> },
 }
 
 /// Effect ids that need two passes (separable blurs): Gaussian blur and bloom.
@@ -196,7 +214,7 @@ impl LayerDraw {
         self.region.map(|r| r.map(f32::to_bits)).hash(h);
         self.effects.len().hash(h);
         for e in &self.effects {
-            (e.kind, e.seed).hash(h);
+            (e.kind, e.seed, e.warp.as_ref().map(|w| w.key)).hash(h);
             hash_f32s(e.params.iter().chain([&e.opacity]), h);
         }
     }
@@ -212,7 +230,7 @@ impl DrawItem {
                 l.hash_into(h);
             }
             DrawItem::Effect(e) => {
-                (1u8, e.kind, e.seed).hash(h);
+                (1u8, e.kind, e.seed, e.warp.as_ref().map(|w| w.key)).hash(h);
                 hash_f32s(e.params.iter().chain([&e.opacity]), h);
                 hash_mask(&e.mask, h);
                 if let Some(f) = &e.frame {
@@ -227,6 +245,12 @@ impl DrawItem {
                     if let Some(l) = l {
                         l.hash_into(h);
                     }
+                }
+            }
+            DrawItem::Group { key, items } => {
+                (4u8, key, items.len()).hash(h);
+                for i in items {
+                    i.hash_into(h);
                 }
             }
             DrawItem::Samples { prefix, lists } => {
@@ -253,7 +277,8 @@ struct LayerOp {
     src: Option<SourceKey>,
     matte: Option<SourceKey>,
     lut: Option<u64>,
-    effects: Vec<(u32, bool)>,
+    /// (settings slot, two passes, liquify grid)
+    effects: Vec<(u32, bool, Option<u64>)>,
     copy: u32,
 }
 
@@ -261,7 +286,7 @@ enum Op {
     Clear,
     Layer { layer: LayerOp, normal: bool },
     TwoPass { slot: u32 },
-    Effect { slot: u32 },
+    Effect { slot: u32, warp: Option<u64> },
     Transition { from: Option<LayerOp>, to: Option<LayerOp>, slot: u32, normal: bool },
     BaseSave { slot: u32 },
     BaseRestore { slot: u32 },
@@ -354,6 +379,8 @@ struct Targets {
     width: u32,
     height: u32,
     accum: [wgpu::TextureView; 2],
+    /// The accumulation textures themselves (copied out for compound clips).
+    accum_tex: [wgpu::Texture; 2],
     layer: wgpu::TextureView,
     /// Transition inputs (outgoing and incoming clip).
     trans: [wgpu::TextureView; 2],
@@ -410,6 +437,8 @@ pub struct Compositor {
     lut_layout: wgpu::BindGroupLayout,
     /// Identity 2x2x2 LUT for layers without one.
     blank_lut: wgpu::BindGroup,
+    /// Uploaded liquify grids by key.
+    warps: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
     luts: HashMap<u64, LutTex>,
     pair_layout: wgpu::BindGroupLayout,
     single_layout: wgpu::BindGroupLayout,
@@ -612,7 +641,9 @@ impl Compositor {
         let blend = pipeline("blend", &blend_layout, "vs_full", "fs_blend", WORK_FORMAT, None, list);
         let blur_h = pipeline("blur h", &single_pl, "vs_full", "fs_blur_h", WORK_FORMAT, None, list);
         let blur_v = pipeline("blur v", &blend_layout, "vs_full", "fs_blur_v", WORK_FORMAT, None, list);
-        let effect = pipeline("effect", &blend_layout, "vs_full", "fs_effect", WORK_FORMAT, None, list);
+        // Effects can read a liquify grid through the matte slot (group 2).
+        let effect_layout = layout("effect", &[Some(&uniform_layout), Some(&pair_layout), Some(&matte_layout)]);
+        let effect = pipeline("effect", &effect_layout, "vs_full", "fs_effect", WORK_FORMAT, None, list);
         let transition_over = pipeline("transition over", &blend_layout, "vs_full", "fs_transition", WORK_FORMAT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), list);
         let transition_replace = pipeline("transition", &blend_layout, "vs_full", "fs_transition", WORK_FORMAT, None, list);
         let add = wgpu::BlendState {
@@ -685,6 +716,7 @@ impl Compositor {
             lut_layout,
             blank_lut,
             luts: HashMap::new(),
+            warps: HashMap::new(),
             pair_layout,
             single_layout,
             out_layout,
@@ -736,8 +768,9 @@ impl Compositor {
     ) -> Targets {
         use wgpu::TextureUsages as U;
         let work = U::RENDER_ATTACHMENT | U::TEXTURE_BINDING;
-        let a0 = texture(device, w, h, WORK_FORMAT, work, "accum 0").create_view(&Default::default());
-        let a1 = texture(device, w, h, WORK_FORMAT, work, "accum 1").create_view(&Default::default());
+        let accum_tex = [0, 1].map(|i| texture(device, w, h, WORK_FORMAT, work | U::COPY_SRC, if i == 0 { "accum 0" } else { "accum 1" }));
+        let a0 = accum_tex[0].create_view(&Default::default());
+        let a1 = accum_tex[1].create_view(&Default::default());
         let layer = texture(device, w, h, WORK_FORMAT, work, "layer").create_view(&Default::default());
         let t0 = texture(device, w, h, WORK_FORMAT, work, "transition from").create_view(&Default::default());
         let t1 = texture(device, w, h, WORK_FORMAT, work, "transition to").create_view(&Default::default());
@@ -811,6 +844,7 @@ impl Compositor {
             width: w,
             height: h,
             accum: [a0, a1],
+            accum_tex,
             layer,
             trans: [t0, t1],
             sum,
@@ -863,7 +897,8 @@ impl Compositor {
 
     /// Frees GPU memory for sources no longer needed.
     pub fn retain_sources(&mut self, mut keep: impl FnMut(&SourceKey) -> bool) {
-        self.sources.retain(|k, _| keep(k));
+        // Compound pictures are managed by `render` itself.
+        self.sources.retain(|k, _| matches!(k, SourceKey::Group(_)) || keep(k));
         let sources = &self.sources;
         self.preps.retain(|k, _| sources.contains_key(k));
     }
@@ -881,6 +916,7 @@ impl Compositor {
                     texture(&self.device, w / 2, h / 2, wgpu::TextureFormat::R8Unorm, usage, "v"),
                 ],
                 SourceKind::Gray => vec![texture(&self.device, w, h, wgpu::TextureFormat::R8Unorm, usage, "matte")],
+                SourceKind::Premul => vec![texture(&self.device, w, h, WORK_FORMAT, usage, "compound")],
             };
             let views: Vec<wgpu::TextureView> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
             let plane = |i: usize| views.get(i).unwrap_or(&self.dummy);
@@ -970,7 +1006,7 @@ impl Compositor {
                         self.collect_mattes(list, out);
                     }
                 }
-                DrawItem::Effect(_) => {}
+                DrawItem::Effect(_) | DrawItem::Group { .. } => {}
             }
         }
     }
@@ -1080,20 +1116,14 @@ impl Compositor {
 
     /// The part of a layer that shows (masks and AI cut-out), in its own 0..1 space.
     fn visible_rect(&self, l: &LayerDraw) -> [f32; 4] {
-        let masks = l.region.unwrap_or(geometry::FULL_RECT);
+        // An inverted matte keeps the background: it doesn't shrink the area.
         let matte = self.layer_matte(l).filter(|_| l.matte.mode < 1.5).and_then(|k| self.sources.get(&k)).map(|s| s.bounds);
-        let rect = match matte {
-            None => Some(masks),
-            // Masks bring the background back: the union of both.
-            Some(m) if l.matte.restore => match (m, l.region) {
-                (Some(m), Some(r)) => Some(geometry::union(m, r)),
-                (m, None) => m.or(Some(masks)),
-                (None, Some(r)) => Some(r),
-            },
-            // Masks cut the subject out further: where both show.
-            Some(m) => m.and_then(|m| geometry::intersect(m, masks)),
-        };
-        rect.filter(|r| r[2] > r[0] && r[3] > r[1]).unwrap_or(geometry::FULL_RECT)
+        geometry::visible_rect(l.region, matte, l.matte.restore)
+    }
+
+    /// Where an uploaded matte shows the subject (outer None: not uploaded).
+    pub fn matte_bounds(&self, key: SourceKey) -> Option<Option<[f32; 4]>> {
+        self.sources.get(&key).map(|s| s.bounds)
     }
 
     /// The matte a layer uses, if it has one and it's switched on.
@@ -1124,7 +1154,11 @@ impl Compositor {
             Paint::Source(k) => {
                 let src = &self.sources[k];
                 yuv = src.yuv;
-                if src.kind == SourceKind::Yuv420 { 1 } else { 0 }
+                match src.kind {
+                    SourceKind::Yuv420 => 1,
+                    SourceKind::Premul => 4,
+                    _ => 0,
+                }
             }
             Paint::Gradient { colors, positions, count, angle_deg, size } => {
                 extra[0] = colors[0];
@@ -1166,7 +1200,7 @@ impl Compositor {
     }
 
     fn uniform_for_transition(&self, t: &TransitionDraw) -> LayerUniform {
-        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0, mask: MaskFrame::NONE, frame: None });
+        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0, 0.0, 0.0, 0.0, 0.0], opacity: t.progress, seed: 0, mask: MaskFrame::NONE, frame: None, warp: None });
         u.blend = t.blend.shader_id();
         u
     }
@@ -1174,7 +1208,9 @@ impl Compositor {
     fn uniform_for_effect(&self, e: &EffectDraw) -> LayerUniform {
         let (ow, oh) = self.size();
         let mut extra = [[0.0f32; 4]; 6];
-        extra[0] = e.params;
+        let p = &e.params;
+        extra[0] = [p[0], p[1], p[2], p[3]];
+        extra[2] = [p[4], p[5], p[6], p[7]];
         // Effect sizes are in project pixels; scale them to this output.
         extra[1] = [ow as f32 / self.canvas.0, e.seed as f32, ow as f32, oh as f32];
         // The effect's own frame: [0..3] frame <- project frame, [3..6] the way back,
@@ -1221,11 +1257,11 @@ impl Compositor {
         let frame = (!l.effects.is_empty()).then(|| EffectFrame::new(&l.quad, self.visible_rect(l), self.canvas));
         for e in &l.effects {
             u.push(self.uniform_for_effect(&EffectDraw { frame, ..e.clone() }));
-            effects.push(((u.len() - 1) as u32, e.kind == BLUR_ID || e.kind == BLOOM_ID));
+            effects.push(((u.len() - 1) as u32, e.kind == BLUR_ID || e.kind == BLOOM_ID, e.warp.as_ref().map(|w| w.key)));
         }
         let mut copy = 0;
         if !effects.is_empty() {
-            let mut c = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None });
+            let mut c = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 8], opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None, warp: None });
             // The copy pass uses the track's blend mode when the result goes through `blend`.
             c.blend = v.blend;
             u.push(c);
@@ -1271,6 +1307,57 @@ impl Compositor {
         LutTex { group, size: n, domain: lut.domain }
     }
 
+    /// Uploads liquify grids the stack uses (new ones only) and frees unused ones.
+    fn upload_warps(&mut self, items: &[DrawItem]) {
+        fn collect<'a>(items: &'a [DrawItem], out: &mut Vec<&'a WarpDraw>) {
+            for item in items {
+                match item {
+                    DrawItem::Effect(e) => out.extend(e.warp.iter()),
+                    DrawItem::Layer(l) => out.extend(l.effects.iter().filter_map(|e| e.warp.as_ref())),
+                    DrawItem::Transition(t) => {
+                        for l in t.from.iter().chain(t.to.iter()) {
+                            out.extend(l.effects.iter().filter_map(|e| e.warp.as_ref()));
+                        }
+                    }
+                    DrawItem::Samples { prefix, lists } => {
+                        collect(prefix, out);
+                        for l in lists {
+                            collect(l, out);
+                        }
+                    }
+                    DrawItem::Group { items, .. } => collect(items, out),
+                }
+            }
+        }
+        let mut used = Vec::new();
+        collect(items, &mut used);
+        for w in &used {
+            if self.warps.contains_key(&w.key) || w.size < 2 || w.offsets.len() < (w.size * w.size) as usize {
+                continue;
+            }
+            let tex = texture(&self.device, w.size, w.size, wgpu::TextureFormat::Rg16Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, "liquify");
+            let data: Vec<u16> = w.offsets.iter().flat_map(|o| [half::f16::from_f32(o[0]).to_bits(), half::f16::from_f32(o[1]).to_bits()]).collect();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&data),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w.size * 4), rows_per_image: Some(w.size) },
+                wgpu::Extent3d { width: w.size, height: w.size, depth_or_array_layers: 1 },
+            );
+            let view = tex.create_view(&Default::default());
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("liquify"),
+                layout: &self.matte_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.warps.insert(w.key, (tex, group));
+        }
+        let keys: Vec<u64> = used.iter().map(|w| w.key).collect();
+        self.warps.retain(|k, _| keys.contains(k));
+    }
+
     /// Uploads a 3D LUT under `key` (e.g. a hash of its file path).
     pub fn upload_lut(&mut self, key: u64, lut: &Lut3D) {
         let t = Self::make_lut(&self.device, &self.queue, &self.lut_layout, &self.sampler, lut);
@@ -1309,7 +1396,8 @@ impl Compositor {
 
     /// One effect pass from `single`/`pair` (its input) into `dst`. Two-pass blurs go
     /// through `layer` in between.
-    fn encode_effect(&self, enc: &mut wgpu::CommandEncoder, slot: u32, two_pass: bool, single: &wgpu::BindGroup, pair: &wgpu::BindGroup, dst: &wgpu::TextureView) {
+    #[allow(clippy::too_many_arguments)]
+    fn encode_effect(&self, enc: &mut wgpu::CommandEncoder, slot: u32, two_pass: bool, warp: Option<u64>, single: &wgpu::BindGroup, pair: &wgpu::BindGroup, dst: &wgpu::TextureView) {
         let off = (slot as u64 * UNIFORM_STRIDE) as u32;
         if two_pass {
             {
@@ -1329,6 +1417,7 @@ impl Compositor {
             pass.set_pipeline(&self.effect);
             pass.set_bind_group(0, &self.uniform_group, &[off]);
             pass.set_bind_group(1, pair, &[]);
+            pass.set_bind_group(2, warp.and_then(|k| self.warps.get(&k)).map_or(&self.blank_matte, |w| &w.1), &[]);
             pass.draw(0..3, 0..1);
         }
     }
@@ -1347,8 +1436,8 @@ impl Compositor {
             pass.draw(0..4, 0..1);
         }
         let mut i = 0;
-        for (slot, two_pass) in &l.effects {
-            self.encode_effect(enc, *slot, *two_pass, &t.iso_single[i], &t.iso_pair[i], &t.iso[1 - i]);
+        for (slot, two_pass, warp) in &l.effects {
+            self.encode_effect(enc, *slot, *two_pass, *warp, &t.iso_single[i], &t.iso_pair[i], &t.iso[1 - i]);
             i = 1 - i;
         }
         i
@@ -1393,7 +1482,7 @@ impl Compositor {
                 }
                 DrawItem::Effect(e) => {
                     let s = slot(u, self.uniform_for_effect(e));
-                    ops.push(if e.kind == BLUR_ID || e.kind == BLOOM_ID { Op::TwoPass { slot: s } } else { Op::Effect { slot: s } });
+                    ops.push(if e.kind == BLUR_ID || e.kind == BLOOM_ID { Op::TwoPass { slot: s } } else { Op::Effect { slot: s, warp: e.warp.as_ref().map(|w| w.key) } });
                 }
                 DrawItem::Transition(t) => {
                     // Each side is drawn on its own; the track blend mode applies to the mix.
@@ -1406,12 +1495,14 @@ impl Compositor {
                     let s = slot(u, self.uniform_for_transition(t));
                     ops.push(Op::Transition { from, to, slot: s, normal: t.blend == BlendMode::Normal });
                 }
+                // Rendered before the stack (see `render_groups`).
+                DrawItem::Group { .. } => {}
                 DrawItem::Samples { prefix, lists } => {
                     if lists.is_empty() {
                         continue;
                     }
                     let weight = 1.0 / lists.len() as f32;
-                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0, mask: MaskFrame::NONE, frame: None });
+                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 8], opacity: weight, seed: 0, mask: MaskFrame::NONE, frame: None, warp: None });
                     let add = slot(u, w);
                     w.opacity = 1.0;
                     let copy = slot(u, w);
@@ -1439,6 +1530,36 @@ impl Compositor {
     /// Draws the stack (bottom first) and fills the 8-bit output texture.
     /// Layers whose picture hasn't been uploaded yet are skipped.
     pub fn render(&mut self, items: &[DrawItem]) {
+        self.upload_warps(items);
+        // Compound clips first (innermost first): later layers draw their pictures.
+        let mut used = Vec::new();
+        self.render_groups(items, &mut used);
+        self.sources.retain(|k, _| !matches!(k, SourceKey::Group(g) if !used.contains(g)));
+        self.render_stack(items, None);
+    }
+
+    fn render_groups(&mut self, items: &[DrawItem], used: &mut Vec<u64>) {
+        for item in items {
+            match item {
+                DrawItem::Group { key, items: inner } => {
+                    self.render_groups(inner, used);
+                    self.render_stack(inner, Some(*key));
+                    used.push(*key);
+                }
+                DrawItem::Samples { prefix, lists } => {
+                    self.render_groups(prefix, used);
+                    for l in lists {
+                        self.render_groups(l, used);
+                    }
+                }
+                DrawItem::Transition(_) | DrawItem::Layer(_) | DrawItem::Effect(_) => {}
+            }
+        }
+    }
+
+    /// Draws a stack. Into the output (`into` None), or on transparent into the picture
+    /// of compound clip `into`.
+    fn render_stack(&mut self, items: &[DrawItem], into: Option<u64>) {
         let mut uniforms = Vec::new();
         // AI matte cleanup first: the layers below read its results.
         let mut mattes = Vec::new();
@@ -1494,7 +1615,8 @@ impl Compositor {
         for op in &ops {
             match op {
                 Op::Clear => {
-                    drop(begin_pass(&mut enc, "clear", &t.accum[cur], wgpu::LoadOp::Clear(wgpu::Color::BLACK)));
+                    let bg = if into.is_some() { wgpu::Color::TRANSPARENT } else { wgpu::Color::BLACK };
+                    drop(begin_pass(&mut enc, "clear", &t.accum[cur], wgpu::LoadOp::Clear(bg)));
                 }
                 Op::Layer { layer, normal } => {
                     if *normal && layer.effects.is_empty() {
@@ -1526,11 +1648,11 @@ impl Compositor {
                     }
                 }
                 Op::TwoPass { slot } => {
-                    self.encode_effect(&mut enc, *slot, true, &t.single_groups[cur], &t.blend_groups[cur], &t.accum[1 - cur]);
+                    self.encode_effect(&mut enc, *slot, true, None, &t.single_groups[cur], &t.blend_groups[cur], &t.accum[1 - cur]);
                     cur = 1 - cur;
                 }
-                Op::Effect { slot } => {
-                    self.encode_effect(&mut enc, *slot, false, &t.single_groups[cur], &t.blend_groups[cur], &t.accum[1 - cur]);
+                Op::Effect { slot, warp } => {
+                    self.encode_effect(&mut enc, *slot, false, *warp, &t.single_groups[cur], &t.blend_groups[cur], &t.accum[1 - cur]);
                     cur = 1 - cur;
                 }
                 Op::Transition { from, to, slot, normal } => {
@@ -1598,6 +1720,19 @@ impl Compositor {
             }
         }
 
+        if let Some(key) = into {
+            // Keep the result as the compound clip's picture.
+            let (w, h) = self.size();
+            let accum = self.targets.accum_tex[cur].clone();
+            let dst = self.ensure_source(SourceKey::Group(key), SourceKind::Premul, w, h).textures[0].clone();
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &accum, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &dst, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.queue.submit([enc.finish()]);
+            return;
+        }
         {
             let mut pass = begin_pass(&mut enc, "output", &t.output_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
             pass.set_pipeline(&self.output);

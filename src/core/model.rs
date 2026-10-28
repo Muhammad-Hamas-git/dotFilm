@@ -367,6 +367,44 @@ pub struct Clip {
     /// Transition at the clip's end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_out: Option<Transition>,
+    /// Sound settings: pitch, fades, separated audio.
+    #[serde(default, skip_serializing_if = "ClipAudio::is_default")]
+    pub audio: ClipAudio,
+}
+
+/// Highest pitch shift, semitones (up or down).
+pub const PITCH_RANGE: f32 = 12.0;
+/// Longest audio fade, seconds.
+pub const MAX_FADE: f64 = 30.0;
+
+/// A clip's sound settings (volume is the keyframeable `Clip::volume`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClipAudio {
+    /// Pitch shift in semitones (12 = an octave up). Keeps the timing.
+    #[serde(default)]
+    pub pitch: f32,
+    /// Fade in / out at the clip's start and end, seconds.
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+    /// The clip's own sound is off (it was separated into its own clip, or muted).
+    #[serde(default)]
+    pub muted: bool,
+    /// Sound only: a video's audio separated onto its own clip (no picture).
+    #[serde(default)]
+    pub only: bool,
+}
+
+impl ClipAudio {
+    pub fn is_default(&self) -> bool {
+        *self == ClipAudio::default()
+    }
+
+    /// Pitch shift as a frequency factor.
+    pub fn pitch_factor(&self) -> f64 {
+        2f64.powf(self.pitch.clamp(-PITCH_RANGE, PITCH_RANGE) as f64 / 12.0)
+    }
 }
 
 /// Slowest allowed speed (keeps the time math well behaved).
@@ -661,6 +699,9 @@ impl Project {
 
     /// Longest a clip can be, given where it starts in the source and its speed.
     pub fn max_duration(&self, clip: &Clip) -> f64 {
+        if let Some(Content::Compound(c)) = &clip.content {
+            return clip.local_at_source(c.project.duration()).max(MIN_CLIP);
+        }
         match self.asset(clip.asset) {
             Some(a) if a.kind.is_timed() => clip.local_at_source(a.duration).max(MIN_CLIP),
             _ => f64::INFINITY,
@@ -669,6 +710,9 @@ impl Project {
 
     /// Earliest timeline time the clip's start can be trimmed back to.
     pub fn earliest_start(&self, clip: &Clip) -> f64 {
+        if let Some(Content::Compound(_)) = &clip.content {
+            return clip.timeline(clip.local_at_source(0.0));
+        }
         match self.asset(clip.asset) {
             Some(a) if a.kind.is_timed() => clip.timeline(clip.local_at_source(0.0)),
             _ => f64::NEG_INFINITY,
@@ -711,6 +755,7 @@ impl Project {
         }
         let mut c = template.clone();
         c.id = ClipId(self.alloc_id());
+        self.renumber_compound(&mut c);
         c.track = track;
         c.start = start;
         self.clips.push(c.clone());
@@ -830,8 +875,60 @@ impl Project {
             frame_rate: None,
             transition_in: None,
             transition_out: None,
+            audio: ClipAudio::default(),
         });
+        // A compound asset added again gets fresh ids inside.
+        if let Some(mut c) = self.clips.pop() {
+            self.renumber_compound(&mut c);
+            self.clips.push(c);
+        }
         Some(id)
+    }
+
+    /// Lowest track where `start..end` is free, adding a track at the bottom if none is.
+    /// Returns the track (clip tracks above shift up when one is added).
+    fn free_track_low(&mut self, start: f64, end: f64) -> usize {
+        if let Some(t) = (0..self.tracks.len()).find(|t| self.is_free(*t, start, end, None)) {
+            return t;
+        }
+        self.tracks.insert(0, Track::named(0));
+        for c in &mut self.clips {
+            c.track += 1;
+        }
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            if t.name.starts_with("Track ") {
+                t.name = format!("Track {}", i + 1);
+            }
+        }
+        0
+    }
+
+    /// Separates a video clip's sound onto its own clip on a free track (the lowest one,
+    /// like an audio track). The video clip goes silent. Returns the new audio clip.
+    pub fn separate_audio(&mut self, id: ClipId) -> Option<ClipId> {
+        let clip = self.clip(id)?.clone();
+        let asset = self.asset(clip.asset)?;
+        if !asset.has_audio || clip.audio.only || clip.audio.muted || clip.content.is_some() {
+            return None;
+        }
+        let track = self.free_track_low(clip.start, clip.end());
+        let new_id = ClipId(self.alloc_id());
+        let mut a = self.clip(id)?.clone();
+        a.id = new_id;
+        a.track = track;
+        a.audio.only = true;
+        a.audio.muted = false;
+        // Picture settings don't apply to sound.
+        a.effects.clear();
+        a.masks.clear();
+        a.matte = None;
+        a.transition_in = None;
+        a.transition_out = None;
+        self.clips.push(a);
+        if let Some(v) = self.clip_mut(id) {
+            v.audio.muted = true;
+        }
+        Some(new_id)
     }
 
     /// Adds a track on top.
@@ -865,6 +962,7 @@ impl Project {
         let left_len = t - clip.start;
         let mut right = clip.clone();
         right.id = new_id;
+        self.renumber_compound(&mut right);
         // trim_start shifts keyframes and source position, so the right half
         // continues exactly where the left half stops.
         right.trim_start(left_len);
@@ -894,6 +992,9 @@ impl Project {
         for c in &mut self.clips {
             scale_anim(&mut c.transform.x, sx);
             scale_anim(&mut c.transform.y, sy);
+            if let Some(Content::Compound(comp)) = &mut c.content {
+                comp.project.set_resolution(w, h);
+            }
         }
         self.width = w;
         self.height = h;
@@ -1085,6 +1186,35 @@ mod tests {
         let c2 = p.add_clip(a, 0, 5.0).unwrap();
         assert_eq!(p.clip(c1).unwrap().track, 0);
         assert_eq!(p.clip(c2).unwrap().track, 1);
+    }
+
+    #[test]
+    fn separate_audio_makes_a_sound_clip_below() {
+        let (mut p, a) = project_with_video();
+        if let Some(asset) = p.assets.iter_mut().find(|x| x.id == a) {
+            asset.has_audio = true;
+        }
+        let v = p.add_clip(a, 0, 1.0).unwrap();
+        let s = p.separate_audio(v).unwrap();
+        let (vc, sc) = (p.clip(v).unwrap().clone(), p.clip(s).unwrap().clone());
+        assert!(vc.audio.muted && !vc.audio.only, "video goes silent");
+        assert!(sc.audio.only && !sc.audio.muted, "new clip is sound only");
+        assert_eq!((sc.start, sc.duration, sc.source_in), (vc.start, vc.duration, vc.source_in));
+        // The lowest free track.
+        assert_eq!((vc.track, sc.track), (0, 1));
+        assert!(p.separate_audio(v).is_none(), "only once");
+        // With every track taken, a new bottom track is added and the others move up.
+        let n = p.tracks.len();
+        for t in 0..n {
+            if p.is_free(t, 1.0, 11.0, None) {
+                p.add_clip(a, t, 1.0);
+            }
+        }
+        let v2 = p.clips.iter().find(|c| c.track == n - 1 && !c.audio.only).map(|c| c.id).unwrap();
+        let s2 = p.separate_audio(v2).unwrap();
+        assert_eq!(p.clip(s2).unwrap().track, 0);
+        assert_eq!(p.tracks.len(), n + 1);
+        assert_eq!(p.clip(v2).unwrap().track, n);
     }
 
     #[test]

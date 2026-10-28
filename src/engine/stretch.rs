@@ -26,7 +26,14 @@ const MATCH: usize = 1024;
 
 /// Does this clip need stretched audio?
 pub fn needed(clip: &Clip) -> bool {
-    !clip.speed_affects_pitch && (clip.speed.is_animated() || (clip.speed.value - 1.0).abs() > 1e-4)
+    clip.audio.pitch.abs() > 1e-3 || (!clip.speed_affects_pitch && (clip.speed.is_animated() || (clip.speed.value - 1.0).abs() > 1e-4))
+}
+
+/// How much faster than real time the stretched audio is read (its pitch factor).
+/// The pitch shift, times the speed when speed changes the pitch too.
+pub fn read_rate(clip: &Clip) -> f64 {
+    let p = clip.audio.pitch_factor();
+    if clip.speed_affects_pitch && !clip.speed.is_animated() { p * clip.speed.value.max(crate::core::model::MIN_SPEED) as f64 } else { p }
 }
 
 /// Cache key: changes whenever anything affecting the stretched result changes.
@@ -36,6 +43,7 @@ pub fn key(clip: &Clip) -> u64 {
     clip.source_in.to_bits().hash(&mut h);
     clip.duration.to_bits().hash(&mut h);
     clip.speed.value.to_bits().hash(&mut h);
+    (clip.audio.pitch.to_bits(), clip.speed_affects_pitch).hash(&mut h);
     for k in &clip.speed.keys {
         (k.t.to_bits(), k.v.to_bits(), format!("{:?}", k.ease)).hash(&mut h);
     }
@@ -43,11 +51,13 @@ pub fn key(clip: &Clip) -> u64 {
 }
 
 /// Stretches `pcm` (stereo, AUDIO_RATE, the whole file) for this clip.
-/// Returns stereo samples covering the clip on the timeline, from its start.
+/// Returns stereo samples covering the clip from its start, meant to be read
+/// `read_rate` times faster than real time (that's how the pitch shift happens).
 pub fn stretch(pcm: &[i16], clip: &Clip) -> Vec<i16> {
     let rate = AUDIO_RATE as f64;
     let frames = pcm.len() / 2;
-    let out_frames = (clip.duration * rate).ceil() as usize;
+    let pitch = read_rate(clip);
+    let out_frames = (clip.duration * pitch * rate).ceil() as usize;
     let mut out = vec![0.0f32; out_frames * 2];
 
     let window: Vec<f32> = (0..WINDOW).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / WINDOW as f32).cos()).collect();
@@ -75,7 +85,8 @@ pub fn stretch(pcm: &[i16], clip: &Clip) -> Vec<i16> {
         if out_start >= out_frames as i64 {
             break;
         }
-        let center = (k * HOP) as f64 / rate;
+        // Buffer time -> clip time (the buffer is read `pitch` times faster).
+        let center = (k * HOP) as f64 / rate / pitch;
         let wanted = (clip.source_in + clip.source_elapsed(center)) * rate - (WINDOW / 2) as f64;
         let mut pos = wanted.round() as i64;
         if let Some(p) = prev {
@@ -189,6 +200,7 @@ mod tests {
             frame_rate: None,
             transition_in: None,
             transition_out: None,
+            audio: Default::default(),
         }
     }
 
@@ -201,6 +213,26 @@ mod tests {
             }
         }
         crossings as f64 / 2.0 / ((to - from) as f64 / AUDIO_RATE as f64)
+    }
+
+    #[test]
+    fn pitch_shift_keeps_length() {
+        let rate = AUDIO_RATE as usize;
+        let tone: Vec<i16> = (0..rate * 3)
+            .flat_map(|i| {
+                let v = ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 12000.0) as i16;
+                [v, v]
+            })
+            .collect();
+        let mut c = clip(1.0, 2.0);
+        c.audio.pitch = 12.0;
+        assert!(needed(&c));
+        assert!((read_rate(&c) - 2.0).abs() < 1e-9);
+        let out = stretch(&tone, &c);
+        // Twice as many samples, read twice as fast: same 2 s on the timeline, an octave up.
+        assert_eq!(out.len(), rate * 4 * 2);
+        let f = frequency(&out, rate / 2, rate * 3) * read_rate(&c);
+        assert!((f - 880.0).abs() < 16.0, "pitch {f}");
     }
 
     #[test]

@@ -112,8 +112,13 @@ pub mod tests {
         DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity, blend, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })
     }
 
+    /// Four effect settings, the rest zero.
+    pub fn pad8(p: [f32; 4]) -> [f32; 8] {
+        [p[0], p[1], p[2], p[3], 0.0, 0.0, 0.0, 0.0]
+    }
+
     fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
-        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed, mask: MaskFrame::NONE, frame: None })
+        DrawItem::Effect(EffectDraw { kind, params: pad8(params), opacity: 1.0, seed, mask: MaskFrame::NONE, frame: None, warp: None })
     }
 
     fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
@@ -478,6 +483,240 @@ pub mod tests {
         assert!(close(&m, [0, 0, 0], 2), "red multiplied with green is black: {m:?}");
     }
 
+    /// A left-to-right gray ramp, `w` x `h`.
+    fn ramp(c: &mut Compositor, key: SourceKey, w: u32, h: u32) {
+        let mut px = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                let v = (x * 255 / (w - 1)) as u8;
+                px.extend([v, v, v, 255]);
+            }
+        }
+        c.upload_rgba(key, w, h, &px);
+    }
+
+    fn fx8(kind: u32, params: [f32; 8], seed: u32) -> DrawItem {
+        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed, mask: MaskFrame::NONE, frame: None, warp: None })
+    }
+
+    #[test]
+    fn retro_effects() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (gray, white, black) = (SourceKey::Asset(1), SourceKey::Asset(2), SourceKey::Asset(3));
+        ramp(&mut c, gray, w, h);
+        solid(&mut c, white, [255, 255, 255, 255]);
+        solid(&mut c, black, [0, 0, 0, 255]);
+        let q = full_frame(w as f32, h as f32);
+        let mut img = |items: &[DrawItem]| {
+            c.render(items);
+            c.read_rgba()
+        };
+
+        // Pixelate 8 px: every 8x8 block is one color, neighbouring blocks differ.
+        let out = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(12, [8.0, 0.0, 0.0, 0.0], 0)]);
+        assert_eq!(px(&out, w, 8, 8), px(&out, w, 15, 15), "same block");
+        assert!(px(&out, w, 16, 8)[0] > px(&out, w, 15, 8)[0] + 20, "next block is lighter");
+
+        // Dither to 2 colors: only black and white, more white on the right.
+        let out = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(13, [2.0, 1.0, 0.0, 1.0], 0)]);
+        let mut whites = [0u32; 2];
+        for y in 0..h {
+            for x in 0..w {
+                let v = px(&out, w, x, y)[0];
+                assert!(v < 3 || v > 252, "only two levels, got {v}");
+                if v > 128 {
+                    whites[(x * 2 / w) as usize] += 1;
+                }
+            }
+        }
+        assert!(whites[1] > whites[0] * 2, "right half brighter: {whites:?}");
+
+        // Halftone: white stays paper, black is all ink.
+        let out = img(&[layer(white, q, BlendMode::Normal, 1.0), effect(14, [8.0, 45.0, 0.0, 0.0], 0)]);
+        assert!(px(&out, w, 20, 20)[0] > 245, "white paper: {:?}", px(&out, w, 20, 20));
+        let out = img(&[layer(black, q, BlendMode::Normal, 1.0), effect(14, [8.0, 45.0, 1.0, 0.0], 0)]);
+        assert!(px(&out, w, 20, 20)[0] < 40, "black is covered with ink: {:?}", px(&out, w, 20, 20));
+
+        // VHS: scanlines make neighbouring rows differ on a flat white picture.
+        let out = img(&[layer(white, q, BlendMode::Normal, 1.0), fx8(10, [1.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3)]);
+        let rows: Vec<u8> = (0..8).map(|y| px(&out, w, 32, y)[0]).collect();
+        assert!(rows.iter().max().unwrap() - rows.iter().min().unwrap() > 60, "scanlines: {rows:?}");
+
+        // Jitter: the picture moves between hold periods, not within one.
+        let jit = |seed| fx8(11, [6.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0], seed);
+        let a = img(&[layer(gray, q, BlendMode::Normal, 1.0), jit(0)]);
+        let b = img(&[layer(gray, q, BlendMode::Normal, 1.0), jit(1)]);
+        let c2 = img(&[layer(gray, q, BlendMode::Normal, 1.0), jit(2)]);
+        assert_eq!(px(&a, w, 32, 32), px(&b, w, 32, 32), "held for 2 frames");
+        assert_ne!(px(&a, w, 32, 32), px(&c2, w, 32, 32), "then jumps");
+    }
+
+    #[test]
+    fn distortion_effects() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let gray = SourceKey::Asset(1);
+        ramp(&mut c, gray, w, h);
+        let q = full_frame(w as f32, h as f32);
+        let mut img = |items: &[DrawItem]| {
+            c.render(items);
+            c.read_rgba()
+        };
+        let plain = img(&[layer(gray, q, BlendMode::Normal, 1.0)]);
+        // Bulge magnifies around the center: a point right of center shows something closer to it.
+        let bulge = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(15, [1.0, 0.45, 0.5, 0.5], 0)]);
+        let (p, b) = (px(&plain, w, 40, 32)[0], px(&bulge, w, 40, 32)[0]);
+        assert!(b < p && b > px(&plain, w, 32, 32)[0] - 3, "bulge pulls in from the center: plain {p}, bulged {b}");
+        // Pinch does the opposite.
+        let pinch = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(15, [-1.0, 0.45, 0.5, 0.5], 0)]);
+        assert!(px(&pinch, w, 40, 32)[0] > p, "pinch pushes out");
+        // Outside the radius nothing changes.
+        assert!(close(&px(&bulge, w, 2, 2), px(&plain, w, 2, 2), 2));
+        // Fisheye keeps the corners and the center.
+        let fish = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(16, [0.8, 1.0, 0.5, 0.5], 0)]);
+        assert!(close(&px(&fish, w, 32, 32), px(&plain, w, 32, 32), 3));
+        assert!(px(&fish, w, 44, 32)[0] < px(&plain, w, 44, 32)[0], "magnified middle");
+        // CRT bulge: corners become black glass.
+        let crt = img(&[layer(gray, q, BlendMode::Normal, 1.0), effect(17, [0.5, 0.6, 0.0, 1.0], 0)]);
+        assert!(px(&crt, w, 1, 1)[0] < 5 && px(&crt, w, 62, 62)[0] < 5, "rounded black corners");
+        assert!(px(&crt, w, 48, 32)[0] > 100, "screen still shows the picture");
+    }
+
+    #[test]
+    fn liquify_moves_pixels() {
+        use super::compositor::WarpDraw;
+        use crate::core::warp::WarpGrid;
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let gray = SourceKey::Asset(1);
+        ramp(&mut c, gray, w, h);
+        let q = full_frame(w as f32, h as f32);
+        let mut grid = WarpGrid::default();
+        grid.push([0.5, 0.5], [0.15, 0.0], 0.3, 1.0, 1.0);
+        let warp = WarpDraw { key: 7, size: grid.size as u32, offsets: std::sync::Arc::new(grid.offsets.clone()) };
+        let fx = |amount: f32| DrawItem::Effect(EffectDraw { kind: 18, params: pad8([amount, 0.0, 0.0, 0.0]), opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None, warp: Some(warp.clone()) });
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0)]);
+        let plain = c.read_rgba();
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), fx(1.0)]);
+        let pushed = c.read_rgba();
+        // Pushed right: the middle now shows what was to its left (darker).
+        let (p, l) = (px(&plain, w, 32, 32)[0] as i32, px(&pushed, w, 32, 32)[0] as i32);
+        assert!(p - l > 20, "pushed: plain {p}, liquified {l}");
+        assert!(close(&px(&pushed, w, 32, 2), px(&plain, w, 32, 2), 2), "far from the brush unchanged");
+        c.render(&[layer(gray, q, BlendMode::Normal, 1.0), fx(0.0)]);
+        assert!(close(&px(&c.read_rgba(), w, 32, 32), px(&plain, w, 32, 32), 2), "amount 0 = no change");
+    }
+
+    #[test]
+    fn light_effects() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (black, white) = (SourceKey::Asset(1), SourceKey::Asset(2));
+        solid(&mut c, black, [0, 0, 0, 255]);
+        solid(&mut c, white, [255, 255, 255, 255]);
+        let q = full_frame(w as f32, h as f32);
+        let dot = geometry::project(&Placement { cx: 32.0, cy: 32.0, width: 4.0, height: 4.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        let mut img = |items: &[DrawItem]| {
+            c.render(items);
+            c.read_rgba()
+        };
+        // Sparkles: a bright dot gets a star along its rays, not between them.
+        let star = img(&[layer(black, q, BlendMode::Normal, 1.0), layer(white, dot, BlendMode::Normal, 1.0), fx8(20, [0.5, 24.0, 2.0, 0.0, 4.0, 0.0, 0.0, 0.0], 0)]);
+        assert!(px(&star, w, 44, 32)[0] > 30, "ray to the right: {:?}", px(&star, w, 44, 32));
+        assert!(px(&star, w, 44, 44)[0] < 10, "nothing on the diagonal: {:?}", px(&star, w, 44, 44));
+        // Light rays: streaks away from the light source, at the source's side.
+        let top = geometry::project(&Placement { cx: 32.0, cy: 8.0, width: 12.0, height: 12.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        let rays = img(&[layer(black, q, BlendMode::Normal, 1.0), layer(white, top, BlendMode::Normal, 1.0), fx8(19, [2.0, 1.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.0], 0)]);
+        assert!(px(&rays, w, 32, 30)[0] > 15, "rays reach down from the light: {:?}", px(&rays, w, 32, 30));
+    }
+
+    #[test]
+    fn new_transitions_start_and_end_on_their_clips() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 32u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (red, blue) = (SourceKey::Asset(1), SourceKey::Asset(2));
+        solid(&mut c, red, [200, 0, 0, 255]);
+        solid(&mut c, blue, [0, 0, 200, 255]);
+        let q = full_frame(w as f32, h as f32);
+        for kind in 6..=10u32 {
+            for (t, want) in [(0.0, [200, 0, 0]), (1.0, [0, 0, 200])] {
+                c.render(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), kind, t, 0.0, 0)]);
+                let got = px(&c.read_rgba(), w, 32, 16);
+                assert!(close(&got, want, 3), "kind {kind} at {t}: {got:?}");
+            }
+            // Something in between happens.
+            c.render(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), kind, 0.5, 0.0, 0)]);
+            let mid = px(&c.read_rgba(), w, 32, 16);
+            assert!(!close(&mid, [200, 0, 0], 3) || kind == 8, "kind {kind} changes by the middle: {mid:?}");
+        }
+        // Slide halfway: the new clip covers the left half, the old one still shows on the right.
+        c.render(&[transition(Some(layer_draw(red, q)), Some(layer_draw(blue, q)), 8, 0.5, 0.0, 0)]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, w, 8, 16), [0, 0, 200], 2) && close(&px(&img, w, 56, 16), [200, 0, 0], 2));
+    }
+
+    /// Renders a project through the scene (generated clips only) at `t`.
+    fn render_project(c: &mut Compositor, p: &crate::core::model::Project, t: f64) -> Vec<u8> {
+        use crate::engine::scene::{self, ScenePaint};
+        let mut text = crate::engine::text::TextEngine::default();
+        c.set_canvas(p.width as f32, p.height as f32);
+        let items = scene::items_at(p, t, &mut text, 1.0);
+        let draws = scene::to_draws(&items, 0, &mut |l: &scene::SceneLayer| {
+            let paint = match &l.paint {
+                ScenePaint::Gradient { colors, positions, count, angle_deg, size } => Paint::Gradient { colors: *colors, positions: *positions, count: *count, angle_deg: *angle_deg, size: *size },
+                ScenePaint::Group(k) => Paint::Source(SourceKey::Group(*k)),
+                _ => return None,
+            };
+            Some(scene::layer_draw(l, paint, 0))
+        });
+        c.render(&draws);
+        c.read_rgba()
+    }
+
+    #[test]
+    fn compound_clip_draws_like_its_clips() {
+        use crate::core::content::Content;
+        let Some(g) = gpu() else { return };
+        let mut p = crate::core::model::Project::default();
+        p.set_resolution(64, 64);
+        let red = p.add_generated_asset(Content::color());
+        let c1 = p.add_clip(red, 0, 0.0).unwrap();
+        let c2 = p.add_clip(red, 1, 0.0).unwrap();
+        // c1: full blue frame; c2: a small square on the right, half transparent.
+        if let Some(Content::Color(col)) = &mut p.clip_mut(c2).unwrap().content {
+            col.r.value = 1.0;
+            col.g.value = 0.0;
+            col.b.value = 0.0;
+        }
+        let cl = p.clip_mut(c2).unwrap();
+        cl.transform.scale.value = 0.25;
+        cl.transform.x.value = 48.0;
+        cl.opacity.value = 0.5;
+        let mut c = Compositor::new(g.device, g.queue, 64, 64);
+        let before = render_project(&mut c, &p, 1.0);
+        let gid = p.make_compound(&[c1, c2]).unwrap();
+        let after = render_project(&mut c, &p, 1.0);
+        for (x, y) in [(10, 10), (48, 32), (56, 56)] {
+            assert!(close(&px(&after, 64, x, y), px(&before, 64, x, y), 2), "({x},{y}): {:?} vs {:?}", px(&after, 64, x, y), px(&before, 64, x, y));
+        }
+        // The compound fades as one picture: half of everything over black.
+        p.clip_mut(gid).unwrap().opacity.value = 0.5;
+        let faded = render_project(&mut c, &p, 1.0);
+        let (b, f) = (px(&before, 64, 10, 10), px(&faded, 64, 10, 10));
+        assert!(close(&f, [b[0] / 2, b[1] / 2, b[2] / 2], 2), "faded {f:?} from {b:?}");
+        // Scaled down, it shows black around it.
+        p.clip_mut(gid).unwrap().opacity.value = 1.0;
+        p.clip_mut(gid).unwrap().transform.scale.value = 0.5;
+        let small = render_project(&mut c, &p, 1.0);
+        assert!(close(&px(&small, 64, 4, 4), [0, 0, 0], 1) && close(&px(&small, 64, 28, 32), px(&before, 64, 10, 10), 2));
+    }
+
     #[test]
     fn motion_blur_samples_are_averaged() {
         let Some(g) = gpu() else { return };
@@ -624,7 +863,7 @@ pub mod tests {
         left.values[idx::FEATHER as usize] = Anim::new(0.0);
         let gray = SourceKey::Asset(2);
         solid(&mut c, gray, [128, 128, 128, 255]);
-        let vignette = DrawItem::Effect(EffectDraw { kind: 1, params: [-1.0, 0.0, 0.01, 0.0], opacity: 1.0, seed: 0, mask: mask::frame(&[left], 0.0, size), frame: None });
+        let vignette = DrawItem::Effect(EffectDraw { kind: 1, params: pad8([-1.0, 0.0, 0.01, 0.0]), opacity: 1.0, seed: 0, mask: mask::frame(&[left], 0.0, size), frame: None, warp: None });
         c.render(&[layer(gray, q, BlendMode::Normal, 1.0), vignette]);
         let img = c.read_rgba();
         assert!(px(&img, w, 8, 32)[0] > 200, "effect applies on the left {:?}", px(&img, w, 8, 32));
@@ -765,7 +1004,7 @@ pub mod tests {
         solid(&mut c, red, [200, 0, 0, 255]);
         let q = full_frame(w as f32, h as f32);
         let square = geometry::project(&Placement { cx: 32.0, cy: 32.0, width: 20.0, height: 20.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
-        let fx = |kind: u32, params: [f32; 4]| EffectDraw { kind, params, opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None };
+        let fx = |kind: u32, params: [f32; 4]| EffectDraw { kind, params: pad8(params), opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None, warp: None };
         let clip = |effects: Vec<EffectDraw>, blend: BlendMode| {
             DrawItem::Layer(LayerDraw { effects, blend, ..layer_draw(white, square) })
         };

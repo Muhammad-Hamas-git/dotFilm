@@ -62,6 +62,20 @@ Read README.md first for the folder layout.
   `mask::bounds`) and the AI matte's bounds (found on upload). Shaders reach it through `to_frame` /
   `from_frame` / `frame_px`; any effect with a center or edges must use those, not the raw frame uv.
 - Export renders at `ExportSettings` size and fps (the compositor's canvas stays the project size).
+- Effects have `EFFECT_PARAMS` (8) settings; the shader gets 0..3 in `gen[0]` and 4..7 in `gen[2]`. Older
+  projects with 4 load padded (`pad_params`). A clip effect's mix is index `CLIP_EFFECT_MIX` (8).
+- Liquify keeps a `WarpGrid` on its `EffectParams`; the scene hands it to the GPU as a `WarpDraw` (keyed by a
+  hash, uploaded once), bound in the effect pass's group 2 (the matte slot).
+- Compound clips are `Content::Compound` holding a whole inner `Project`. The scene builds the inner stack as
+  a `SceneItem::Group` (key = clip id + time) before the layer that shows it (`ScenePaint::Group`). The
+  compositor renders groups first (`render_groups`, innermost first, on transparent) into
+  `SourceKey::Group` textures (premultiplied, layer kind 4), then the main stack. Inner clip ids must be unique
+  project-wide: anything that copies a compound calls `renumber_compound`. Their sound comes from
+  `compound::sound_clips`, which both the preview and export mix. Editing inside swaps `app.project`
+  (`open_compound` / `close_compound`); save and export close every open compound first.
+- `clip.audio` holds pitch, fades, `muted` (sound off, e.g. separated) and `only` (a separated sound clip, never
+  drawn). Pitch goes through the time-stretcher: the stretched buffer is read `stretch::read_rate` times
+  faster.
 - The timeline's keyframe table (`ui/keyframes.rs`) lists every animated `Param` of the selected clip from
   `Clip::params()`; anything that edits keys on the timeline must use `params()`, not `Param::ALL`.
 - The asset preview (`app.source`) is a separate one-clip `Project` rendered by the same preview renderer.

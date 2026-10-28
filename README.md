@@ -9,9 +9,17 @@ A desktop video editor written in Rust, rendered on the GPU.
   **New** makes solid colors, gradients (2 or 3 colors, any angle), text and effects.
 - **Text**: any installed font, bold/italic, alignment, size, line spacing, fill and outline color,
   outline width. Proper shaping for Arabic, Urdu and other complex scripts. All keyframeable.
-- **Effect layers**: Gaussian blur, lens blur (round bokeh), radial (zoom) blur, spin blur, **motion blur**,
-  bloom, vignette, film grain (new pattern every frame), chromatic aberration, double exposure.
-  An effect clip is its own layer on a track and changes everything on the tracks below it.
+- **Effect layers**, in groups:
+  - Blur: Gaussian, lens (round bokeh), radial (zoom), spin, **motion blur**.
+  - Retro: **VHS** (scanlines, line count, noise, line jitter, color bleed, CRT curve, tracking band,
+    softness, each adjustable), **jitter** (random shake every few frames), **pixelate**, **dither** (few
+    colors, ordered or noise pattern, mono or color), **halftone** (black or CMY dots), film grain.
+  - Distort: **bulge / pinch** and **fisheye** with a center you drag in the player, **CRT bulge** (curved
+    glass, rounded corners, darker edges), **liquify** (push pixels with a brush in the player).
+  - Light: bloom, **light rays** (streaks from a light source you place), **star sparkles** on highlights.
+  - Look: vignette, chromatic aberration, double exposure.
+  An effect clip is its own layer on a track and changes everything on the tracks below it. Effects with a
+  center show a yellow crosshair on the player to drag.
   Motion blur blurs anything that moves by keyframes (position, scale, rotation...): it draws the layers
   below at several moments within the shutter and averages them. Shutter angle and sample count are adjustable.
 - **Masks** (up to 4 per clip): rectangle (rounded corners), ellipse, linear, mirror (a band) and freeform
@@ -22,7 +30,8 @@ A desktop video editor written in Rust, rendered on the GPU.
   **Color range** masks select by color instead of shape: click **Pick** and then a color in the player, then
   widen the hue range, minimum saturation, brightness range and softness. Blur only the blue sky, desaturate
   everything but the red coat.
-- **Transitions**: crossfade, fade through black or white, wipe (any direction, soft edge), push and zoom,
+- **Transitions**: crossfade, fade through black or white, wipe (any direction, soft edge), push, slide,
+  zoom, spin, blur, glow and light leak,
   with adjustable length and easing. Set them on a clip's start or end (Adjustments panel, or right-click
   the clip). Between two touching clips it works like CapCut: the next clip slides back over the end of
   the previous one by the transition length and starts playing from its first frame when the transition
@@ -71,6 +80,15 @@ A desktop video editor written in Rust, rendered on the GPU.
 - **Timeline**: multiple tracks (Track 1 is the bottom layer), **blend mode per track** (18 modes: multiply,
   screen, overlay, soft light, difference, hue, color, luminosity...), drag/trim/split clips, snapping, zoom,
   hide/mute tracks, keyframe diamonds you can drag, click or right-click.
+- **Compound clips**: select clips (Ctrl+click for more) and press **Compound** (or right-click > Make
+  compound clip). They become one clip that moves, scales, fades, takes masks, effects and transitions as one
+  picture. Double-click it (or right-click > Open compound) to edit inside, **Back** (or Esc with nothing
+  selected) to return. Right-click > Release compound puts the clips back. Compounds can contain compounds.
+- **Audio**: volume (keyframeable), fade in / out (fields, or drag the small circles at a selected clip's top
+  corners on the timeline), pitch in semitones without changing the timing, speed with or without pitch.
+  **Separate audio** (right-click a video, or the Audio section) moves a video's sound onto its own clip on the
+  lowest free track (a new bottom track if needed), so it can be cut, moved and faded on its own. Waveforms
+  show on clips with sound.
 - **Markers**: press M (or the Marker button) to drop a marker at the playhead. Drag them on the ruler,
   click to jump, double-click to type an exact time (e.g. 4.35 s), right-click to name, color or delete.
   **Markers > Beat markers from BPM** lays an endless beat (or bar) grid from a start time on; it stays
@@ -148,7 +166,8 @@ on the same moment of the footage. Right-click a clip, or use **Clear** in the A
 | Delete | Delete selected clip |
 | M | Add a marker at the playhead |
 | F11 | Full screen player on / off |
-| Esc | Leave full screen / back from an asset preview / stop picking a color / stop editing a mask / deselect |
+| Esc | Leave full screen / back from an asset preview / stop picking a color / stop editing a mask / deselect / leave a compound clip |
+| Ctrl+click (timeline) | Select more clips (for a compound clip or deleting several) |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clip at the playhead |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S, Ctrl+O, Ctrl+I, Ctrl+E | Save, open, import, export |
@@ -168,7 +187,9 @@ src/
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
     transition.rs      transitions on clip edges, the overlap at cuts, and where they play on the timeline
     tone.rs            levels, shadows / highlights, curves, and .cube LUT reading / writing
-    marker.rs          timeline markers and beat markers
+    marker.rs          timeline markers and the beat grid
+    compound.rs        compound clips: grouping, releasing, their sound
+    warp.rs            liquify grid and brush
     mask.rs            mask shapes, their math, and packing for the GPU
     matte.rs           AI background removal settings (quality, erode/dilate/feather, mask mode)
     geometry.rs        3D rotation and perspective of a layer
@@ -192,8 +213,9 @@ src/
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector (+ grading, tone, clip_effects, matte, masks,
-                     transitions), timeline (+ markers, keyframes), export_dialog
+  ui/                the window: app.rs, assets, player (+ effect_tools: effect centers, liquify brush),
+                     inspector (+ grading, tone, clip_effects, matte, masks, transitions, audio),
+                     timeline (+ markers, keyframes), export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -261,6 +283,15 @@ Example: a new animatable parameter "blur radius".
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
 | Speed range | `SPEED_RANGE` in `core/model.rs` |
 | Time-stretch quality (chunk size, alignment search) | `WINDOW`, `SEEK` in `engine/stretch.rs` |
+| Effect setting ranges and defaults (VHS, dither, bulge...) | `EffectKind::params` in `core/content.rs` |
+| Light rays taps, sparkle taps | the `19u` / `20u` cases of `fs_effect` in `gpu/shaders.wgsl` (`n`, `taps`) |
+| Glow / blur transition reach | `30.0` / `45.0` in the `6u, 7u` case of `fs_transition` in `gpu/shaders.wgsl` |
+| Liquify grid detail | `GRID` in `core/warp.rs` (more = finer, bigger project files) |
+| Liquify brush size range, default strength, restore speed | `BRUSH_SIZE`, `BRUSH_STRENGTH`, `RESTORE_RATE` in `ui/effect_tools.rs` |
+| Effect center handle size, grab distance, color | `CENTER_HANDLE`, `CENTER_GRAB`, `HANDLE_COLOR` in `ui/effect_tools.rs` |
+| Pitch range, longest fade | `PITCH_RANGE`, `MAX_FADE` in `core/model.rs` |
+| Waveform detail and color, fade shading | `PEAKS_PER_SECOND`, `WAVE_STEP_PX`, `WAVE_COLOR`, `FADE_SHADE` in `ui/audio.rs` |
+| Fade handle grab distance | `FADE_GRAB_PX` in `ui/timeline.rs` |
 | Levels / shadows / highlights ranges and defaults | `info` in `core/tone.rs` |
 | Shadows / highlights strength | `SH_STRENGTH` in `core/tone.rs` |
 | Curve editor size, grab distance, most points | `CURVE_EDITOR_SIZE`, `GRAB_PX`, `MAX_POINTS` in `ui/tone.rs` |
@@ -281,6 +312,10 @@ Example: a new animatable parameter "blur radius".
 - Exported LUTs capture color only: per-clip effects, masks and chroma key are not part of a LUT.
 - A clip's own frame rate holds frames; it doesn't blend or interpolate them.
 - 1D `.cube` LUTs are not supported yet (3D ones are, which is nearly all of them).
+- Pitch shift is per clip (not keyframeable). With speed changing the pitch and keyframed speed, the pitch
+  shift adds on top of the original pitch, not the sped-up one.
+- Liquify is not keyframeable (its Amount is), and its grid follows the clip's visible area.
+- Ctrl+click picks clips one by one; there's no box selection yet.
 - Odd frame sizes get one black pixel row/column on MP4 export (H.264 requires even sizes).
 - AI background removal works on video clips (not still images yet). It finds the most prominent subject;
   with several people it may pick the wrong one or all of them, so use Intersect or Subtract masks.

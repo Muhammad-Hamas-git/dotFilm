@@ -5,6 +5,8 @@
 use super::app::EditorApp;
 use crate::core::anim::Ease;
 use crate::core::model::{AssetKind, BlendMode, ClipId, MIN_CLIP};
+use std::collections::HashMap;
+use std::sync::Arc;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui};
 
 // ----- Layout values you can tune -----
@@ -14,6 +16,7 @@ const TRACK_H: f32 = 66.0;
 const HANDLE_W: f32 = 8.0; // grab zone for trimming at clip edges
 const KEY_RADIUS: f32 = 5.0; // keyframe diamond size on clips
 const COLOR_KEY: Color32 = Color32::from_rgb(255, 196, 64);
+const FADE_GRAB_PX: f32 = 7.0; // grab distance of fade handles, screen pixels
 const SNAP_PX: f32 = 8.0; // snapping distance in screen pixels
 const MIN_PPS: f32 = 4.0; // most zoomed out (pixels per second)
 const MAX_PPS: f32 = 600.0; // most zoomed in
@@ -34,6 +37,9 @@ enum DragKind {
     Scrub,
     /// Dragging a keyframe of the selected clip. Times are source time.
     Keyframe { current: f64 },
+    /// Dragging the sound fade handle at the clip's start / end.
+    FadeIn,
+    FadeOut,
 }
 
 pub struct TimelineState {
@@ -51,6 +57,8 @@ pub struct TimelineState {
     /// Showing the selected clip's keyframe table instead of the tracks.
     pub keyframes: bool,
     pub key_table: super::keyframes::KeyTable,
+    /// Waveform peaks per asset.
+    pub waves: super::audio::Waves,
 }
 
 impl Default for TimelineState {
@@ -65,6 +73,7 @@ impl Default for TimelineState {
             markers: Default::default(),
             keyframes: false,
             key_table: Default::default(),
+            waves: Default::default(),
         }
     }
 }
@@ -141,6 +150,9 @@ fn toolbar(app: &mut EditorApp, ui: &mut Ui) {
         if ui.add_enabled(app.selected.is_some(), egui::Button::new("Delete")).clicked() {
             app.delete_selected();
         }
+        if ui.add_enabled(app.selected.is_some(), egui::Button::new("Compound")).on_hover_text("Group the selected clips (Ctrl+click to select more) into one compound clip").clicked() {
+            app.make_compound();
+        }
         ui.separator();
         if ui.button("+ Track").clicked() {
             app.history.checkpoint(&app.project);
@@ -167,6 +179,19 @@ fn toolbar(app: &mut EditorApp, ui: &mut Ui) {
         }
         ui.separator();
         ui.label(format!("{} / {}", format_time(app.playhead), format_time(app.project.duration())));
+        // Inside a compound clip: where we are, and the way back.
+        if !app.compound_stack.is_empty() {
+            ui.separator();
+            let names: Vec<String> = app
+                .compound_stack
+                .iter()
+                .map(|o| o.outer.clip(o.clip).and_then(|c| o.outer.asset(c.asset)).map_or("Compound".to_string(), |a| a.name.clone()))
+                .collect();
+            ui.label(egui::RichText::new(format!("Main timeline > {}", names.join(" > "))).strong().color(Color32::from_rgb(140, 190, 255)));
+            if ui.button("Back").on_hover_text("Close this compound clip (Esc with nothing selected)").clicked() {
+                app.close_compound();
+            }
+        }
     });
 }
 
@@ -291,6 +316,17 @@ fn hit_test(app: &EditorApp, view: View, lanes: Rect, p: Pos2) -> Option<(ClipId
         return Some((id, DragKind::Keyframe { current: k }));
     }
     let n = app.project.tracks.len();
+    // Fade handles of the selected clip, if it has sound.
+    if let Some(clip) = app.selected.and_then(|id| app.project.clip(id)).filter(|c| has_sound(app, c)) {
+        let r = clip_rect(view, lanes, n, clip.track, clip.start, clip.end());
+        let [a, b] = super::audio::fade_handles(r, clip, &|t| view.x(t));
+        if a.distance(p) <= FADE_GRAB_PX {
+            return Some((clip.id, DragKind::FadeIn));
+        }
+        if b.distance(p) <= FADE_GRAB_PX {
+            return Some((clip.id, DragKind::FadeOut));
+        }
+    }
     // Where clips overlap (a cut transition) the later one is on top.
     let mut clips: Vec<&crate::core::model::Clip> = app.project.clips.iter().collect();
     clips.sort_by(|a, b| b.start.total_cmp(&a.start));
@@ -417,6 +453,18 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
         app.timeline.move_blocked = false;
     }
 
+    // --- double-click a compound clip: open it ---
+    if response.double_clicked() {
+        if let Some(p) = pointer {
+            if let Some((id, DragKind::Move { .. })) = hit_test(app, view, lanes, p) {
+                if app.project.clip(id).is_some_and(|c| matches!(c.content, Some(crate::core::content::Content::Compound(_)))) {
+                    app.open_compound(id);
+                    return;
+                }
+            }
+        }
+    }
+
     // --- clicks ---
     if response.clicked() || response.secondary_clicked() {
         if let Some(p) = pointer {
@@ -430,7 +478,14 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                         }
                     }
                 }
-                Some((id, _)) => app.selected = Some(id),
+                Some((id, _)) => {
+                    if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                        app.toggle_selected(id);
+                    } else {
+                        app.selected = Some(id);
+                        app.multi.clear();
+                    }
+                }
                 None if response.clicked() => {
                     app.selected = None;
                     app.seek(view.t(p.x).max(0.0));
@@ -473,6 +528,31 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
         }
         if ui.add_enabled(app.selected.is_some(), egui::Button::new("Delete clip")).clicked() {
             app.delete_selected();
+            ui.close();
+        }
+        let can_separate = app.selected.and_then(|id| app.project.clip(id)).is_some_and(|c| {
+            !c.audio.only && !c.audio.muted && c.content.is_none() && app.project.asset(c.asset).is_some_and(|a| a.kind == AssetKind::Video && a.has_audio)
+        });
+        let compound = app.selected.filter(|id| app.project.clip(*id).is_some_and(|c| matches!(c.content, Some(crate::core::content::Content::Compound(_)))));
+        if ui.add_enabled(app.selected.is_some(), egui::Button::new(format!("Make compound clip ({})", app.selection().len()))).clicked() {
+            app.make_compound();
+            ui.close();
+        }
+        if let Some(id) = compound {
+            if ui.button("Open compound").clicked() {
+                app.open_compound(id);
+                ui.close();
+            }
+            if ui.button("Release compound").clicked() {
+                app.release_compound(id);
+                ui.close();
+            }
+        }
+        if can_separate && ui.button("Separate audio").clicked() {
+            app.history.checkpoint(&app.project);
+            if let Some(id) = app.selected {
+                app.selected = app.project.separate_audio(id).or(Some(id));
+            }
             ui.close();
         }
         ui.separator();
@@ -536,7 +616,16 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
     }
 
     super::markers::lane_lines(app, &painter, lanes, &|t| view.x(t), &|x| view.t(x));
-    draw_clips(app, ui, &painter, lanes, view);
+    // Waveforms of visible clips with sound (peaks are made on first use).
+    let mut peaks: HashMap<ClipId, Arc<Vec<u8>>> = HashMap::new();
+    let (t0, t1) = (view.t(lanes.left()), view.t(lanes.right()));
+    let sounding: Vec<(ClipId, crate::core::model::AssetId)> = app.project.clips.iter().filter(|c| c.end() > t0 && c.start < t1 && has_sound(app, c)).map(|c| (c.id, c.asset)).collect();
+    for (id, asset) in sounding {
+        if let Some(p) = app.timeline.waves.get(asset, app.media.audio.get(&asset)) {
+            peaks.insert(id, p);
+        }
+    }
+    draw_clips(app, ui, &painter, lanes, view, &peaks);
 
     // Playhead line.
     let x = view.x(app.playhead);
@@ -629,11 +718,29 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
                 c.duration = new_end - c.start;
             }
         }
+        DragKind::FadeIn | DragKind::FadeOut => {
+            let max = (clip.duration / 2.0).min(crate::core::model::MAX_FADE);
+            let t = view.t(p.x);
+            let v = if matches!(kind, DragKind::FadeIn) { t - clip.start } else { clip.end() - t };
+            if let Some(c) = app.project.clip_mut(id) {
+                let v = v.clamp(0.0, max);
+                if matches!(kind, DragKind::FadeIn) {
+                    c.audio.fade_in = v;
+                } else {
+                    c.audio.fade_out = v;
+                }
+            }
+        }
         DragKind::Scrub => {}
     }
 }
 
-fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, view: View) {
+/// Does this clip play sound (an audio file, separated sound, or a video's own sound)?
+fn has_sound(app: &EditorApp, c: &crate::core::model::Clip) -> bool {
+    !c.audio.muted && c.content.is_none() && app.project.asset(c.asset).is_some_and(|a| a.has_audio)
+}
+
+fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, view: View, peaks: &HashMap<ClipId, Arc<Vec<u8>>>) {
     let n = app.project.tracks.len();
     let tol = app.project.key_tolerance();
     // Later clips on top, so a clip sliding into the previous one (cut transition) shows.
@@ -646,8 +753,10 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             continue;
         }
         let selected = app.selected == Some(clip.id);
+        let also_selected = app.multi.contains(&clip.id);
         let blocked = selected && app.timeline.move_blocked;
         let base = match asset.kind {
+            _ if clip.audio.only => COLOR_AUDIO,
             AssetKind::Video => COLOR_VIDEO,
             AssetKind::Image => COLOR_IMAGE,
             AssetKind::Audio => COLOR_AUDIO,
@@ -662,9 +771,16 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
         let fill = if hidden { fill.gamma_multiply(0.4) } else { fill };
         painter.rect_filled(r, CornerRadius::same(4), fill);
 
+        // Sound: waveform (filling sound-only clips, along the bottom of videos) and fades.
+        let sound_only = asset.kind == AssetKind::Audio || clip.audio.only;
+        if has_sound(app, clip) {
+            let clipped = painter.with_clip_rect(r.intersect(lanes));
+            super::audio::draw_clip_sound(&clipped, r, clip, peaks.get(&clip.id).map(|p| p.as_slice()), &|t| view.x(t), &|x| view.t(x), sound_only);
+        }
+
         // Thumbnail on the left edge.
         let mut text_left = r.left() + 6.0;
-        if let Some(tex) = app.media.thumbs.get(&asset.id) {
+        if let Some(tex) = app.media.thumbs.get(&asset.id).filter(|_| !sound_only) {
             let size = tex.size_vec2();
             let h = r.height() - 6.0;
             let w = (h * size.x / size.y).min(r.width() - 6.0);
@@ -688,6 +804,24 @@ fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, vi
             Color32::from_white_alpha(170),
         );
 
+        if selected && has_sound(app, clip) {
+            for h in super::audio::fade_handles(r, clip, &|t| view.x(t)) {
+                painter.circle(h, 4.0, Color32::WHITE, Stroke::new(1.0, Color32::from_black_alpha(160)));
+            }
+        }
+        if also_selected {
+            painter.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.5, Color32::from_white_alpha(200)), StrokeKind::Inside);
+        }
+        if let Some(crate::core::content::Content::Compound(_)) = &clip.content {
+            // Compound clips: a stacked-bars badge.
+            let b = Rect::from_min_size(pos2(r.right() - 18.0, r.top() + 4.0), vec2(12.0, 10.0));
+            if r.width() > 40.0 {
+                for i in 0..3 {
+                    let y = b.top() + i as f32 * 3.5;
+                    painter.rect_filled(Rect::from_min_max(pos2(b.left(), y), pos2(b.right(), y + 2.0)), 0.0, Color32::from_white_alpha(200));
+                }
+            }
+        }
         if selected {
             painter.rect_stroke(r, CornerRadius::same(4), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
             let handle = Color32::from_white_alpha(200);

@@ -7,11 +7,11 @@ use crate::core::mask::{self, MaskFrame};
 use crate::core::tone::{self, ToneFrame};
 use std::path::PathBuf;
 use crate::core::matte::MatteFrame;
-use crate::core::content::{Content, EffectKind, TextParams};
+use crate::core::content::{Content, EffectKind, EffectParams, TextParams, EFFECT_PARAMS};
 use crate::core::geometry::{EffectFrame, Quad};
 use crate::core::model::{Asset, AssetKind, BlendMode, Clip, Project};
 use crate::core::transition::{self, Edge, TrackShow, TransitionKind};
-use super::gpu::compositor::{DrawItem, EffectDraw, LayerDraw, Paint, TransitionDraw};
+use super::gpu::compositor::{DrawItem, EffectDraw, LayerDraw, Paint, TransitionDraw, WarpDraw};
 use std::sync::Arc;
 
 /// What fills a layer.
@@ -21,6 +21,8 @@ pub enum ScenePaint {
     /// Solid color (one stop) or gradient, stops sorted by position.
     Gradient { colors: [[f32; 4]; 3], positions: [f32; 3], count: u32, angle_deg: f32, size: (f32, f32) },
     Text { mask: Arc<TextMask>, fill: [f32; 4], outline: [f32; 4] },
+    /// A compound clip's contents, rendered by the `SceneItem::Group` with this key.
+    Group(u64),
 }
 
 pub struct SceneLayer<'a> {
@@ -53,12 +55,14 @@ pub struct SceneLayer<'a> {
 
 pub struct SceneEffect {
     pub kind: EffectKind,
-    pub params: [f32; 4],
+    pub params: [f32; EFFECT_PARAMS],
     pub opacity: f32,
     /// Limits the effect to an area of the frame.
     pub mask: MaskFrame,
     /// What the effect treats as the picture (effect layers: their masks' area).
     pub frame: Option<EffectFrame>,
+    /// Liquify offsets.
+    pub warp: Option<WarpDraw>,
 }
 
 /// Two clips (or one at a free edge) mixed by a transition.
@@ -82,6 +86,9 @@ pub enum SceneItem<'a> {
     /// `prefix` is the part that's the same in every sample (drawn once); each list
     /// is drawn on top of it. Replaces everything before it.
     Samples { prefix: Vec<SceneItem<'a>>, lists: Vec<Vec<SceneItem<'a>>> },
+    /// A compound clip's contents (its own stack), drawn by a later layer with
+    /// `ScenePaint::Group(key)`.
+    Group { key: u64, items: Vec<SceneItem<'a>> },
 }
 
 /// Text mask and unscaled on-screen size (project pixels) of a text clip at `t`.
@@ -114,6 +121,9 @@ fn base_size(project: &Project, clip: &Clip, asset: &Asset) -> (f32, f32) {
 /// Where a clip's corners land at `t` (None for audio and effects).
 /// Use this rather than `Project::clip_quad`, which can't measure text.
 pub fn clip_quad(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine, frame_scale: f32) -> Option<Quad> {
+    if clip.audio.only {
+        return None;
+    }
     let t = clip.chop(t);
     let asset = project.asset(clip.asset)?;
     match &clip.content {
@@ -130,6 +140,9 @@ pub fn clip_quad(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine
 /// Size of a clip's layer in its own pixels (what masks are measured in), and its
 /// on-screen outline. Effect layers cover the frame.
 pub fn layer_space(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine, frame_scale: f32) -> Option<((f32, f32), Quad)> {
+    if clip.audio.only {
+        return None;
+    }
     let t = clip.chop(t);
     let asset = project.asset(clip.asset)?;
     let frame = (project.width as f32, project.height as f32);
@@ -172,7 +185,7 @@ fn build<'a>(project: &'a Project, t: f64, source_t: f64, upto: usize, motion_bl
             match show {
                 TrackShow::Clip(clip) => {
                     let Some(asset) = project.asset(clip.asset) else { continue };
-                    if asset.kind == AssetKind::Audio {
+                    if asset.kind == AssetKind::Audio || clip.audio.only {
                         continue;
                     }
                     let l = clip.local(clip.chop(t));
@@ -181,7 +194,7 @@ fn build<'a>(project: &'a Project, t: f64, source_t: f64, upto: usize, motion_bl
                         continue;
                     }
                     if let Some(Content::Effect(e)) = &clip.content {
-                        let params = [0, 1, 2, 3].map(|i| e.p[i].eval(l));
+                        let params: [f32; EFFECT_PARAMS] = std::array::from_fn(|i| e.p[i].eval(l));
                         if e.kind == EffectKind::MotionBlur {
                             if motion_blur {
                                 apply_motion_blur(project, &mut items, t, track, params, opacity, engine, frame_scale);
@@ -191,20 +204,24 @@ fn build<'a>(project: &'a Project, t: f64, source_t: f64, upto: usize, motion_bl
                         let canvas = (project.width as f32, project.height as f32);
                         let mask = mask::frame(&clip.masks, l, canvas);
                         let frame = mask::bounds(&clip.masks, l, canvas).map(|r| EffectFrame::new(&full_quad(canvas), r, canvas));
-                        items.push(SceneItem::Effect(SceneEffect { kind: e.kind, params, opacity, mask, frame }));
+                        items.push(SceneItem::Effect(SceneEffect { kind: e.kind, params, opacity, mask, frame, warp: warp_of(e) }));
                         continue;
                     }
-                    if let Some(layer) = layer_at(project, clip, asset, t, source_t, blend, engine, frame_scale) {
+                    let mut groups = Vec::new();
+                    if let Some(layer) = layer_at(project, clip, asset, t, source_t, blend, engine, frame_scale, &mut groups) {
+                        items.append(&mut groups);
                         items.push(SceneItem::Layer(layer));
                     }
                 }
                 TrackShow::Transition { from, to, window } => {
-                    let mut side = |c: Option<&'a Clip>| {
+                    let mut groups = Vec::new();
+                    let mut side = |c: Option<&'a Clip>, groups: &mut Vec<SceneItem<'a>>| {
                         let c = c?;
                         let asset = project.asset(c.asset)?;
-                        layer_at(project, c, asset, t, source_t, BlendMode::Normal, engine, frame_scale)
+                        layer_at(project, c, asset, t, source_t, BlendMode::Normal, engine, frame_scale, groups)
                     };
-                    let (from, to) = (side(from), side(to));
+                    let (from, to) = (side(from, &mut groups), side(to, &mut groups));
+                    items.append(&mut groups);
                     if from.is_none() && to.is_none() {
                         continue;
                     }
@@ -237,6 +254,7 @@ fn layer_at<'a>(
     blend: BlendMode,
     engine: &mut TextEngine,
     frame_scale: f32,
+    groups: &mut Vec<SceneItem<'a>>,
 ) -> Option<SceneLayer<'a>> {
     // Frame chopping: the clip only changes at its own frame rate.
     let (t, source_t) = (clip.chop(t), clip.chop(source_t));
@@ -268,6 +286,14 @@ fn layer_at<'a>(
             let (mask, base) = text_layout_at(clip, tp, t, source_t, engine, frame_scale);
             (ScenePaint::Text { mask, fill: tp.fill.eval(l), outline: tp.outline.eval(l) }, base)
         }
+        Some(Content::Compound(comp)) => {
+            // Its own stack at its own time, drawn first; this layer then shows it.
+            let inner = &comp.project;
+            let items = build(inner, clip.inner_time(t), clip.inner_time(source_t), inner.tracks.len(), true, engine, frame_scale);
+            let key = group_key(clip, t);
+            groups.push(SceneItem::Group { key, items });
+            (ScenePaint::Group(key), (project.width as f32, project.height as f32))
+        }
         None => (ScenePaint::Media, base_size(project, clip, asset)),
     };
     let matte = match (&clip.matte, &paint) {
@@ -295,15 +321,44 @@ fn layer_at<'a>(
     })
 }
 
+/// Identifies a compound clip's rendered contents at timeline time `t` (motion blur
+/// renders the same compound at several times in one frame).
+fn group_key(clip: &Clip, t: f64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (clip.id.0, t.to_bits()).hash(&mut h);
+    h.finish()
+}
+
 /// A clip's own enabled effects at clip time `l`. Motion blur needs the stack around
 /// the clip, so it only works as an effect layer.
 fn clip_effects(clip: &Clip, l: f64) -> Vec<SceneEffect> {
     clip.effects
         .iter()
         .filter(|e| e.enabled && e.effect.kind != EffectKind::MotionBlur)
-        .map(|e| SceneEffect { kind: e.effect.kind, params: [0, 1, 2, 3].map(|i| e.effect.p[i].eval(l)), opacity: e.mix.eval(l).clamp(0.0, 1.0), mask: MaskFrame::NONE, frame: None })
+        .map(|e| SceneEffect {
+            kind: e.effect.kind,
+            params: std::array::from_fn(|i| e.effect.p[i].eval(l)),
+            opacity: e.mix.eval(l).clamp(0.0, 1.0),
+            mask: MaskFrame::NONE,
+            frame: None,
+            warp: warp_of(&e.effect),
+        })
         .filter(|e| e.opacity > 0.0)
         .collect()
+}
+
+/// A liquify effect's grid for the GPU (None when nothing has been painted).
+fn warp_of(e: &EffectParams) -> Option<WarpDraw> {
+    use std::hash::{Hash, Hasher};
+    let g = e.warp.as_ref().filter(|g| e.kind == EffectKind::Liquify && !g.is_empty())?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    g.size.hash(&mut h);
+    for o in &g.offsets {
+        o[0].to_bits().hash(&mut h);
+        o[1].to_bits().hash(&mut h);
+    }
+    Some(WarpDraw { key: h.finish(), size: g.size as u32, offsets: Arc::new(g.offsets.clone()) })
 }
 
 /// Replaces the stack built so far (tracks below `track`) with motion blur samples:
@@ -315,7 +370,7 @@ fn apply_motion_blur<'a>(
     items: &mut Vec<SceneItem<'a>>,
     t: f64,
     track: usize,
-    params: [f32; 4],
+    params: [f32; EFFECT_PARAMS],
     mix: f32,
     engine: &mut TextEngine,
     frame_scale: f32,
@@ -383,6 +438,10 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
                 f(*angle_deg);
             }
             ScenePaint::Text { fill, outline, .. } => fill.iter().chain(outline.iter()).for_each(|v| f(*v)),
+            ScenePaint::Group(key) => {
+                f(f32::from_bits(*key as u32));
+                f(f32::from_bits((*key >> 32) as u32));
+            }
         }
     }
     let mut out = Vec::new();
@@ -401,6 +460,11 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
                 }
             }
             SceneItem::Samples { .. } => out.push(u32::MAX),
+            SceneItem::Group { items, .. } => {
+                // The key changes with time; what matters is what's inside.
+                out.push(u32::MAX - 1);
+                out.extend(fingerprint(items));
+            }
         }
     }
     out
@@ -408,7 +472,7 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
 
 /// A layer's draw settings with the given paint (see `to_draws`).
 pub fn layer_draw(l: &SceneLayer, paint: Paint, seed: u32) -> LayerDraw {
-    let effects = l.effects.iter().map(|e| EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: None }).collect();
+    let effects = l.effects.iter().map(|e| EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: None, warp: e.warp.clone() }).collect();
     LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend, effects, tone: l.tone, lut: None, region: l.region }
 }
 
@@ -424,7 +488,7 @@ pub fn to_draws(items: &[SceneItem], seed: u32, layer: &mut dyn FnMut(&SceneLaye
                     out.push(DrawItem::Layer(d));
                 }
             }
-            SceneItem::Effect(e) => out.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: e.frame })),
+            SceneItem::Effect(e) => out.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: e.frame, warp: e.warp.clone() })),
             SceneItem::Transition(tr) => {
                 let from = tr.from.as_ref().and_then(&mut *layer);
                 let to = tr.to.as_ref().and_then(&mut *layer);
@@ -448,6 +512,7 @@ pub fn to_draws(items: &[SceneItem], seed: u32, layer: &mut dyn FnMut(&SceneLaye
                 prefix: to_draws(prefix, seed, layer),
                 lists: lists.iter().map(|l| to_draws(l, seed, layer)).collect(),
             }),
+            SceneItem::Group { key, items } => out.push(DrawItem::Group { key: *key, items: to_draws(items, seed, layer) }),
         }
     }
     out

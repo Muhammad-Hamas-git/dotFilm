@@ -29,11 +29,32 @@ pub enum TransitionKind {
     Wipe,
     Push,
     Zoom,
+    /// Glows up to a bright bloom and settles on the new picture.
+    Glow,
+    /// Blurs out and the new picture blurs in.
+    Blur,
+    /// The new picture slides in over the old one.
+    Slide,
+    /// The old picture spins away, the new one spins in.
+    Spin,
+    /// A warm film light leak washes across.
+    LightLeak,
 }
 
 impl TransitionKind {
-    pub const ALL: [TransitionKind; 6] =
-        [TransitionKind::Crossfade, TransitionKind::FadeBlack, TransitionKind::FadeWhite, TransitionKind::Wipe, TransitionKind::Push, TransitionKind::Zoom];
+    pub const ALL: [TransitionKind; 11] = [
+        TransitionKind::Crossfade,
+        TransitionKind::FadeBlack,
+        TransitionKind::FadeWhite,
+        TransitionKind::Wipe,
+        TransitionKind::Push,
+        TransitionKind::Slide,
+        TransitionKind::Zoom,
+        TransitionKind::Spin,
+        TransitionKind::Blur,
+        TransitionKind::Glow,
+        TransitionKind::LightLeak,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -43,6 +64,11 @@ impl TransitionKind {
             TransitionKind::Wipe => "Wipe",
             TransitionKind::Push => "Push",
             TransitionKind::Zoom => "Zoom",
+            TransitionKind::Glow => "Glow",
+            TransitionKind::Blur => "Blur",
+            TransitionKind::Slide => "Slide",
+            TransitionKind::Spin => "Spin",
+            TransitionKind::LightLeak => "Light leak",
         }
     }
 
@@ -55,12 +81,17 @@ impl TransitionKind {
             TransitionKind::Wipe => 3,
             TransitionKind::Push => 4,
             TransitionKind::Zoom => 5,
+            TransitionKind::Glow => 6,
+            TransitionKind::Blur => 7,
+            TransitionKind::Slide => 8,
+            TransitionKind::Spin => 9,
+            TransitionKind::LightLeak => 10,
         }
     }
 
     /// Wipe and push move in a direction.
     pub fn has_direction(self) -> bool {
-        matches!(self, TransitionKind::Wipe | TransitionKind::Push)
+        matches!(self, TransitionKind::Wipe | TransitionKind::Push | TransitionKind::Slide | TransitionKind::LightLeak)
     }
 }
 
