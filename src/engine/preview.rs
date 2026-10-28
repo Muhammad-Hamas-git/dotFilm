@@ -155,8 +155,8 @@ impl PreviewRenderer {
                         let at = clip.source_time(first).max(0.0);
                         ensure_stream(&mut self.streams, clip.id, path, w, h, clip.decode_rate(project.fps), asset.color.full_range).update(at);
                         keep_streams.insert(clip.id);
-                        if let Some(path) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|_| mattes.ready(asset.id)) {
-                            let (mw, mh) = matte::matte_size(asset);
+                        if let Some((path, q)) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|m| Some((mattes.ready(asset.id, m.quality)?, m.quality))) {
+                            let (mw, mh) = matte::matte_size(asset, q);
                             ensure_stream(&mut self.matte_streams, clip.id, path, mw, mh, clip.decode_rate(project.fps), true).update(at);
                             keep_mattes.insert(clip.id);
                         }
@@ -227,8 +227,9 @@ impl PreviewRenderer {
             let mut d = scene::layer_draw(l, paint);
             // The AI matte: decoded like a video, from the cached grayscale file.
             if l.matte.is_on() {
-                if let Some(path) = mattes.ready(l.asset.id) {
-                    let (mw, mh) = matte::matte_size(l.asset);
+                let quality = l.clip.matte.as_ref().map(|m| m.quality).unwrap_or_default();
+                if let Some(path) = mattes.ready(l.asset.id, quality) {
+                    let (mw, mh) = matte::matte_size(l.asset, quality);
                     let stream = ensure_stream(matte_streams, l.clip.id, path, mw, mh, l.clip.decode_rate(project.fps), true);
                     keep_mattes.insert(l.clip.id);
                     let changed = stream.update(l.source_time);

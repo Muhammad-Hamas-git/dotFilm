@@ -8,10 +8,16 @@
 //! invert) are live, see core/matte.rs.
 //!
 //! Mattes are keyed by file path, size and modification time (like proxies), plus the
-//! model and the settings below, so changing either makes new ones.
+//! quality, the model and the settings below, so changing any of them makes new ones.
+//! A video can have a High quality and a Fast matte at the same time.
+//!
+//! Fast analyzes every FAST_FRAME_STEP-th frame (the matte video simply has a lower
+//! frame rate, so neighboring frames share a matte when it's played back) and runs the
+//! model at FAST_MODEL_SIZE instead of its full 1024 x 1024.
 
 use super::ffmpeg;
 use super::segment::{self, Segmenter, MODEL};
+use crate::core::matte::MatteQuality;
 use crate::core::model::{Asset, AssetId, AssetKind};
 use crossbeam_channel::{bounded, unbounded, Sender};
 use std::collections::HashMap;
@@ -24,9 +30,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ----- Values you can tune -----
-/// Mattes are stored at most this big (longest side). The shader scales them up;
-/// the model itself always sees 1024 x 1024, so more wouldn't add detail.
+/// High quality mattes are stored at most this big (longest side). The shader scales
+/// them up; the model itself sees 1024 x 1024, so more wouldn't add detail.
 pub const MATTE_MAX_SIDE: u32 = 1024;
+/// Fast mode runs the model at this size (square). Must divide 1024 into the model's
+/// steps evenly: 512 (about 3x faster per frame) or 768 (about 1.6x faster, closer
+/// to High quality).
+pub const FAST_MODEL_SIZE: u32 = 512;
+/// Fast mode analyzes every n-th frame; the frames in between reuse the last matte.
+pub const FAST_FRAME_STEP: u32 = 2;
 /// Frame rates above this are analyzed at this rate (each matte frame is then
 /// shown for two source frames).
 const MAX_FPS: f64 = 60.0;
@@ -44,8 +56,9 @@ pub enum MatteState {
     Queued,
     /// Fetching the AI model (first use only), 0..1.
     Downloading(f32),
-    /// Running the model. `fps` = frames analyzed per second.
-    Analyzing { progress: f32, fps: f32, device: &'static str },
+    /// Running the model. `fps` = video frames covered per second (in Fast mode
+    /// that's more than the frames the model actually runs on).
+    Analyzing { progress: f32, fps: f32, device: String },
     Ready(PathBuf),
     Failed(String),
 }
@@ -61,10 +74,22 @@ pub fn supports(asset: &Asset) -> bool {
     asset.kind == AssetKind::Video
 }
 
-/// Size of an asset's matte (fits MATTE_MAX_SIDE, keeps the aspect, even numbers).
-pub fn matte_size(asset: &Asset) -> (u32, u32) {
+/// Square size the model runs at for a quality.
+pub fn model_size(quality: MatteQuality) -> u32 {
+    match quality {
+        MatteQuality::High => MODEL.size,
+        MatteQuality::Fast => FAST_MODEL_SIZE,
+    }
+}
+
+/// Size of an asset's matte (fits the model size, keeps the aspect, even numbers).
+pub fn matte_size(asset: &Asset, quality: MatteQuality) -> (u32, u32) {
+    let max_side = match quality {
+        MatteQuality::High => MATTE_MAX_SIDE,
+        MatteQuality::Fast => FAST_MODEL_SIZE,
+    };
     let (w, h) = (asset.width.max(2) as f32, asset.height.max(2) as f32);
-    let k = (MATTE_MAX_SIDE as f32 / w.max(h)).min(1.0);
+    let k = (max_side as f32 / w.max(h)).min(1.0);
     let even = |v: f32| ((v.round() as u32) / 2 * 2).max(2);
     (even(w * k), even(h * k))
 }
@@ -75,7 +100,7 @@ pub fn cache_dir() -> PathBuf {
 
 /// Cache file for a source file's matte. Changes when the source, the model or the
 /// settings change.
-pub fn matte_path(source: &Path) -> PathBuf {
+pub fn matte_path(source: &Path, quality: MatteQuality) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut h);
     if let Ok(meta) = std::fs::metadata(source) {
@@ -85,29 +110,36 @@ pub fn matte_path(source: &Path) -> PathBuf {
         }
     }
     (MODEL.name, MATTE_MAX_SIDE, MAX_FPS.to_bits(), SMOOTHING.to_bits(), MOTION_THRESHOLD.to_bits()).hash(&mut h);
+    if quality == MatteQuality::Fast {
+        // High keeps its old key, so mattes made before Fast existed still count.
+        ("fast", FAST_MODEL_SIZE, FAST_FRAME_STEP).hash(&mut h);
+    }
     cache_dir().join(format!("{:016x}.mkv", h.finish()))
 }
 
 /// The matte file for an asset if it has been made (export uses this; it has no `Mattes`).
-pub fn existing(asset: &Asset) -> Option<PathBuf> {
-    let p = matte_path(&asset.path);
+pub fn existing(asset: &Asset, quality: MatteQuality) -> Option<PathBuf> {
+    let p = matte_path(&asset.path, quality);
     (supports(asset) && p.is_file()).then_some(p)
 }
 
 struct Job {
     id: AssetId,
+    quality: MatteQuality,
     source: PathBuf,
     duration: f64,
     size: (u32, u32),
     cancel: Arc<AtomicBool>,
 }
 
-type States = Arc<Mutex<HashMap<AssetId, MatteState>>>;
+/// One matte: an asset at a quality.
+type Key = (AssetId, MatteQuality);
+type States = Arc<Mutex<HashMap<Key, MatteState>>>;
 
 /// Makes mattes one at a time in a background thread (they share the GPU).
 pub struct Mattes {
     states: States,
-    cancels: Arc<Mutex<HashMap<AssetId, Arc<AtomicBool>>>>,
+    cancels: Arc<Mutex<HashMap<Key, Arc<AtomicBool>>>>,
     tx: Sender<Job>,
 }
 
@@ -121,8 +153,9 @@ impl Mattes {
                 if job.cancel.load(Ordering::Relaxed) {
                     continue;
                 }
+                let key = (job.id, job.quality);
                 let set = |s: MatteState| {
-                    st.lock().unwrap().insert(job.id, s);
+                    st.lock().unwrap().insert(key, s);
                     ctx.request_repaint();
                 };
                 let result = build(&job, &set);
@@ -134,7 +167,7 @@ impl Mattes {
                 match result {
                     Some(s) => set(s),
                     None => {
-                        st.lock().unwrap().remove(&job.id);
+                        st.lock().unwrap().remove(&key);
                         ctx.request_repaint();
                     }
                 }
@@ -143,59 +176,71 @@ impl Mattes {
         Self { states, cancels: Arc::default(), tx }
     }
 
-    /// Notes an already cached matte (e.g. after opening a project). Never starts work.
+    /// Notes already cached mattes (e.g. after opening a project). Never starts work.
     pub fn check(&self, asset: &Asset) {
-        if let Some(p) = existing(asset) {
-            self.states.lock().unwrap().insert(asset.id, MatteState::Ready(p));
+        for q in MatteQuality::ALL {
+            if let Some(p) = existing(asset, q) {
+                self.states.lock().unwrap().insert((asset.id, q), MatteState::Ready(p));
+            }
         }
     }
 
     /// Starts making a matte for an asset. Instant if it's already cached.
-    pub fn request(&self, asset: &Asset) {
+    pub fn request(&self, asset: &Asset, quality: MatteQuality) {
         if !supports(asset) {
             return;
         }
-        let path = matte_path(&asset.path);
+        let key = (asset.id, quality);
+        let path = matte_path(&asset.path, quality);
         let mut states = self.states.lock().unwrap();
         if path.is_file() {
-            states.insert(asset.id, MatteState::Ready(path));
+            states.insert(key, MatteState::Ready(path));
             return;
         }
-        if states.get(&asset.id).is_some_and(|s| s.is_busy() || matches!(s, MatteState::Ready(_))) {
+        if states.get(&key).is_some_and(|s| s.is_busy() || matches!(s, MatteState::Ready(_))) {
             return;
         }
-        states.insert(asset.id, MatteState::Queued);
+        states.insert(key, MatteState::Queued);
         let cancel = Arc::new(AtomicBool::new(false));
-        self.cancels.lock().unwrap().insert(asset.id, cancel.clone());
-        let _ = self.tx.send(Job { id: asset.id, source: asset.path.clone(), duration: asset.duration, size: matte_size(asset), cancel });
+        self.cancels.lock().unwrap().insert(key, cancel.clone());
+        let job = Job { id: asset.id, quality, source: asset.path.clone(), duration: asset.duration, size: matte_size(asset, quality), cancel };
+        let _ = self.tx.send(job);
     }
 
     /// Deletes and remakes a matte.
-    pub fn rebuild(&self, asset: &Asset) {
-        self.cancel(asset.id);
-        let _ = std::fs::remove_file(matte_path(&asset.path));
-        self.states.lock().unwrap().remove(&asset.id);
-        self.request(asset);
+    pub fn rebuild(&self, asset: &Asset, quality: MatteQuality) {
+        self.cancel(asset.id, quality);
+        let _ = std::fs::remove_file(matte_path(&asset.path, quality));
+        self.states.lock().unwrap().remove(&(asset.id, quality));
+        self.request(asset, quality);
     }
 
     /// Stops a queued or running job.
-    pub fn cancel(&self, id: AssetId) {
-        if let Some(c) = self.cancels.lock().unwrap().remove(&id) {
+    pub fn cancel(&self, id: AssetId, quality: MatteQuality) {
+        let key = (id, quality);
+        if let Some(c) = self.cancels.lock().unwrap().remove(&key) {
             c.store(true, Ordering::Relaxed);
         }
         let mut states = self.states.lock().unwrap();
-        if states.get(&id).is_some_and(|s| s.is_busy()) {
-            states.remove(&id);
+        if states.get(&key).is_some_and(|s| s.is_busy()) {
+            states.remove(&key);
         }
     }
 
-    pub fn state(&self, id: AssetId) -> Option<MatteState> {
-        self.states.lock().unwrap().get(&id).cloned()
+    /// Stops all jobs of an asset (it's being removed).
+    pub fn cancel_all(&self, id: AssetId) {
+        for q in MatteQuality::ALL {
+            self.cancel(id, q);
+        }
+    }
+
+    pub fn state(&self, id: AssetId, quality: MatteQuality) -> Option<MatteState> {
+        self.states.lock().unwrap().get(&(id, quality)).cloned()
     }
 
     /// The matte file to use, if it's ready.
-    pub fn ready(&self, id: AssetId) -> Option<PathBuf> {
-        match self.states.lock().unwrap().get(&id) {
+    pub fn ready(&self, id: AssetId, quality: MatteQuality) -> Option<PathBuf> {
+        match self.states.lock().unwrap().get(&(id, quality)) {
             Some(MatteState::Ready(p)) => Some(p.clone()),
             _ => None,
         }
@@ -233,6 +278,18 @@ fn analysis_rate(source: &Path) -> String {
     }
 }
 
+/// `rate` divided by `step`, keeping it an exact fraction ("30000/1001" / 2 = "30000/2002").
+fn divide_rate(rate: &str, step: u32) -> String {
+    if step <= 1 {
+        return rate.to_string();
+    }
+    let (n, d) = rate.split_once('/').unwrap_or((rate, "1"));
+    match d.trim().parse::<u64>() {
+        Ok(d) => format!("{}/{}", n.trim(), d * step as u64),
+        Err(_) => format!("{}", rate_value(rate) / step as f64),
+    }
+}
+
 fn rate_value(rate: &str) -> f64 {
     let (n, d) = rate.split_once('/').unwrap_or((rate, "1"));
     n.parse::<f64>().unwrap_or(30.0) / d.parse::<f64>().unwrap_or(1.0).max(1e-9)
@@ -262,19 +319,22 @@ fn build(job: &Job, set: &dyn Fn(MatteState)) -> Result<PathBuf, String> {
         set(MatteState::Downloading(0.0));
         segment::ensure_model(&mut |p| set(MatteState::Downloading(p)), cancel)?
     };
-    set(MatteState::Analyzing { progress: 0.0, fps: 0.0, device: "loading model" });
-    let mut seg = Segmenter::load(&model)?;
-    let device = seg.device;
+    set(MatteState::Analyzing { progress: 0.0, fps: 0.0, device: "loading model".into() });
+    let s = model_size(job.quality);
+    let mut seg = Segmenter::load(&model, s)?;
+    let device = seg.device.clone();
     if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled".into());
     }
 
-    let out = matte_path(&job.source);
+    let out = matte_path(&job.source, job.quality);
     std::fs::create_dir_all(cache_dir()).map_err(|e| e.to_string())?;
     let tmp = out.with_extension("part.mkv");
-    let rate = analysis_rate(&job.source);
+    let step = if job.quality == MatteQuality::Fast { FAST_FRAME_STEP } else { 1 };
+    // Fast: a lower-rate matte video. Playback decodes it at the clip's rate, which
+    // repeats each matte frame for the frames in between.
+    let rate = divide_rate(&analysis_rate(&job.source), step);
     let fps = rate_value(&rate);
-    let s = MODEL.size;
     let (w, h) = job.size;
 
     // Decoder: every frame, stretched to the model's square input.
@@ -336,8 +396,8 @@ fn build(job: &Job, set: &dyn Fn(MatteState)) -> Result<PathBuf, String> {
             break;
         }
         done += 1;
-        let speed = done as f32 / started.elapsed().as_secs_f32().max(1e-3);
-        set(MatteState::Analyzing { progress: (done as f64 / expected).min(0.99) as f32, fps: speed, device });
+        let speed = (done * step as u64) as f32 / started.elapsed().as_secs_f32().max(1e-3);
+        set(MatteState::Analyzing { progress: (done as f64 / expected).min(0.99) as f32, fps: speed, device: device.clone() });
     }
     drop(frx);
     let _ = decoder.kill();
@@ -383,12 +443,14 @@ mod tests {
     #[test]
     fn matte_size_keeps_aspect_and_never_upscales() {
         let mut a = Asset::test_asset(AssetKind::Video);
+        let hq = MatteQuality::High;
         (a.width, a.height) = (2560, 1440);
-        assert_eq!(matte_size(&a), (1024, 576));
+        assert_eq!(matte_size(&a, hq), (1024, 576));
+        assert_eq!(matte_size(&a, MatteQuality::Fast), (512, 288));
         (a.width, a.height) = (640, 360);
-        assert_eq!(matte_size(&a), (640, 360));
+        assert_eq!(matte_size(&a, hq), (640, 360));
         (a.width, a.height) = (1080, 1920);
-        assert_eq!(matte_size(&a), (576, 1024));
+        assert_eq!(matte_size(&a, hq), (576, 1024));
     }
 
     /// Runs the real model on the test video. Opt-in, because it needs the model
@@ -413,28 +475,37 @@ mod tests {
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "ffmpeg could not cut the test clip");
-        let job = Job { id: AssetId(1), source: clip.clone(), duration: seconds, size: (1024, 576), cancel: Arc::default() };
-        let last = Mutex::new(None);
-        let out = build(&job, &|s| *last.lock().unwrap() = Some(s)).expect("matte job");
-        if let Some(MatteState::Analyzing { fps, device, .. }) = last.lock().unwrap().clone() {
-            eprintln!("matte speed: {fps:.2} frames/s on {device}");
+        for (quality, (w, h)) in [(MatteQuality::High, (1024u32, 576u32)), (MatteQuality::Fast, (512, 288))] {
+            let job = Job { id: AssetId(1), quality, source: clip.clone(), duration: seconds, size: (w, h), cancel: Arc::default() };
+            let last = Mutex::new(None);
+            let out = build(&job, &|s| *last.lock().unwrap() = Some(s)).expect("matte job");
+            if let Some(MatteState::Analyzing { fps, device, .. }) = last.lock().unwrap().clone() {
+                eprintln!("{quality:?} matte speed: {fps:.2} video frames/s on {device}");
+            }
+            // Decode the matte the way the preview does (full-range YUV, Y = matte), at 30 fps.
+            let mut s = crate::media::video::SequentialStream::open(&out, 0.0, w, h, 30.0, true, false).unwrap();
+            let frame0 = s.frame(0).expect("a matte frame")[..(w * h) as usize].to_vec();
+            let at = |x: f32, y: f32| frame0[((y * h as f32) as u32 * w + (x * w as f32) as u32) as usize];
+            // The penguin stands left of center; its dark back is solid. (Its white belly against the
+            // snow comes out about half see-through: a known weak spot, fixed with a mask.)
+            assert!(at(0.25, 0.694) > 200, "{quality:?} penguin body {}", at(0.25, 0.694));
+            assert!(at(0.88, 0.1) < 20, "{quality:?} sky {}", at(0.88, 0.1));
+            assert!(at(0.78, 0.87) < 40, "{quality:?} rocks {}", at(0.78, 0.87));
+            // Fast: frames 1 and 2 share one matte (half-rate video played back at 30 fps).
+            if quality == MatteQuality::Fast {
+                let f1 = s.frame(1).unwrap()[..(w * h) as usize].to_vec();
+                let f2 = s.frame(2).unwrap()[..(w * h) as usize].to_vec();
+                assert!(f1 == frame0 || f1 == f2, "frame 1 reuses a neighbor's matte");
+            }
+            let _ = std::fs::remove_file(&out);
         }
-        // Decode the first matte frame the way the preview does (full-range YUV, Y = matte).
-        let mut s = crate::media::video::SequentialStream::open(&out, 0.0, 1024, 576, 30.0, true, false).unwrap();
-        let y = s.frame(0).expect("a matte frame")[..1024 * 576].to_vec();
-        let at = |x: u32, yy: u32| y[(yy * 1024 + x) as usize];
-        // The penguin stands left of center; its dark back is solid. (Its white belly against the
-        // snow comes out about half see-through: a known weak spot, fixed with an Add mask.)
-        assert!(at(256, 400) > 200, "penguin body {}", at(256, 400));
-        assert!(at(900, 60) < 20, "sky {}", at(900, 60));
-        assert!(at(800, 500) < 40, "rocks {}", at(800, 500));
-        let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Benchmark on your own machine: analyzes $DOTFILM_MATTE_SOURCE (default: the test
     /// video) and prints the speed and device. The result stays in the cache, so the
     /// app finds it. Run with: cargo test --release -- --ignored matte_benchmark --nocapture
+    /// (set DOTFILM_MATTE_QUALITY=fast for the Fast mode).
     #[test]
     #[ignore]
     fn matte_benchmark() {
@@ -444,8 +515,12 @@ mod tests {
         let info = crate::media::probe::probe(&source).expect("probe");
         let mut asset = Asset::test_asset(AssetKind::Video);
         (asset.width, asset.height, asset.duration) = (info.width, info.height, info.duration);
-        let _ = std::fs::remove_file(matte_path(&source));
-        let job = Job { id: AssetId(1), source: source.clone(), duration: info.duration, size: matte_size(&asset), cancel: Arc::default() };
+        let quality = match std::env::var("DOTFILM_MATTE_QUALITY").as_deref() {
+            Ok("fast") => MatteQuality::Fast,
+            _ => MatteQuality::High,
+        };
+        let _ = std::fs::remove_file(matte_path(&source, quality));
+        let job = Job { id: AssetId(1), quality, source: source.clone(), duration: info.duration, size: matte_size(&asset, quality), cancel: Arc::default() };
         let started = Instant::now();
         let last = Mutex::new(None);
         let out = build(&job, &|s| {
@@ -465,5 +540,8 @@ mod tests {
     fn rates() {
         assert!((rate_value("30000/1001") - 29.97).abs() < 0.01);
         assert_eq!(rate_value("25"), 25.0);
+        assert_eq!(divide_rate("30000/1001", 2), "30000/2002");
+        assert_eq!(divide_rate("30", 2), "30/2");
+        assert_eq!(divide_rate("60", 1), "60");
     }
 }

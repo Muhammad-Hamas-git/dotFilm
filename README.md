@@ -33,13 +33,15 @@ A desktop video editor written in Rust, rendered on the GPU.
   (shadows, midtones, highlights: tint plus luminance), and **HSL by color** (hue, saturation and
   luminance for red, orange, yellow, green, blue, indigo, violet). All keyframeable.
 - **Remove background (AI)**: no green screen needed. Select a video clip, open **Remove background (AI)**
-  in the Adjustments panel and click **Remove BG**. The video is analyzed once in the background (progress bar,
-  cancel button) on your GPU through DirectML (any DirectX 12 card), or on the CPU if that fails. After that it
-  plays in real time. **Shrink / grow** and **Edge softness** refine the edge live and are keyframeable;
-  **Keep the background instead** inverts it. Fix mistakes with the clip's **masks**, which apply on top of
-  the AI result: Add brings back missed parts, Subtract removes extra parts, Intersect keeps only one area.
-  The first use downloads the AI model (ISNet, about 180 MB) into the cache folder. Results are cached per
-  video, so other clips of the same file reuse them.
+  in the Adjustments panel and click **Remove BG (high quality)** or **Remove BG (fast)**. The video is analyzed
+  once in the background (progress bar, cancel button) on your dedicated GPU through DirectML (any DirectX 12
+  card), or on the CPU if that fails. After that it plays in real time. **Fast** analyzes every other frame at
+  half resolution, about 6 to 8 times faster, with softer edges. Both results can be cached at once; switch
+  between them any time. **Erode**, **Dilate** and **Feather** clean up the edge live and are keyframeable;
+  **Keep the background instead** inverts it. The clip's **masks** then isolate the subject further (only what's
+  inside an Add mask stays). Turn on **Masks bring back the background** to have masks combine with the cut-out
+  instead, so an Add mask shows the original picture inside it. The first use downloads the AI model (ISNet,
+  about 180 MB) into the cache folder.
 - **Chroma key**: remove a green (or any) screen. Click **Pick** and then the background in the player,
   or set the color by hand. Similarity, softness and spill removal. Runs on the GPU like everything else.
 - **Copy and paste clips** (Ctrl+C / Ctrl+V or right-click): pastes at the playhead with all its
@@ -130,7 +132,7 @@ src/
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
     transition.rs      transitions on clip edges and where they play on the timeline
     mask.rs            mask shapes, their math, and packing for the GPU
-    matte.rs           AI background removal settings (shrink, softness, invert)
+    matte.rs           AI background removal settings (quality, erode/dilate/feather, mask mode)
     geometry.rs        3D rotation and perspective of a layer
     history.rs         undo/redo
   media/             reading files
@@ -207,9 +209,10 @@ Example: a new animatable parameter "blur radius".
 | Mask value ranges and defaults | `info` and `Mask::new` in `core/mask.rs` |
 | Mask handle size, grab distance, outline color | top of `ui/masks.rs` |
 | AI matte size, flicker smoothing, analysis frame rate cap | `MATTE_MAX_SIDE`, `SMOOTHING`, `MOTION_THRESHOLD`, `MAX_FPS` in `media/matte.rs` |
+| Fast mode: model size, frames skipped | `FAST_MODEL_SIZE` (512, or 768 for closer to High quality), `FAST_FRAME_STEP` in `media/matte.rs` |
 | Which AI model removes backgrounds | `MODEL` in `media/segment.rs` (set `DOTFILM_MATTE_MODEL` to a local .onnx to skip the download) |
-| Shrink / grow strength, edge softness range | `info` and `refine` in `core/matte.rs` (keep `refine` in step with `matte_refine` in `gpu/shaders.wgsl`) |
-| Edge softness quality (blur taps) | `matte_at` in `gpu/shaders.wgsl` |
+| Which GPU runs the AI | automatic (Windows' high performance GPU); set `DOTFILM_DML_DEVICE=1` (or 0, 2...) to force one |
+| Erode / dilate / feather ranges | `info` in `core/matte.rs`; largest radius `MAX_RADIUS` there and `MATTE_MAX_RADIUS` in `gpu/shaders.wgsl` (keep in step) |
 | Effect parameter ranges and defaults | `EffectKind::params` in `core/content.rs` |
 | Default text, colors, gradient | `Content::text`, `Content::color`, `Content::gradient` in `core/content.rs` |
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
@@ -227,4 +230,4 @@ Example: a new animatable parameter "blur radius".
 - AI background removal works on video clips (not still images yet). It finds the most prominent subject;
   with several people it may pick the wrong one or all of them, so use Intersect or Subtract masks.
   Low-contrast edges (white feathers on snow) can come out partly see-through; an Add mask fixes them.
-  The matte is stored at up to 1024 px, so very fine hair on 4K footage is softer than the picture.
+  The matte is stored at up to 1024 px (Fast: 512 px), so very fine hair on 4K footage is softer than the picture.

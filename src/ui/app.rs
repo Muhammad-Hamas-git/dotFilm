@@ -277,7 +277,7 @@ impl EditorApp {
         if self.source.as_ref().is_some_and(|s| s.asset == id) {
             self.close_source();
         }
-        self.mattes.cancel(id);
+        self.mattes.cancel_all(id);
         self.history.checkpoint(&self.project);
         self.project.remove_asset(id);
         self.history.clear(); // Undo could bring back clips whose asset is gone.

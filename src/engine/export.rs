@@ -282,8 +282,8 @@ pub fn run(
             let from = clip.source_time(first).max(0.0);
             let s = SequentialStream::open(&asset.path, from, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
             streams.insert(clip.id, (s, rate, from, None));
-            if let Some(path) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|_| matte::existing(asset)) {
-                let (mw, mh) = matte::matte_size(asset);
+            if let Some((path, q)) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|m| Some((matte::existing(asset, m.quality)?, m.quality))) {
+                let (mw, mh) = matte::matte_size(asset, q);
                 // Gray decodes as full-range YUV: the Y plane is the matte.
                 let m = SequentialStream::open(&path, from, mw, mh, rate, true, false).map_err(|e| fail(e, &mut enc))?;
                 mattes.insert(clip.id, (m, rate, from, None));

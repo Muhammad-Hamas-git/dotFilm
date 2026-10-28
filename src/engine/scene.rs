@@ -322,7 +322,7 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
         l.stages.iter().flatten().flatten().for_each(|v| f(*v));
         l.grade.data.iter().flatten().for_each(|v| f(*v));
         l.mask.masks.iter().flatten().chain(l.mask.points.iter().flatten()).for_each(|v| f(*v));
-        l.matte.0.iter().for_each(|v| f(*v));
+        l.matte.values().iter().for_each(|v| f(*v));
         f(l.opacity);
         match &l.paint {
             ScenePaint::Media => {}

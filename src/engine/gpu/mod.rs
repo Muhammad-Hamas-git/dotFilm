@@ -600,7 +600,7 @@ pub mod tests {
     }
 
     #[test]
-    fn ai_matte_with_refine_and_cleanup_masks() {
+    fn ai_matte_cleanup_and_masks_match_the_cpu_reference() {
         use crate::core::anim::Anim;
         use crate::core::mask::{self, idx, Mask, MaskKind, MaskMode};
         use crate::core::matte;
@@ -610,23 +610,28 @@ pub mod tests {
         let mut c = Compositor::new(g.device, g.queue, w, h);
         let white = SourceKey::Asset(1);
         solid(&mut c, white, [255, 255, 255, 255]);
-        // Matte: the left half is the subject, plus a soft ramp in the right half's top rows.
+        // Matte: a subject rectangle with a ragged, half-transparent right edge, and a
+        // 2 px speck of background the AI wrongly kept.
         let m = SourceKey::Matte(1);
         let mut pixels = vec![0u8; (w * h) as usize];
         for y in 0..h {
             for x in 0..w {
-                let v = if x < w / 2 { 255 } else if y < 8 { ((x - w / 2) * 255 / (w / 2)) as u8 } else { 0 };
-                pixels[(y * w + x) as usize] = v;
+                let inside = (8..40).contains(&x) && (8..56).contains(&y);
+                let ragged = x == 40 && y % 3 == 0;
+                let speck = (52..54).contains(&x) && (20..22).contains(&y);
+                pixels[(y * w + x) as usize] = if inside || speck { 255 } else if ragged { 128 } else { 0 };
             }
         }
         c.upload_matte(m, w, h, &pixels);
+        let src: Vec<f32> = pixels.iter().map(|&v| v as f32 / 255.0).collect();
         let q = full_frame(size.0, size.1);
-        let draw = |c: &mut Compositor, frame: [f32; 4], masks: &[Mask]| {
+        let frame = |erode: f32, dilate: f32, feather: f32, mode: f32, restore: bool| MatteFrame { mode, restore, erode, dilate, feather };
+        let draw = |c: &mut Compositor, mf: MatteFrame, masks: &[Mask]| {
             c.render(&[DrawItem::Layer(LayerDraw {
                 paint: Paint::Source(white),
                 grade: NO_GRADE,
                 mask: mask::frame(masks, 0.0, size),
-                matte: MatteFrame(frame),
+                matte: mf,
                 matte_src: Some(m),
                 quad: q,
                 stages: vec![],
@@ -635,54 +640,75 @@ pub mod tests {
             })]);
             c.read_rgba()
         };
+        let cpu = |erode: f32, dilate: f32, feather: f32| {
+            let mut a = src.clone();
+            for (kind, horizontal, r) in matte::passes(erode, dilate, feather) {
+                a = matte::apply_pass(&a, w as usize, h as usize, kind, horizontal, r);
+            }
+            a
+        };
+        let compare = |img: &[u8], want: &[f32], what: &str| {
+            let mut worst = 0.0f32;
+            for y in 0..h {
+                for x in 0..w {
+                    worst = worst.max((want[(y * w + x) as usize] * 255.0 - px(img, w, x, y)[0] as f32).abs());
+                }
+            }
+            assert!(worst <= 4.0, "{what}: GPU and CPU differ by {worst}");
+        };
 
-        // Plain matte: subject shows, background is gone.
-        let img = draw(&mut c, [1.0, 0.0, 0.0, 0.0], &[]);
-        assert!(px(&img, w, 8, 40)[0] > 250);
-        assert!(px(&img, w, 56, 40)[0] < 3);
-        // The soft ramp matches the CPU twin of shrink/grow.
-        for shrink in [0.0f32, 0.5, -0.5] {
-            let img = draw(&mut c, [1.0, shrink, 0.0, 0.0], &[]);
-            for x in [36u32, 44, 52, 60] {
-                let raw = (x - w / 2) as f32 / (w / 2) as f32;
-                let want = matte::refine(raw, shrink) * 255.0;
-                let got = px(&img, w, x, 2)[0] as f32;
-                assert!((want - got).abs() <= 10.0, "shrink {shrink} at x {x}: want {want}, got {got}");
+        // Plain, then each cleanup alone and combined (layer px = matte px here).
+        compare(&draw(&mut c, frame(0.0, 0.0, 0.0, 1.0, false), &[]), &src, "plain");
+        for (e, d, f) in [(1.5, 0.0, 0.0), (0.0, 2.5, 0.0), (0.0, 0.0, 4.0), (1.0, 1.0, 2.0)] {
+            compare(&draw(&mut c, frame(e, d, f, 1.0, false), &[]), &cpu(e, d, f), &format!("erode {e} dilate {d} feather {f}"));
+        }
+        // Erode then dilate removes the speck and keeps the subject.
+        let open = draw(&mut c, frame(1.0, 1.0, 0.0, 1.0, false), &[]);
+        assert!(px(&open, w, 52, 20)[0] < 3, "speck removed");
+        assert!(px(&open, w, 20, 30)[0] > 250, "subject kept");
+        // Settings are in layer pixels: on a layer twice the matte's size, 3 px is 1.5 matte px.
+        c.render(&[DrawItem::Layer(LayerDraw {
+            paint: Paint::Source(white),
+            grade: NO_GRADE,
+            mask: mask::frame(&[], 0.0, (128.0, 128.0)),
+            matte: frame(3.0, 0.0, 0.0, 1.0, false),
+            matte_src: Some(m),
+            quad: q,
+            stages: vec![],
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        })]);
+        compare(&c.read_rgba(), &cpu(1.5, 0.0, 0.0), "layer px to matte px");
+        // Inverted keeps the background.
+        let inv = draw(&mut c, frame(0.0, 0.0, 0.0, 2.0, false), &[]);
+        assert!(px(&inv, w, 20, 30)[0] < 3 && px(&inv, w, 60, 60)[0] > 250);
+
+        // Masks: by default they isolate the cut-out; with restore they combine with it.
+        let mut keep_left = Mask::new(MaskKind::Rectangle, size);
+        keep_left.values[idx::CENTER_X as usize] = Anim::new(0.25);
+        keep_left.values[idx::WIDTH as usize] = Anim::new(32.0);
+        keep_left.values[idx::HEIGHT as usize] = Anim::new(64.0);
+        keep_left.values[idx::FEATHER as usize] = Anim::new(0.0);
+        keep_left.mode = MaskMode::Add;
+        let masks = vec![keep_left];
+        for restore in [false, true] {
+            let img = draw(&mut c, frame(0.0, 0.0, 0.0, 1.0, restore), &masks);
+            let mut worst = 0.0f32;
+            for y in (0..h).step_by(3) {
+                for x in (0..w).step_by(3) {
+                    let base = src[(y * w + x) as usize];
+                    let want = mask::coverage_with_matte(&masks, 0.0, size, [x as f32 + 0.5, y as f32 + 0.5], base, restore) * 255.0;
+                    worst = worst.max((want - px(&img, w, x, y)[0] as f32).abs());
+                }
+            }
+            assert!(worst <= 6.0, "restore {restore}: GPU and CPU differ by {worst}");
+            if restore {
+                assert!(px(&img, w, 2, 2)[0] > 250, "Add mask brings the background back");
+            } else {
+                assert!(px(&img, w, 2, 2)[0] < 3, "background stays removed");
+                assert!(px(&img, w, 36, 30)[0] < 3, "subject outside the mask is cut");
+                assert!(px(&img, w, 20, 30)[0] > 250, "subject inside the mask stays");
             }
         }
-        // Edge softness blurs across the hard edge at x = 32.
-        let soft = draw(&mut c, [1.0, 0.0, 6.0, 0.0], &[]);
-        let edge = px(&soft, w, 32, 40)[0];
-        assert!(edge > 40 && edge < 215, "soft edge {edge}");
-        assert!(px(&soft, w, 8, 40)[0] > 250 && px(&soft, w, 56, 40)[0] < 3, "far from the edge unchanged");
-        // Inverted keeps the background instead.
-        let inv = draw(&mut c, [2.0, 0.0, 0.0, 0.0], &[]);
-        assert!(px(&inv, w, 8, 40)[0] < 3 && px(&inv, w, 56, 40)[0] > 250);
-        // Off: the whole picture.
-        let off = draw(&mut c, [0.0, 0.0, 0.0, 0.0], &[]);
-        assert!(px(&off, w, 56, 40)[0] > 250);
-
-        // Cleanup masks work on top of the matte, like the CPU reference.
-        let mut add = Mask::new(MaskKind::Rectangle, size);
-        add.values[idx::CENTER_X as usize] = Anim::new(0.8);
-        add.values[idx::WIDTH as usize] = Anim::new(10.0);
-        add.values[idx::HEIGHT as usize] = Anim::new(10.0);
-        add.values[idx::FEATHER as usize] = Anim::new(0.0);
-        let mut cut = add.clone();
-        cut.mode = MaskMode::Subtract;
-        cut.values[idx::CENTER_X as usize] = Anim::new(0.2);
-        let masks = vec![add, cut];
-        let img = draw(&mut c, [1.0, 0.0, 0.0, 0.0], &masks);
-        let mut worst = 0.0f32;
-        for y in (12..h).step_by(3) {
-            for x in (0..w).step_by(3) {
-                let base = pixels[(y * w + x) as usize] as f32 / 255.0;
-                let want = mask::coverage_over(&masks, 0.0, size, [x as f32 + 0.5, y as f32 + 0.5], Some(base)) * 255.0;
-                worst = worst.max((want - px(&img, w, x, y)[0] as f32).abs());
-            }
-        }
-        assert!(worst <= 6.0, "GPU and CPU differ by {worst}");
-        assert!(px(&img, w, 51, 32)[0] > 250, "added back");
-        assert!(px(&img, w, 13, 32)[0] < 3, "cut out");
     }
 }
