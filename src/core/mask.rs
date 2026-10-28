@@ -356,7 +356,6 @@ pub fn rgb_to_hsl(c: [f32; 3]) -> [f32; 3] {
 
 /// How far a color is outside a color range mask (negative inside), in units where
 /// the softness applies (matches the shader's `color_distance`; tests compare).
-#[cfg(test)]
 pub fn color_distance(m: &Mask, t: f64, rgb: [f32; 3]) -> f32 {
     let v = |i: u8| m.value(i, t);
     let [h, s, l] = rgb_to_hsl(rgb);
@@ -369,7 +368,6 @@ pub fn color_distance(m: &Mask, t: f64, rgb: [f32; 3]) -> f32 {
 }
 
 /// Degrees of hue that count as one unit of color distance (so softness 0.1 fades over 9 degrees).
-#[cfg(test)]
 pub const HUE_SPAN: f32 = 90.0;
 
 /// Signed distance to a closed polygon (negative inside).
@@ -426,17 +424,85 @@ pub fn coverage_over(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base
 /// Like `coverage_over`, for a pixel of color `rgb` (what color range masks look at).
 #[cfg(test)]
 pub fn coverage_full(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base: Option<f32>, rgb: [f32; 3]) -> f32 {
+    coverage_impl(masks, t, size, p, base, Some(rgb))
+}
+
+/// Grid used to find where masks show the layer (see `bounds`).
+const BOUNDS_GRID: usize = 48;
+/// Coverage below this counts as hidden when finding mask bounds.
+const BOUNDS_THRESHOLD: f32 = 0.02;
+
+/// The part of a layer of `size` that its masks leave visible, as (u0, v0, u1, v1) in
+/// the layer's own 0..1 space. None if no mask limits it. Color range masks can show
+/// anything, so they never shrink the area.
+pub fn bounds(masks: &[Mask], t: f64, size: (f32, f32)) -> Option<[f32; 4]> {
+    let usable = masks.iter().take(MAX_MASKS).filter(|m| m.kind != MaskKind::Shape || m.points.len() >= 3).count();
+    if usable == 0 {
+        return None;
+    }
+    let cov = |u: f32, v: f32| coverage_impl(masks, t, size, [u * size.0, v * size.1], None, None) > BOUNDS_THRESHOLD;
+    let n = BOUNDS_GRID;
+    let at = |i: usize| i as f32 / n as f32;
+    let (mut lo, mut hi) = ([n, n], [0usize, 0usize]);
+    let mut any = false;
+    for j in 0..=n {
+        for i in 0..=n {
+            if cov(at(i), at(j)) {
+                any = true;
+                lo = [lo[0].min(i), lo[1].min(j)];
+                hi = [hi[0].max(i), hi[1].max(j)];
+            }
+        }
+    }
+    if !any {
+        return Some([0.0, 0.0, 0.0, 0.0]);
+    }
+    // Refine each edge inside the grid cell beyond it.
+    let fine = 16;
+    let line = |fixed_u: Option<f32>, fixed_v: Option<f32>| (0..=n * 2).any(|k| {
+        let s = k as f32 / (n * 2) as f32;
+        cov(fixed_u.unwrap_or(s), fixed_v.unwrap_or(s))
+    });
+    let refine = |from: f32, to: f32, vertical: bool| {
+        // Walks from the hidden side `from` towards the known visible `to`.
+        for k in 0..=fine {
+            let x = from + (to - from) * k as f32 / fine as f32;
+            let hit = if vertical { line(Some(x), None) } else { line(None, Some(x)) };
+            if hit {
+                return x;
+            }
+        }
+        to
+    };
+    let cell = 1.0 / n as f32;
+    let u0 = if lo[0] == 0 { 0.0 } else { refine(at(lo[0]) - cell, at(lo[0]), true) };
+    let u1 = if hi[0] == n { 1.0 } else { refine(at(hi[0]) + cell, at(hi[0]), true) };
+    let v0 = if lo[1] == 0 { 0.0 } else { refine(at(lo[1]) - cell, at(lo[1]), false) };
+    let v1 = if hi[1] == n { 1.0 } else { refine(at(hi[1]) + cell, at(hi[1]), false) };
+    Some([u0, v0, u1.max(u0 + 1e-3), v1.max(v0 + 1e-3)])
+}
+
+/// Mask coverage at `p`. With `rgb` None, color range masks count as "could be
+/// anything": fully showing for Add / Intersect, not cutting for Subtract.
+fn coverage_impl(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base: Option<f32>, rgb: Option<[f32; 3]>) -> f32 {
     let usable: Vec<&Mask> = masks.iter().take(MAX_MASKS).filter(|m| m.kind != MaskKind::Shape || m.points.len() >= 3).collect();
     let Some(first) = usable.first() else { return base.unwrap_or(1.0) };
     let mut acc = base.unwrap_or(if first.mode == MaskMode::Add { 0.0 } else { 1.0 });
     for m in usable {
-        let (d, f) = match m.kind {
-            MaskKind::ColorRange => (color_distance(m, t, rgb), m.value(idx::SOFTNESS, t).max(1e-3)),
-            _ => (distance(m, t, size, p), m.value(idx::FEATHER, t).max(1.0)),
+        let mut c = match (m.kind, rgb) {
+            (MaskKind::ColorRange, None) => {
+                if m.mode == MaskMode::Subtract { 0.0 } else { 1.0 }
+            }
+            _ => {
+                let (d, f) = match (m.kind, rgb) {
+                    (MaskKind::ColorRange, Some(rgb)) => (color_distance(m, t, rgb), m.value(idx::SOFTNESS, t).max(1e-3)),
+                    _ => (distance(m, t, size, p), m.value(idx::FEATHER, t).max(1.0)),
+                };
+                let s = ((d + f * 0.5) / f).clamp(0.0, 1.0);
+                1.0 - s * s * (3.0 - 2.0 * s)
+            }
         };
-        let s = ((d + f * 0.5) / f).clamp(0.0, 1.0);
-        let mut c = 1.0 - s * s * (3.0 - 2.0 * s);
-        if m.invert {
+        if m.invert && !(m.kind == MaskKind::ColorRange && rgb.is_none()) {
             c = 1.0 - c;
         }
         let o = m.value(idx::OPACITY, t).clamp(0.0, 1.0);

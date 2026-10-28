@@ -8,7 +8,7 @@ use crate::core::tone::{self, ToneFrame};
 use std::path::PathBuf;
 use crate::core::matte::MatteFrame;
 use crate::core::content::{Content, EffectKind, TextParams};
-use crate::core::geometry::Quad;
+use crate::core::geometry::{EffectFrame, Quad};
 use crate::core::model::{Asset, AssetKind, BlendMode, Clip, Project};
 use crate::core::transition::{self, Edge, TrackShow, TransitionKind};
 use super::gpu::compositor::{DrawItem, EffectDraw, LayerDraw, Paint, TransitionDraw};
@@ -46,6 +46,9 @@ pub struct SceneLayer<'a> {
     pub tone: ToneFrame,
     /// LUT file and intensity (loaded and uploaded by preview / export).
     pub lut: Option<(PathBuf, f32)>,
+    /// The part its masks leave visible, in its own 0..1 space (only worked out when
+    /// it has effects of its own, which treat it as the picture).
+    pub region: Option<[f32; 4]>,
 }
 
 pub struct SceneEffect {
@@ -54,6 +57,8 @@ pub struct SceneEffect {
     pub opacity: f32,
     /// Limits the effect to an area of the frame.
     pub mask: MaskFrame,
+    /// What the effect treats as the picture (effect layers: their masks' area).
+    pub frame: Option<EffectFrame>,
 }
 
 /// Two clips (or one at a free edge) mixed by a transition.
@@ -129,10 +134,7 @@ pub fn layer_space(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngi
     let asset = project.asset(clip.asset)?;
     let frame = (project.width as f32, project.height as f32);
     match &clip.content {
-        Some(Content::Effect(_)) => {
-            let p = crate::core::geometry::Placement { cx: frame.0 / 2.0, cy: frame.1 / 2.0, width: frame.0, height: frame.1, pitch: 0.0, yaw: 0.0, roll: 0.0 };
-            Some((frame, crate::core::geometry::project(&p, frame.0, frame.1)))
-        }
+        Some(Content::Effect(_)) => Some((frame, full_quad(frame))),
         Some(Content::Text(tp)) => {
             let (_, base) = text_layout(clip, tp, t, engine, frame_scale);
             Some((base, project.quad_for(clip, t, base)))
@@ -143,6 +145,12 @@ pub fn layer_space(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngi
             Some((base, project.quad_for(clip, t, base)))
         }
     }
+}
+
+/// The whole project frame as a layer outline.
+pub fn full_quad(frame: (f32, f32)) -> Quad {
+    let p = crate::core::geometry::Placement { cx: frame.0 / 2.0, cy: frame.1 / 2.0, width: frame.0, height: frame.1, pitch: 0.0, yaw: 0.0, roll: 0.0 };
+    crate::core::geometry::project(&p, frame.0, frame.1)
 }
 
 /// Everything to draw at timeline time `t`, bottom first.
@@ -180,8 +188,10 @@ fn build<'a>(project: &'a Project, t: f64, source_t: f64, upto: usize, motion_bl
                             }
                             continue;
                         }
-                        let mask = mask::frame(&clip.masks, l, (project.width as f32, project.height as f32));
-                        items.push(SceneItem::Effect(SceneEffect { kind: e.kind, params, opacity, mask }));
+                        let canvas = (project.width as f32, project.height as f32);
+                        let mask = mask::frame(&clip.masks, l, canvas);
+                        let frame = mask::bounds(&clip.masks, l, canvas).map(|r| EffectFrame::new(&full_quad(canvas), r, canvas));
+                        items.push(SceneItem::Effect(SceneEffect { kind: e.kind, params, opacity, mask, frame }));
                         continue;
                     }
                     if let Some(layer) = layer_at(project, clip, asset, t, source_t, blend, engine, frame_scale) {
@@ -264,7 +274,10 @@ fn layer_at<'a>(
         (Some(m), ScenePaint::Media) if is_video(asset) => m.frame(l),
         _ => MatteFrame::NONE,
     };
+    let effects = clip_effects(clip, l);
+    let region = if effects.is_empty() { None } else { mask::bounds(&clip.masks, l, base) };
     Some(SceneLayer {
+        region,
         clip,
         asset,
         matte,
@@ -276,7 +289,7 @@ fn layer_at<'a>(
         mask: mask::frame(&clip.masks, l, base),
         source_time: clip.source_time(source_t),
         paint,
-        effects: clip_effects(clip, l),
+        effects,
         tone: clip.tone.frame(l),
         lut: clip.tone.lut.clone().map(|p| (p, clip.tone.values[tone::idx::LUT_INTENSITY as usize].eval(l).clamp(0.0, 1.0))),
     })
@@ -288,7 +301,7 @@ fn clip_effects(clip: &Clip, l: f64) -> Vec<SceneEffect> {
     clip.effects
         .iter()
         .filter(|e| e.enabled && e.effect.kind != EffectKind::MotionBlur)
-        .map(|e| SceneEffect { kind: e.effect.kind, params: [0, 1, 2, 3].map(|i| e.effect.p[i].eval(l)), opacity: e.mix.eval(l).clamp(0.0, 1.0), mask: MaskFrame::NONE })
+        .map(|e| SceneEffect { kind: e.effect.kind, params: [0, 1, 2, 3].map(|i| e.effect.p[i].eval(l)), opacity: e.mix.eval(l).clamp(0.0, 1.0), mask: MaskFrame::NONE, frame: None })
         .filter(|e| e.opacity > 0.0)
         .collect()
 }
@@ -356,6 +369,9 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
         if let Some((_, i)) = &l.lut {
             f(*i);
         }
+        if let Some(r) = &l.region {
+            r.iter().for_each(|v| f(*v));
+        }
         for e in &l.effects {
             f(e.kind.shader_id() as f32);
             e.params.iter().chain([&e.opacity]).for_each(|v| f(*v));
@@ -392,8 +408,8 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
 
 /// A layer's draw settings with the given paint (see `to_draws`).
 pub fn layer_draw(l: &SceneLayer, paint: Paint, seed: u32) -> LayerDraw {
-    let effects = l.effects.iter().map(|e| EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask }).collect();
-    LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend, effects, tone: l.tone, lut: None }
+    let effects = l.effects.iter().map(|e| EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: None }).collect();
+    LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend, effects, tone: l.tone, lut: None, region: l.region }
 }
 
 /// Converts the scene to GPU draw items. `layer` resolves each layer's picture
@@ -408,7 +424,7 @@ pub fn to_draws(items: &[SceneItem], seed: u32, layer: &mut dyn FnMut(&SceneLaye
                     out.push(DrawItem::Layer(d));
                 }
             }
-            SceneItem::Effect(e) => out.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask })),
+            SceneItem::Effect(e) => out.push(DrawItem::Effect(EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask, frame: e.frame })),
             SceneItem::Transition(tr) => {
                 let from = tr.from.as_ref().and_then(&mut *layer);
                 let to = tr.to.as_ref().and_then(&mut *layer);

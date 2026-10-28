@@ -103,6 +103,9 @@ impl EditorApp {
             window_title: String::new(),
         };
         app.preview.text.warm_up();
+        if let Some(rs) = cc.wgpu_render_state.as_ref() {
+            app.export.gpu = rs.adapter.get_info().name;
+        }
         // Check for hardware encoders without blocking startup.
         {
             let enc = app.encoders.clone();

@@ -139,6 +139,92 @@ impl Homography {
     }
 }
 
+/// Inverse of a 3x3 matrix (None if it's singular).
+fn invert3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det.abs() < 1e-18 {
+        return None;
+    }
+    let c = [
+        [m[1][1] * m[2][2] - m[1][2] * m[2][1], m[0][2] * m[2][1] - m[0][1] * m[2][2], m[0][1] * m[1][2] - m[0][2] * m[1][1]],
+        [m[1][2] * m[2][0] - m[1][0] * m[2][2], m[0][0] * m[2][2] - m[0][2] * m[2][0], m[0][2] * m[1][0] - m[0][0] * m[1][2]],
+        [m[1][0] * m[2][1] - m[1][1] * m[2][0], m[0][1] * m[2][0] - m[0][0] * m[2][1], m[0][0] * m[1][1] - m[0][1] * m[1][0]],
+    ];
+    Some(c.map(|r| r.map(|v| v / det)))
+}
+
+fn mul3(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    r
+}
+
+/// The area an effect treats as "the picture": a clip's visible part (inside its
+/// masks and AI cut-out), following the clip's position, scale and 3D rotation.
+/// Vignettes darken towards its edges, distortions and radial blurs center on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectFrame {
+    /// Project frame (u, v in 0..1) -> effect frame (0..1), projective.
+    pub to_frame: [[f32; 3]; 3],
+    /// Effect frame -> project frame.
+    pub from_frame: [[f32; 3]; 3],
+    /// Width and height of the effect frame in project pixels.
+    pub size: [f32; 2],
+}
+
+impl EffectFrame {
+    /// The whole project frame.
+    pub fn full(canvas: (f32, f32)) -> Self {
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        Self { to_frame: id, from_frame: id, size: [canvas.0, canvas.1] }
+    }
+
+    /// The part `rect` (u0, v0, u1, v1 in the layer's own 0..1 space) of a layer drawn
+    /// at `quad`, in a project of `canvas` pixels.
+    pub fn new(quad: &Quad, rect: [f32; 4], canvas: (f32, f32)) -> Self {
+        let rect = [rect[0].clamp(0.0, 1.0), rect[1].clamp(0.0, 1.0), rect[2].clamp(0.0, 1.0), rect[3].clamp(0.0, 1.0)];
+        let (du, dv) = ((rect[2] - rect[0]).max(1e-4) as f64, (rect[3] - rect[1]).max(1e-4) as f64);
+        let a = [[du, 0.0, rect[0] as f64], [0.0, dv, rect[1] as f64], [0.0, 0.0, 1.0]];
+        let s = [[1.0 / canvas.0.max(1.0) as f64, 0.0, 0.0], [0.0, 1.0 / canvas.1.max(1.0) as f64, 0.0], [0.0, 0.0, 1.0]];
+        let h = quad.homography();
+        let from = mul3(s, mul3(h.m, a));
+        let Some(to) = invert3(from) else { return Self::full(canvas) };
+        let sub = Homography { m: mul3(h.m, a) };
+        let d = |p: [f32; 2], q: [f32; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+        let (c00, c10, c11, c01) = (sub.map(0.0, 0.0), sub.map(1.0, 0.0), sub.map(1.0, 1.0), sub.map(0.0, 1.0));
+        let size = [(d(c00, c10) + d(c01, c11)) / 2.0, (d(c00, c01) + d(c10, c11)) / 2.0];
+        let f = |m: [[f64; 3]; 3]| m.map(|r| r.map(|v| v as f32));
+        Self { to_frame: f(to), from_frame: f(from), size: [size[0].max(1.0), size[1].max(1.0)] }
+    }
+
+    /// Project frame (0..1) -> effect frame (0..1).
+    #[cfg(test)]
+    pub fn to_local(&self, u: f32, v: f32) -> [f32; 2] {
+        let m = &self.to_frame;
+        let w = m[2][0] * u + m[2][1] * v + m[2][2];
+        [(m[0][0] * u + m[0][1] * v + m[0][2]) / w, (m[1][0] * u + m[1][1] * v + m[1][2]) / w]
+    }
+}
+
+/// Intersection of two rectangles (u0, v0, u1, v1); None if they don't overlap.
+pub fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
+    let r = [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])];
+    (r[2] > r[0] && r[3] > r[1]).then_some(r)
+}
+
+/// Smallest rectangle around both.
+pub fn union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// The whole layer, as a rectangle in its own 0..1 space.
+pub const FULL_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -159,6 +245,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn effect_frame_maps_its_rect_to_unit() {
+        let q = project(&place(0.0, 30.0, 10.0), 1920.0, 1080.0);
+        let f = EffectFrame::new(&q, [0.25, 0.5, 0.75, 1.0], (1920.0, 1080.0));
+        let h = q.homography();
+        // The rect's top-left in layer space is the effect frame's (0, 0).
+        let p = h.map(0.25, 0.5);
+        let l = f.to_local(p[0] / 1920.0, p[1] / 1080.0);
+        assert!(l[0].abs() < 1e-3 && l[1].abs() < 1e-3, "{l:?}");
+        let p = h.map(0.75, 1.0);
+        let l = f.to_local(p[0] / 1920.0, p[1] / 1080.0);
+        assert!((l[0] - 1.0).abs() < 1e-3 && (l[1] - 1.0).abs() < 1e-3, "{l:?}");
+        // Half of a 400 px wide layer is about 200 px (less with the yaw).
+        assert!(f.size[0] > 150.0 && f.size[0] < 205.0, "{:?}", f.size);
+        let full = EffectFrame::new(&project(&Placement { cx: 960.0, cy: 540.0, width: 1920.0, height: 1080.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, 1920.0, 1080.0), FULL_RECT, (1920.0, 1080.0));
+        assert!((full.to_local(0.3, 0.6)[0] - 0.3).abs() < 1e-5);
+    }
 
     fn place(pitch: f32, yaw: f32, roll: f32) -> Placement {
         Placement { cx: 960.0, cy: 540.0, width: 400.0, height: 200.0, pitch, yaw, roll }

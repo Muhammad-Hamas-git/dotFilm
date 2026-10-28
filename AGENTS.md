@@ -55,7 +55,13 @@ Read README.md first for the folder layout.
   edits masks through `Quad::homography`, the same projective map the GPU uses. `MaskKind::ColorRange`
   isn't a shape: it reuses the value slots (see `mask::idx` aliases) and keys on the clip's own source color
   (on effect layers, the backdrop); `mask::coverage_full` is its CPU twin.
-- Markers (`project.markers`, `core/marker.rs`) are part of undo snapshots. Timeline snapping includes them.
+- Markers (`project.markers`) and the beat grid (`project.beat_grid`, an endless `BeatGrid`, never stored
+  as single markers) live in `core/marker.rs` and are part of undo snapshots. Timeline snapping includes them.
+- Effects get an `EffectFrame` (core/geometry.rs): the area they treat as the picture. For a clip's own
+  effects the compositor builds it from the clip's quad, its mask bounds (`LayerDraw::region`, from
+  `mask::bounds`) and the AI matte's bounds (found on upload). Shaders reach it through `to_frame` /
+  `from_frame` / `frame_px`; any effect with a center or edges must use those, not the raw frame uv.
+- Export renders at `ExportSettings` size and fps (the compositor's canvas stays the project size).
 - The timeline's keyframe table (`ui/keyframes.rs`) lists every animated `Param` of the selected clip from
   `Clip::params()`; anything that edits keys on the timeline must use `params()`, not `Param::ALL`.
 - The asset preview (`app.source`) is a separate one-clip `Project` rendered by the same preview renderer.

@@ -602,6 +602,9 @@ pub struct Project {
     /// Timeline markers, sorted by time (see core/marker.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Marker>,
+    /// Beat markers (see core/marker.rs).
+    #[serde(default)]
+    pub beat_grid: Option<super::marker::BeatGrid>,
 }
 
 /// Shortest clip you can trim to, seconds.
@@ -624,6 +627,7 @@ impl Default for Project {
             clips: Vec::new(),
             next_id: 1,
             markers: Vec::new(),
+            beat_grid: None,
         }
     }
 }
@@ -933,6 +937,8 @@ impl Project {
             // Version 3 centered cut transitions on touching clips; now clips overlap (CapCut style).
             super::transition::upgrade_centered_cuts(self);
         }
+        // Beat markers used to be single markers; they're a grid now.
+        self.markers.retain(|m| !m.beat);
         self.version = PROJECT_VERSION;
     }
 }

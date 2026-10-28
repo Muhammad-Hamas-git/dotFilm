@@ -25,6 +25,9 @@ const PREROLL: f64 = 1.0;
 const IMAGE_MAX_SIDE: u32 = 4096;
 /// Audio bitrate for AAC.
 const AUDIO_BITRATE: &str = "192k";
+/// Frames rendered ahead while the encoder catches up (GPU and encoder work at
+/// the same time instead of taking turns).
+const FRAMES_AHEAD: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoder {
@@ -72,6 +75,10 @@ pub enum Speed {
 #[derive(Clone, Debug)]
 pub struct ExportSettings {
     pub path: PathBuf,
+    /// Output size and frame rate (can differ from the project's).
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
     pub encoder: Encoder,
     pub rate: RateControl,
     pub speed: Speed,
@@ -194,7 +201,9 @@ pub fn run(
     if total <= 0.0 {
         return Err("The timeline is empty.".into());
     }
-    let (w, h, fps) = (project.width, project.height, project.fps.max(1));
+    let (w, h, fps) = (settings.width.max(2), settings.height.max(2), settings.fps.max(1));
+    // Output size / project size: text and video are prepared at the size they end up.
+    let frame_scale = (w as f32 / project.width.max(1) as f32).max(h as f32 / project.height.max(1) as f32);
     let frames = (total * fps as f64).ceil() as u64;
 
     // Audio first, into a temporary WAV.
@@ -205,6 +214,7 @@ pub fn run(
     let g = gpu::headless()?;
     let gpu_name = g.adapter_name.clone();
     let mut comp = Compositor::new(g.device, g.queue, w, h);
+    comp.set_canvas(project.width as f32, project.height as f32);
     let even = w % 2 == 0 && h % 2 == 0;
 
     // Encoder process reading raw frames from stdin.
@@ -231,7 +241,19 @@ pub fn run(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Can't start ffmpeg: {e}"))?;
-    let mut stdin = enc.stdin.take().unwrap();
+    // Frames go to the encoder from their own thread, so the GPU renders the next
+    // frames while ffmpeg encodes.
+    let stdin = enc.stdin.take().unwrap();
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(FRAMES_AHEAD);
+    let writer = std::thread::spawn(move || {
+        let mut stdin = stdin;
+        for data in frame_rx {
+            if stdin.write_all(&data).is_err() {
+                return false;
+            }
+        }
+        true
+    });
     let errors = Arc::new(Mutex::new(String::new()));
     {
         let errors = errors.clone();
@@ -276,7 +298,7 @@ pub fn run(
                 continue;
             }
             let Some(asset) = project.asset(clip.asset).filter(|a| a.kind == AssetKind::Video) else { continue };
-            let (dw, dh) = scene::decode_size(project, asset, clip, 1.0, (asset.width.max(2), asset.height.max(2)));
+            let (dw, dh) = scene::decode_size(project, asset, clip, frame_scale, (asset.width.max(2), asset.height.max(2)));
             let rate = clip.decode_rate(fps);
             let from = clip.source_time(first).max(0.0);
             let s = SequentialStream::open(&asset.path, from, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
@@ -289,7 +311,7 @@ pub fn run(
             }
         }
 
-        let items = scene::items_at(project, t, &mut text_engine, 1.0);
+        let items = scene::items_at(project, t, &mut text_engine, frame_scale);
         let seed = scene::frame_seed(project, t);
         let mut error: Option<String> = None;
         let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
@@ -365,19 +387,22 @@ pub fn run(
 
         comp.render(&draws);
         let data = if even { comp.read_yuv420().unwrap() } else { comp.read_rgba() };
-        if stdin.write_all(&data).is_err() {
+        if frame_tx.send(data).is_err() {
             return Err(fail("The encoder stopped unexpectedly.".into(), &mut enc));
         }
 
         let done = (i + 1) as f32 / frames as f32;
         let speed = (i + 1) as f32 / started.elapsed().as_secs_f32().max(1e-3);
         if !progress(done, speed) {
-            drop(stdin);
+            drop(frame_tx);
             return Err(fail("Cancelled".into(), &mut enc));
         }
     }
 
-    drop(stdin);
+    drop(frame_tx);
+    if !writer.join().unwrap_or(false) {
+        return Err(fail("The encoder stopped unexpectedly.".into(), &mut enc));
+    }
     let status = enc.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -519,7 +544,12 @@ mod tests {
     }
 
     fn settings(path: PathBuf) -> ExportSettings {
-        ExportSettings { path, encoder: Encoder::X264, rate: RateControl::Quality(12), speed: Speed::Fast }
+        ExportSettings { path, width: 0, height: 0, fps: 0, encoder: Encoder::X264, rate: RateControl::Quality(12), speed: Speed::Fast }
+    }
+
+    /// Settings at the project's own size and frame rate.
+    fn settings_for(p: &Project, path: PathBuf) -> ExportSettings {
+        ExportSettings { width: p.width, height: p.height, fps: p.fps, ..settings(path) }
     }
 
     #[test]
@@ -548,7 +578,7 @@ mod tests {
         clip.opacity.insert(Key { t: 2.0, v: 1.0, ease: Ease::Linear });
 
         let out = dir.join("out.mp4");
-        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        run(&p, &HashMap::new(), &settings_for(&p, out.clone()), |_, _| true).unwrap();
 
         let (d, h, w) = probe_size(&out);
         assert!((d - 3.0).abs() < 0.1, "duration {d}");
@@ -601,7 +631,7 @@ mod tests {
         let a = add_asset(&mut p, &src, 1.0, 640, 360, false);
         p.add_clip(a, 0, 0.0).unwrap();
         let out = dir.join("passthrough.mp4");
-        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        run(&p, &HashMap::new(), &settings_for(&p, out.clone()), |_, _| true).unwrap();
         let tags = ffmpeg::command("ffprobe")
             .args(["-v", "error", "-show_entries", "stream=pix_fmt,color_range,color_space", "-of", "csv=p=0"])
             .arg(&out)
@@ -636,13 +666,44 @@ mod tests {
         clip.speed.value = 2.0;
         clip.duration = 2.0;
         let out = dir.join("speed.mp4");
-        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        run(&p, &HashMap::new(), &settings_for(&p, out.clone()), |_, _| true).unwrap();
         let (d, _, _) = probe_size(&out);
         assert!((d - 2.0).abs() < 0.1, "duration {d}");
         let early = pixel_at(&out, 0.5, 160, 90);
         let late = pixel_at(&out, 1.4, 160, 90);
         assert!(early[0] > 200 && early[2] < 60, "0.5s should be red: {early:?}");
         assert!(late[2] > 200 && late[0] < 60, "1.4s should be blue (source 2.8s): {late:?}");
+    }
+
+    #[test]
+    fn export_size_and_fps_differ_from_project() {
+        if !ffmpeg::available() || crate::engine::gpu::tests::gpu().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("dotfilm_export_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("resize_src.mp4");
+        color_video(&src, "0xFF0000", 2, 640, 360, None);
+        let mut p = Project::default();
+        p.set_resolution(640, 360);
+        p.fps = 60;
+        let a = add_asset(&mut p, &src, 2.0, 640, 360, false);
+        let c = p.add_clip(a, 0, 0.0).unwrap();
+        // Left half only, so the picture's layout must survive the resize.
+        p.clip_mut(c).unwrap().transform.scale.value = 0.5;
+        let out = dir.join("resized.mp4");
+        run(&p, &HashMap::new(), &ExportSettings { width: 320, height: 180, fps: 15, ..settings(out.clone()) }, |_, _| true).unwrap();
+        let (d, h, w) = probe_size(&out);
+        assert_eq!((w, h), (320, 180));
+        assert!((d - 2.0).abs() < 0.2, "duration {d}");
+        let rate = ffmpeg::command("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&rate.stdout).trim(), "15/1");
+        assert!(pixel_at(&out, 1.0, 160, 90)[0] > 200, "center is the red clip");
+        assert!(pixel_at(&out, 1.0, 10, 10)[0] < 40, "corner is outside the half-size clip");
     }
 
     #[test]
@@ -660,7 +721,7 @@ mod tests {
         let a = add_asset(&mut p, &src, 2.0, 320, 240, false);
         p.add_clip(a, 0, 0.0).unwrap();
         let out = dir.join("odd.mp4");
-        run(&p, &HashMap::new(), &settings(out.clone()), |_, _| true).unwrap();
+        run(&p, &HashMap::new(), &settings_for(&p, out.clone()), |_, _| true).unwrap();
         let (d, h, w) = probe_size(&out);
         assert_eq!((w, h), (322, 242));
         assert!((d - 2.0).abs() < 0.4, "duration {d}");
@@ -676,6 +737,9 @@ mod manual {
         let p = crate::core::model::Project::load(std::env::var("DOTFILM_PROJECT").unwrap().as_ref()).unwrap();
         let s = super::ExportSettings {
             path: std::env::var("DOTFILM_OUT").unwrap().into(),
+            width: p.width,
+            height: p.height,
+            fps: p.fps,
             encoder: super::Encoder::X264,
             rate: super::RateControl::Quality(16),
             speed: super::Speed::Fast,

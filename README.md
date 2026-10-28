@@ -31,7 +31,10 @@ A desktop video editor written in Rust, rendered on the GPU.
   what's below.
 - **Per-clip effects**: any effect (except motion blur) can be added to one clip in its **Effects** section.
   It changes only that clip, with a Mix amount, on/off switch and order. Effect layers on the timeline
-  still change every track below them.
+  still change every track below them. When the clip has masks or a removed background, its effects treat
+  the visible part as the picture: a vignette darkens towards the mask's edges, radial blurs and distortions
+  center on it, and it all follows the clip's position, scale and 3D rotation. Masks on an effect layer do
+  the same for that effect.
 - **Frame rate per clip**: tick **Own** next to Frame rate in Timing to play a clip at e.g. 12 fps for a
   choppy, stop-motion look. Keyframed movement steps at that rate too.
 - **Levels, shadows / highlights, curves**: input and output black / white points and gamma; shadows and
@@ -69,14 +72,17 @@ A desktop video editor written in Rust, rendered on the GPU.
   screen, overlay, soft light, difference, hue, color, luminosity...), drag/trim/split clips, snapping, zoom,
   hide/mute tracks, keyframe diamonds you can drag, click or right-click.
 - **Markers**: press M (or the Marker button) to drop a marker at the playhead. Drag them on the ruler,
-  click to jump, right-click to name, color or delete. **Markers > Beat markers from BPM** fills the timeline
-  with beat (or bar) ticks from the playhead on. Clips snap to markers and beats.
+  click to jump, double-click to type an exact time (e.g. 4.35 s), right-click to name, color or delete.
+  **Markers > Beat markers from BPM** lays an endless beat (or bar) grid from a start time on; it stays
+  in place. Clips and the playhead snap to clip edges, markers and beats while Snap is on.
 - **Keyframe table**: the **Keyframes** button swaps the tracks for the selected clip's animated values,
   one row each. Drag keys sideways to retime, and edit the curve of the chosen row in the graph below:
   drag points up and down for the value, and the white handles for bezier easing.
 - **Project**: any resolution up to 8192 x 8192 and any frame rate from 1 to 240 fps.
-- **Export**: MP4 rendered by the same GPU code as the preview. Constant quality or target bitrate.
-  Uses your GPU's video encoder (NVIDIA, AMD, Intel) when available.
+- **Export**: MP4 rendered by the same GPU code as the preview, at the project's size and frame rate or
+  any other (e.g. edit at 1080p 60 fps, export 480p 15 fps). Constant quality or target bitrate. Renders on
+  the dedicated graphics card and uses its video encoder (NVIDIA, AMD, Intel) when ffmpeg has one; the
+  dialog says which GPU and encoder are used.
 - Undo/redo, save/open projects (`.dotfilm` files; old `.cutroom` files still open).
 
 ## Setup on Windows (one time)
@@ -225,7 +231,10 @@ Example: a new animatable parameter "blur radius".
 | Timeline track height, snap distance, zoom, colors | top of `ui/timeline.rs` |
 | Easing editor size and range | `CURVE_SIZE`, `CURVE_Y` in `ui/inspector.rs` |
 | Player handle size, center snap | top of `ui/player.rs` |
-| Export defaults (quality, bitrate) | top of `ui/export_dialog.rs` |
+| Export defaults (quality, bitrate), resolution and frame rate presets | top of `ui/export_dialog.rs` |
+| Frames rendered ahead of the encoder | `FRAMES_AHEAD` in `engine/export.rs` |
+| Which GPU renders | automatic (dedicated card first, `pick_adapter` in `engine/gpu/mod.rs`); set `DOTFILM_GPU=nvidia` (part of the name) to force one |
+| Mask bounds precision for clip effects | `BOUNDS_GRID`, `BOUNDS_THRESHOLD` in `core/mask.rs`, `MATTE_BOUNDS_THRESHOLD` in `engine/gpu/compositor.rs` |
 | Hardware decoding on export, audio bitrate | top of `engine/export.rs` |
 | Resolution / fps presets | `RESOLUTIONS` and `FRAME_RATES` in `ui/inspector.rs` |
 | Undo steps | `MAX_UNDO` in `core/history.rs` |
@@ -259,7 +268,7 @@ Example: a new animatable parameter "blur radius".
 | Color range mask: how wide hue range 1.0 is | `HUE_SPAN` in `core/mask.rs` and `MASK_HUE_SPAN` in `gpu/shaders.wgsl` (keep in step) |
 | Player zoom limits and Ctrl+wheel speed | `ZOOM_RANGE`, `ZOOM_STEP` in `ui/player.rs` |
 | Marker colors | `COLORS` in `core/marker.rs` |
-| Marker grab distance, most beat markers at once | `GRAB_PX`, `MAX_BEATS` in `ui/markers.rs` |
+| Marker grab distance, beat tick spacing, marker time precision | `GRAB_PX`, `MIN_BEAT_PX`, `TIME_DECIMALS` in `ui/markers.rs` |
 | Keyframe table row height, table vs graph split, key size, snapping | `ROW_H`, `ROWS_SHARE`, `KEY_R`, `SNAP_PX` in `ui/keyframes.rs` |
 
 ## Known limits

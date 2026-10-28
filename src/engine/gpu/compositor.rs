@@ -2,7 +2,7 @@
 //! The preview uses it at preview resolution; export uses it at full resolution.
 
 use super::wgpu;
-use crate::core::geometry::Quad;
+use crate::core::geometry::{self, EffectFrame, Quad};
 use crate::core::grade::GradeFrame;
 use crate::core::mask::MaskFrame;
 use crate::core::tone::{Lut3D, ToneFrame};
@@ -88,6 +88,8 @@ struct Source {
     height: u32,
     textures: Vec<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
+    /// Mattes: where the subject is (u0, v0, u1, v1 in 0..1); None if nowhere.
+    bounds: Option<[f32; 4]>,
 }
 
 /// What fills a layer.
@@ -113,6 +115,9 @@ pub struct EffectDraw {
     pub seed: u32,
     /// Limits the effect to an area of the frame (project pixels).
     pub mask: MaskFrame,
+    /// What the effect treats as the picture (vignette edges, distortion centers).
+    /// None = the whole frame. A clip's own effects get theirs from the clip.
+    pub frame: Option<EffectFrame>,
 }
 
 /// Two clips (or one, at a free edge) mixed by a transition, then put on the stack
@@ -188,6 +193,7 @@ impl LayerDraw {
             hash_f32s(self.tone.table.iter().flatten(), h);
         }
         self.lut.map(|(k, i)| (k, i.to_bits())).hash(h);
+        self.region.map(|r| r.map(f32::to_bits)).hash(h);
         self.effects.len().hash(h);
         for e in &self.effects {
             (e.kind, e.seed).hash(h);
@@ -209,6 +215,9 @@ impl DrawItem {
                 (1u8, e.kind, e.seed).hash(h);
                 hash_f32s(e.params.iter().chain([&e.opacity]), h);
                 hash_mask(&e.mask, h);
+                if let Some(f) = &e.frame {
+                    hash_f32s(f.to_frame.iter().flatten().chain(f.size.iter()), h);
+                }
             }
             DrawItem::Transition(t) => {
                 (2u8, t.kind, t.edge, t.blend).hash(h);
@@ -261,6 +270,25 @@ enum Op {
     SumResolve { slot: u32 },
 }
 
+/// Matte values above this count as subject when finding its bounds (0..255).
+const MATTE_BOUNDS_THRESHOLD: u8 = 24;
+
+/// Where an 8-bit matte shows the subject, as (u0, v0, u1, v1) in 0..1.
+fn matte_bounds(w: u32, h: u32, data: &[u8]) -> Option<[f32; 4]> {
+    let (w, h) = (w as usize, h as usize);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for y in 0..h {
+        let row = &data[y * w..(y + 1) * w];
+        let Some(first) = row.iter().position(|v| *v > MATTE_BOUNDS_THRESHOLD) else { continue };
+        let last = row.iter().rposition(|v| *v > MATTE_BOUNDS_THRESHOLD).unwrap_or(first);
+        x0 = x0.min(first);
+        x1 = x1.max(last + 1);
+        y0 = y0.min(y);
+        y1 = y + 1;
+    }
+    (x1 > x0).then(|| [x0 as f32 / w as f32, y0 as f32 / h as f32, x1 as f32 / w as f32, y1 as f32 / h as f32])
+}
+
 /// Format of cleaned-up mattes (16-bit float keeps feathered edges smooth).
 const MATTE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
@@ -310,6 +338,9 @@ pub struct LayerDraw {
     pub tone: ToneFrame,
     /// An uploaded LUT (see `upload_lut`) and its intensity.
     pub lut: Option<(u64, f32)>,
+    /// The part its masks leave visible (u0, v0, u1, v1 in its own 0..1 space), which
+    /// its own effects treat as the picture. None = all of it.
+    pub region: Option<[f32; 4]>,
 }
 
 /// An uploaded 3D LUT.
@@ -874,7 +905,7 @@ impl Compositor {
                     ],
                 })
             };
-            self.sources.insert(key, Source { kind, generation: 0, yuv: [[0.0; 4]; 3], width: w, height: h, textures, bind_group });
+            self.sources.insert(key, Source { kind, generation: 0, yuv: [[0.0; 4]; 3], width: w, height: h, textures, bind_group, bounds: None });
         }
         &self.sources[&key]
     }
@@ -915,8 +946,10 @@ impl Compositor {
         let tex = self.sources[&key].textures[0].clone();
         self.write_plane(&tex, w, h, 1, &data[..(w * h) as usize]);
         self.uploads += 1;
+        let bounds = matte_bounds(w, h, data);
         if let Some(s) = self.sources.get_mut(&key) {
             s.generation = self.uploads;
+            s.bounds = bounds;
         }
     }
 
@@ -1045,6 +1078,24 @@ impl Compositor {
         self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k)) && l.matte_src.is_none_or(|k| self.sources.contains_key(&k))
     }
 
+    /// The part of a layer that shows (masks and AI cut-out), in its own 0..1 space.
+    fn visible_rect(&self, l: &LayerDraw) -> [f32; 4] {
+        let masks = l.region.unwrap_or(geometry::FULL_RECT);
+        let matte = self.layer_matte(l).filter(|_| l.matte.mode < 1.5).and_then(|k| self.sources.get(&k)).map(|s| s.bounds);
+        let rect = match matte {
+            None => Some(masks),
+            // Masks bring the background back: the union of both.
+            Some(m) if l.matte.restore => match (m, l.region) {
+                (Some(m), Some(r)) => Some(geometry::union(m, r)),
+                (m, None) => m.or(Some(masks)),
+                (None, Some(r)) => Some(r),
+            },
+            // Masks cut the subject out further: where both show.
+            Some(m) => m.and_then(|m| geometry::intersect(m, masks)),
+        };
+        rect.filter(|r| r[2] > r[0] && r[3] > r[1]).unwrap_or(geometry::FULL_RECT)
+    }
+
     /// The matte a layer uses, if it has one and it's switched on.
     fn layer_matte(&self, l: &LayerDraw) -> Option<SourceKey> {
         l.matte_src.filter(|_| l.matte.is_on())
@@ -1115,7 +1166,7 @@ impl Compositor {
     }
 
     fn uniform_for_transition(&self, t: &TransitionDraw) -> LayerUniform {
-        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0, mask: MaskFrame::NONE });
+        let mut u = self.uniform_for_effect(&EffectDraw { kind: t.kind, params: [t.angle_deg.to_radians(), t.softness, t.edge as f32, 0.0], opacity: t.progress, seed: 0, mask: MaskFrame::NONE, frame: None });
         u.blend = t.blend.shader_id();
         u
     }
@@ -1126,10 +1177,20 @@ impl Compositor {
         extra[0] = e.params;
         // Effect sizes are in project pixels; scale them to this output.
         extra[1] = [ow as f32 / self.canvas.0, e.seed as f32, ow as f32, oh as f32];
+        // The effect's own frame: [0..3] frame <- project frame, [3..6] the way back,
+        // [6] its size in project pixels.
+        let frame = e.frame.unwrap_or_else(|| EffectFrame::full(self.canvas));
+        let mut stages = [[0.0; 4]; 12];
+        for r in 0..3 {
+            let (a, b) = (frame.to_frame[r], frame.from_frame[r]);
+            stages[r] = [a[0], a[1], a[2], 0.0];
+            stages[3 + r] = [b[0], b[1], b[2], 0.0];
+        }
+        stages[6] = [frame.size[0], frame.size[1], 0.0, 0.0];
         LayerUniform {
             pos: [[0.0; 4]; 4],
             yuv: [[0.0; 4]; 3],
-            stages: [[0.0; 4]; 12],
+            stages,
             extra,
             grade: [[0.0; 4]; 12],
             stage_count: 0,
@@ -1157,13 +1218,14 @@ impl Compositor {
         u.push(v);
         let slot = (u.len() - 1) as u32;
         let mut effects = Vec::new();
+        let frame = (!l.effects.is_empty()).then(|| EffectFrame::new(&l.quad, self.visible_rect(l), self.canvas));
         for e in &l.effects {
-            u.push(self.uniform_for_effect(e));
+            u.push(self.uniform_for_effect(&EffectDraw { frame, ..e.clone() }));
             effects.push(((u.len() - 1) as u32, e.kind == BLUR_ID || e.kind == BLOOM_ID));
         }
         let mut copy = 0;
         if !effects.is_empty() {
-            let mut c = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: 1.0, seed: 0, mask: MaskFrame::NONE });
+            let mut c = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None });
             // The copy pass uses the track's blend mode when the result goes through `blend`.
             c.blend = v.blend;
             u.push(c);
@@ -1349,7 +1411,7 @@ impl Compositor {
                         continue;
                     }
                     let weight = 1.0 / lists.len() as f32;
-                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0, mask: MaskFrame::NONE });
+                    let mut w = self.uniform_for_effect(&EffectDraw { kind: 0, params: [0.0; 4], opacity: weight, seed: 0, mask: MaskFrame::NONE, frame: None });
                     let add = slot(u, w);
                     w.opacity = 1.0;
                     let copy = slot(u, w);

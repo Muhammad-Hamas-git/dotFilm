@@ -870,6 +870,27 @@ fn grain(pos: vec2<f32>, seed: u32, channel: u32, amount: f32) -> f32 {
     return mix(mix(a00, a10, s.x), mix(a01, a11, s.x), s.y);
 }
 
+// The effect's own frame (core::geometry::EffectFrame): the part of a clip that shows
+// (inside its masks and AI cut-out), or the area of an effect layer's masks.
+// stages[0..3] = project frame uv -> frame uv, stages[3..6] = back, stages[6].xy = its
+// size in project pixels.
+fn to_frame(uv: vec2<f32>) -> vec2<f32> {
+    let q = vec3(uv, 1.0);
+    let w = dot(L.stages[2].xyz, q);
+    return vec2(dot(L.stages[0].xyz, q), dot(L.stages[1].xyz, q)) / w;
+}
+
+fn from_frame(f: vec2<f32>) -> vec2<f32> {
+    let q = vec3(f, 1.0);
+    let w = dot(L.stages[5].xyz, q);
+    return vec2(dot(L.stages[3].xyz, q), dot(L.stages[4].xyz, q)) / w;
+}
+
+// Frame size in output pixels.
+fn frame_px() -> vec2<f32> {
+    return max(L.stages[6].xy * L.gen[1].x, vec2(1.0));
+}
+
 // Straight (not premultiplied) color of a premultiplied pixel.
 fn unpremul(c: vec4<f32>) -> vec3<f32> {
     return select(vec3(0.0), c.rgb / c.a, c.a > 1e-5);
@@ -890,10 +911,12 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     var res = o4;
     switch L.kind {
         case 1u: {
-            // Vignette: e = (amount, size, softness, roundness).
-            let aspect = size.x / size.y;
-            let frame_d = length((uv - 0.5) * 2.0) / sqrt(2.0);
-            let circle_d = length((uv - 0.5) * vec2(aspect, 1.0)) / length(vec2(aspect, 1.0) * 0.5);
+            // Vignette: e = (amount, size, softness, roundness), towards the frame's edges.
+            let fs = frame_px();
+            let aspect = fs.x / fs.y;
+            let f = to_frame(uv);
+            let frame_d = length((f - 0.5) * 2.0) / sqrt(2.0);
+            let circle_d = length((f - 0.5) * vec2(aspect, 1.0)) / length(vec2(aspect, 1.0) * 0.5);
             let d = mix(frame_d, circle_d, e.w);
             let v = smoothstep(e.y, e.y + e.z, d);
             var c = orig * (1.0 - e.x * v);
@@ -916,9 +939,12 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         }
         case 3u: {
             // Chromatic aberration: e = (amount px, angle deg, radial, _).
+            // Radial: outwards from the frame's center, in the frame's own space.
             let ang = radians(e.y);
-            let dir = mix(vec2(cos(ang), sin(ang)), (uv - 0.5) * 2.0, e.z);
-            let off = dir * e.x * k / size;
+            let lin_off = vec2(cos(ang), sin(ang)) * e.x * k / size;
+            let f = to_frame(uv);
+            let rad_off = from_frame(f + (f - 0.5) * 2.0 * e.x * k / frame_px()) - uv;
+            let off = mix(lin_off, rad_off, e.z);
             let r = textureSampleLevel(backdrop, lin, uv + off, 0.0);
             let b = textureSampleLevel(backdrop, lin, uv - off, 0.0);
             res = vec4(r.r, o4.g, b.b, max(a0, max(r.a, b.a)));
@@ -948,7 +974,7 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         case 6u, 7u: {
             // Radial (zoom) blur, or spin blur, around center e.yz (0..1 of the frame).
             // Radial: e.x = amount 0..1. Spin: e.x = total angle in degrees.
-            let c = e.yz;
+            let c = from_frame(e.yz);
             let dpx = (uv - c) * size;
             let jit = hash3(vec3(u32(p.x), u32(p.y), 29u));
             var sum = vec4(0.0);
@@ -968,9 +994,12 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         case 8u: {
             // Double exposure: a shifted, scaled copy screen-blended on top.
             // e = (offset x px, offset y px, zoom, amount).
+            // Zooms around the frame's center.
             let off = e.xy * k / size;
-            let uv2 = 0.5 + (uv - 0.5 - off) / max(e.z, 0.05);
-            if (all(uv2 >= vec2(0.0)) && all(uv2 <= vec2(1.0))) {
+            let c = from_frame(vec2(0.5));
+            let uv2 = c + (uv - c - off) / max(e.z, 0.05);
+            let f2 = to_frame(uv2);
+            if (all(f2 >= vec2(0.0)) && all(f2 <= vec2(1.0))) {
                 let ghost = clamp(textureSampleLevel(backdrop, lin, uv2, 0.0), vec4(0.0), vec4(1.0));
                 let base = clamp(o4, vec4(0.0), vec4(1.0));
                 // Screen works on premultiplied color and alpha alike.

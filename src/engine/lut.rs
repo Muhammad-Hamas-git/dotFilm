@@ -81,6 +81,7 @@ pub fn bake(comp: &Compositor, clip: &Clip, t: f64, lut: Option<(u64, &Lut3D)>, 
         effects: vec![],
         tone: clip.tone.frame(l),
         lut: lut.map(|(k, _)| (k, intensity)),
+        region: None,
     })]);
     let out = c.read_rgba();
     let mut data = Vec::with_capacity(n * n * n);

@@ -202,7 +202,8 @@ fn ruler(app: &mut EditorApp, ui: &mut Ui, rect: Rect, view: View) {
             if app.playing {
                 app.toggle_play();
             }
-            app.seek(view.t(pos.x).max(0.0));
+            let t = view.t(pos.x).max(0.0);
+            app.seek(playhead_snap(app, t, view.pps));
         }
     }
 
@@ -311,8 +312,18 @@ fn hit_test(app: &EditorApp, view: View, lanes: Rect, p: Pos2) -> Option<(ClipId
     None
 }
 
-/// Snaps `t` to nearby clip edges or the playhead. Returns the snapped time if close enough.
+/// Where the playhead lands when dragged to `t`: on a nearby clip edge, marker or
+/// beat while snapping is on.
+fn playhead_snap(app: &EditorApp, t: f64, pps: f32) -> f64 {
+    snap_points(app, t, None, pps, false).unwrap_or(t)
+}
+
+/// Snaps `t` to nearby clip edges, markers, beats or the playhead. Returns the snapped time if close enough.
 fn snap_target(app: &EditorApp, t: f64, ignore: Option<ClipId>, pps: f32) -> Option<f64> {
+    snap_points(app, t, ignore, pps, true)
+}
+
+fn snap_points(app: &EditorApp, t: f64, ignore: Option<ClipId>, pps: f32, to_playhead: bool) -> Option<f64> {
     if !app.timeline.snapping {
         return None;
     }
@@ -325,9 +336,14 @@ fn snap_target(app: &EditorApp, t: f64, ignore: Option<ClipId>, pps: f32) -> Opt
         }
     };
     consider(0.0);
-    consider(app.playhead);
+    if to_playhead {
+        consider(app.playhead);
+    }
     for m in &app.project.markers {
         consider(m.time);
+    }
+    if let Some(g) = &app.project.beat_grid {
+        consider(g.nearest(t));
     }
     for c in &app.project.clips {
         if Some(c.id) != ignore {
@@ -374,7 +390,8 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                     if app.playing {
                         app.toggle_play();
                     }
-                    app.seek(view.t(p.x).max(0.0));
+                    let t = view.t(p.x).max(0.0);
+                    app.seek(playhead_snap(app, t, view.pps));
                 }
                 (Some(id), kind) => drag_clip(app, id, kind, view, lanes, p),
                 _ => {}
@@ -518,7 +535,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
         }
     }
 
-    super::markers::lane_lines(app, &painter, lanes, &|t| view.x(t));
+    super::markers::lane_lines(app, &painter, lanes, &|t| view.x(t), &|x| view.t(x));
     draw_clips(app, ui, &painter, lanes, view);
 
     // Playhead line.

@@ -11,22 +11,53 @@ pub struct Gpu {
     pub adapter_name: String,
 }
 
-/// Creates a GPU device without a window. Prefers the real graphics card and
-/// falls back to the software renderer (WARP on Windows, lavapipe on Linux),
-/// which is slower but always works.
+/// Set this environment variable to part of a GPU's name to force that GPU
+/// (e.g. `DOTFILM_GPU=nvidia`). Otherwise the dedicated graphics card wins.
+pub const GPU_ENV: &str = "DOTFILM_GPU";
+
+/// Picks the GPU to render on: a dedicated card over integrated graphics over
+/// software, and DirectX 12 / Vulkan / Metal over OpenGL. Used for the preview
+/// window and for export, so both always run on the same card.
+pub fn pick_adapter(adapters: &[wgpu::Adapter]) -> Option<usize> {
+    let wanted = std::env::var(GPU_ENV).ok().map(|s| s.to_lowercase()).filter(|s| !s.is_empty());
+    let rank = |a: &wgpu::Adapter| {
+        let info = a.get_info();
+        let named = wanted.as_ref().is_some_and(|w| info.name.to_lowercase().contains(w.as_str()));
+        let kind = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu => 2,
+            wgpu::DeviceType::Other => 3,
+            wgpu::DeviceType::Cpu => 4,
+        };
+        let backend = match info.backend {
+            wgpu::Backend::Dx12 | wgpu::Backend::Vulkan | wgpu::Backend::Metal => 0,
+            _ => 1,
+        };
+        (!named, kind, backend)
+    };
+    (0..adapters.len()).min_by_key(|i| rank(&adapters[*i]))
+}
+
+/// Creates a GPU device without a window, on the GPU `pick_adapter` chooses. Falls
+/// back to the software renderer (WARP on Windows, lavapipe on Linux), which is
+/// slower but always works.
 pub fn headless() -> Result<Gpu, String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let mut adapter = None;
-    for fallback in [false, true] {
-        let opts = wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: fallback,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        };
-        if let Ok(a) = pollster::block_on(instance.request_adapter(&opts)) {
-            adapter = Some(a);
-            break;
+    let mut adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    let mut adapter = pick_adapter(&adapters).map(|i| adapters.swap_remove(i));
+    if adapter.is_none() {
+        for fallback in [false, true] {
+            let opts = wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: fallback,
+                compatible_surface: None,
+                apply_limit_buckets: false,
+            };
+            if let Ok(a) = pollster::block_on(instance.request_adapter(&opts)) {
+                adapter = Some(a);
+                break;
+            }
         }
     }
     let adapter = adapter.ok_or("No GPU adapter found")?;
@@ -78,11 +109,11 @@ pub mod tests {
     }
 
     fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> DrawItem {
-        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity, blend, effects: vec![], tone: ToneFrame::NONE, lut: None })
+        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity, blend, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })
     }
 
     fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
-        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed, mask: MaskFrame::NONE })
+        DrawItem::Effect(EffectDraw { kind, params, opacity: 1.0, seed, mask: MaskFrame::NONE, frame: None })
     }
 
     fn px(img: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
@@ -144,7 +175,7 @@ pub mod tests {
         let src = [180u8, 90, 40, 255];
         solid(&mut c, k, src);
         let adj = Adjustments { brightness: 0.05, contrast: 1.3, saturation: 1.4, hue: 35.0, value: 0.9 };
-        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None };
+        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None };
         c.render(&[DrawItem::Layer(d)]);
         let px = c.read_rgba();
         let mut cpu = Vec::new();
@@ -220,7 +251,7 @@ pub mod tests {
             angle_deg: 90.0,
             size: (w as f32, h as f32),
         };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })]);
         let img = c.read_rgba();
         let (l, m, r) = (px(&img, w, 1, 10), px(&img, w, 50, 10), px(&img, w, 98, 10));
         assert!(l[0] > 240 && l[2] < 15, "left {l:?}");
@@ -242,7 +273,7 @@ pub mod tests {
         let k = SourceKey::Clip(9);
         c.upload_rgba(k, 4, 4, &mask);
         let paint = Paint::Text { mask: k, fill: [1.0, 1.0, 0.0, 1.0], outline: [0.0, 0.0, 1.0, 1.0] };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })]);
         let img = c.read_rgba();
         assert!(close(&px(&img, 4, 0, 1), [255, 255, 0], 3), "fill {:?}", px(&img, 4, 0, 1));
         assert!(close(&px(&img, 4, 3, 1), [0, 0, 255], 3), "outline {:?}", px(&img, 4, 3, 1));
@@ -291,7 +322,7 @@ pub mod tests {
     fn graded(c: &mut Compositor, rgba: [u8; 4], grade: &crate::core::grade::Grade) -> [u8; 4] {
         let k = SourceKey::Asset(77);
         solid(c, k, rgba);
-        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })]);
         let px = c.read_rgba();
         let i = (4 * 8 + 4) * 4;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -357,7 +388,7 @@ pub mod tests {
             let q = full_frame(8.0, 8.0);
             c.render(&[
                 layer(bg, q, BlendMode::Normal, 1.0),
-                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }),
+                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None }),
             ]);
             px(&c.read_rgba(), 8, 4, 4)
         };
@@ -393,7 +424,7 @@ pub mod tests {
     }
 
     fn layer_draw(key: SourceKey, quad: geometry::Quad) -> LayerDraw {
-        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }
+        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None }
     }
 
     fn transition(from: Option<LayerDraw>, to: Option<LayerDraw>, kind: u32, progress: f32, angle_deg: f32, edge: u32) -> DrawItem {
@@ -495,7 +526,7 @@ pub mod tests {
         let base = [layer(black, q, BlendMode::Normal, 1.0), layer(white, square, BlendMode::Normal, 1.0)];
         let run = |c: &mut Compositor, extra: Option<DrawItem>| {
             let mut items: Vec<DrawItem> = base.iter().map(|d| match d {
-                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }),
+                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None }),
                 _ => unreachable!(),
             }).collect();
             items.extend(extra);
@@ -571,7 +602,7 @@ pub mod tests {
         let masks = vec![rect, ell, tri];
 
         let frame = mask::frame(&masks, 0.0, size);
-        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(white), grade: NO_GRADE, mask: frame, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(white), grade: NO_GRADE, mask: frame, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None, region: None })]);
         let img = c.read_rgba();
         let mut worst = 0.0f32;
         for y in (0..h).step_by(3) {
@@ -593,7 +624,7 @@ pub mod tests {
         left.values[idx::FEATHER as usize] = Anim::new(0.0);
         let gray = SourceKey::Asset(2);
         solid(&mut c, gray, [128, 128, 128, 255]);
-        let vignette = DrawItem::Effect(EffectDraw { kind: 1, params: [-1.0, 0.0, 0.01, 0.0], opacity: 1.0, seed: 0, mask: mask::frame(&[left], 0.0, size) });
+        let vignette = DrawItem::Effect(EffectDraw { kind: 1, params: [-1.0, 0.0, 0.01, 0.0], opacity: 1.0, seed: 0, mask: mask::frame(&[left], 0.0, size), frame: None });
         c.render(&[layer(gray, q, BlendMode::Normal, 1.0), vignette]);
         let img = c.read_rgba();
         assert!(px(&img, w, 8, 32)[0] > 200, "effect applies on the left {:?}", px(&img, w, 8, 32));
@@ -641,6 +672,7 @@ pub mod tests {
                 effects: vec![],
                 tone: ToneFrame::NONE,
                 lut: None,
+                region: None,
             })]);
             c.read_rgba()
         };
@@ -684,6 +716,7 @@ pub mod tests {
             effects: vec![],
             tone: ToneFrame::NONE,
             lut: None,
+            region: None,
         })]);
         compare(&c.read_rgba(), &cpu(1.5, 0.0, 0.0), "layer px to matte px");
         // Inverted keeps the background.
@@ -721,6 +754,8 @@ pub mod tests {
 
     #[test]
     fn clip_effects_apply_to_that_clip_only() {
+        use crate::core::anim::Anim;
+        use crate::core::mask::{self, idx, Mask, MaskKind};
         let Some(g) = gpu() else { return };
         let (w, h) = (64u32, 64u32);
         let mut c = Compositor::new(g.device, g.queue, w, h);
@@ -730,7 +765,7 @@ pub mod tests {
         solid(&mut c, red, [200, 0, 0, 255]);
         let q = full_frame(w as f32, h as f32);
         let square = geometry::project(&Placement { cx: 32.0, cy: 32.0, width: 20.0, height: 20.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
-        let fx = |kind: u32, params: [f32; 4]| EffectDraw { kind, params, opacity: 1.0, seed: 0, mask: MaskFrame::NONE };
+        let fx = |kind: u32, params: [f32; 4]| EffectDraw { kind, params, opacity: 1.0, seed: 0, mask: MaskFrame::NONE, frame: None };
         let clip = |effects: Vec<EffectDraw>, blend: BlendMode| {
             DrawItem::Layer(LayerDraw { effects, blend, ..layer_draw(white, square) })
         };
@@ -754,6 +789,31 @@ pub mod tests {
         c.render(&[layer(blue, q, BlendMode::Normal, 1.0), clip(vec![fx(1, [1.0, 0.0, 0.05, 0.0])], BlendMode::Normal)]);
         let img = c.read_rgba();
         assert!(close(&px(&img, w, 2, 2), [0, 0, 200], 1), "frame corners untouched by the clip's vignette");
+
+        // The clip's vignette centers on the clip itself, wherever it is.
+        let corner = geometry::project(&Placement { cx: 16.0, cy: 16.0, width: 20.0, height: 20.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        let vig = fx(1, [1.0, 0.3, 0.2, 0.0]);
+        c.render(&[layer(blue, q, BlendMode::Normal, 1.0), DrawItem::Layer(LayerDraw { effects: vec![vig.clone()], ..layer_draw(white, corner) })]);
+        let img = c.read_rgba();
+        assert!(px(&img, w, 16, 16)[0] > 230, "clip center stays bright: {:?}", px(&img, w, 16, 16));
+        assert!(px(&img, w, 7, 7)[0] < 60, "clip corner darkened: {:?}", px(&img, w, 7, 7));
+
+        // With a mask, the visible part is the frame: the vignette follows the mask.
+        let mut m = Mask::new(MaskKind::Rectangle, (64.0, 64.0));
+        m.values[idx::CENTER_X as usize] = Anim::new(0.75);
+        m.values[idx::CENTER_Y as usize] = Anim::new(0.5);
+        m.values[idx::WIDTH as usize] = Anim::new(24.0);
+        m.values[idx::HEIGHT as usize] = Anim::new(24.0);
+        m.values[idx::FEATHER as usize] = Anim::new(0.0);
+        let masks = [m];
+        let region = mask::bounds(&masks, 0.0, (64.0, 64.0));
+        let r = region.unwrap();
+        assert!((r[0] - 0.5625).abs() < 0.01 && (r[2] - 0.9375).abs() < 0.01, "mask bounds {r:?}");
+        c.render(&[layer(blue, q, BlendMode::Normal, 1.0), DrawItem::Layer(LayerDraw { effects: vec![vig], mask: mask::frame(&masks, 0.0, (64.0, 64.0)), region, ..layer_draw(white, q) })]);
+        let img = c.read_rgba();
+        assert!(px(&img, w, 48, 32)[0] > 230, "mask center stays bright: {:?}", px(&img, w, 48, 32));
+        assert!(px(&img, w, 37, 21)[0] < 60, "mask corner darkened: {:?}", px(&img, w, 37, 21));
+        assert!(close(&px(&img, w, 20, 32), [0, 0, 200], 1), "outside the mask: background");
 
         // Effects in order, then the track blend mode applies to the result.
         c.render(&[layer(red, q, BlendMode::Normal, 1.0), clip(vec![fx(1, [-1.0, 0.0, 0.01, 0.0])], BlendMode::Multiply)]);

@@ -2,7 +2,7 @@
 //! so storing a full copy before each edit is simple and cheap.
 //! Rule: call `checkpoint` BEFORE changing the project.
 
-use super::marker::Marker;
+use super::marker::{BeatGrid, Marker};
 use super::model::{Clip, Project, Track};
 
 #[derive(Clone)]
@@ -10,6 +10,7 @@ struct Snapshot {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     markers: Vec<Marker>,
+    beat_grid: Option<BeatGrid>,
     width: u32,
     height: u32,
     fps: u32,
@@ -17,12 +18,13 @@ struct Snapshot {
 
 impl Snapshot {
     fn of(p: &Project) -> Self {
-        Self { tracks: p.tracks.clone(), clips: p.clips.clone(), markers: p.markers.clone(), width: p.width, height: p.height, fps: p.fps }
+        Self { tracks: p.tracks.clone(), clips: p.clips.clone(), markers: p.markers.clone(), beat_grid: p.beat_grid, width: p.width, height: p.height, fps: p.fps }
     }
     fn restore(self, p: &mut Project) {
         p.tracks = self.tracks;
         p.clips = self.clips;
         p.markers = self.markers;
+        p.beat_grid = self.beat_grid;
         p.width = self.width;
         p.height = self.height;
         p.fps = self.fps;
