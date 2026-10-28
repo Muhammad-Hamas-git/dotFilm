@@ -50,13 +50,18 @@ pub fn proxy_size(asset: &Asset) -> (u32, u32) {
     (even(w * k), even(h * k))
 }
 
-pub fn cache_dir() -> PathBuf {
+/// dotFilm's cache folder (proxies, mattes, AI models).
+pub fn cache_root() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("dotFilm").join("proxies")
+    base.join("dotFilm")
+}
+
+pub fn cache_dir() -> PathBuf {
+    cache_root().join("proxies")
 }
 
 /// Cache file for a source file. Changes when the source changes.

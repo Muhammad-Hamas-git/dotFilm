@@ -5,5 +5,6 @@ pub mod geometry;
 pub mod grade;
 pub mod history;
 pub mod mask;
+pub mod matte;
 pub mod model;
 pub mod transition;

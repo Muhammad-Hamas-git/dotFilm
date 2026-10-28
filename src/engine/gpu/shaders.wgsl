@@ -52,6 +52,10 @@ struct Layer {
     mask_points: array<vec4<f32>, 16>,
     // (mask count, layer width, layer height, _).
     mask_info: vec4<f32>,
+    // AI matte: (mode: 0 off, 1 on, 2 inverted; 1 = masks restore the background,
+    // 0 = masks isolate the cut-out; _, _). Erode/dilate/feather already happened
+    // in fs_matte_prep.
+    matte: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> L: Layer;
@@ -60,6 +64,10 @@ struct Layer {
 @group(1) @binding(1) var plane1: texture_2d<f32>;
 @group(1) @binding(2) var plane2: texture_2d<f32>;
 @group(1) @binding(3) var samp: sampler;
+
+// The layer's AI matte (a blank texture when it has none).
+@group(2) @binding(0) var matte_tex: texture_2d<f32>;
+@group(2) @binding(1) var matte_samp: sampler;
 
 struct LayerOut {
     @builtin(position) pos: vec4<f32>,
@@ -317,13 +325,17 @@ fn mask_distance(i: u32, p: vec2<f32>) -> f32 {
 }
 
 // How much of the layer shows at p (layer px), 0..1. `aa` = layer px per output px,
-// so hard edges stay smooth. Matches core::mask::coverage.
-fn mask_value(p: vec2<f32>, aa: f32) -> f32 {
+// so hard edges stay smooth. With `has_base` the masks start from `base` (the AI
+// matte) and add to, cut from or limit it. Matches core::mask::coverage_over.
+fn mask_value(p: vec2<f32>, aa: f32, base: f32, has_base: bool) -> f32 {
     let n = u32(L.mask_info.x + 0.5);
     if (n == 0u) {
-        return 1.0;
+        return select(1.0, base, has_base);
     }
     var acc = select(1.0, 0.0, L.masks[2].z < 0.5);
+    if (has_base) {
+        acc = base;
+    }
     for (var i = 0u; i < n; i = i + 1u) {
         let v1 = L.masks[i * 3u + 1u];
         let v2 = L.masks[i * 3u + 2u];
@@ -352,7 +364,7 @@ fn effect_mask(xy: vec2<f32>) -> f32 {
     }
     let size = out_size();
     let k = L.mask_info.y / size.x;
-    return mask_value(xy / size * L.mask_info.yz, k);
+    return mask_value(xy / size * L.mask_info.yz, k, 1.0, false);
 }
 
 @fragment
@@ -404,7 +416,21 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
 
     // Masks, in the layer's own pixels so they move with it.
     let lp = in.uv * L.mask_info.yz;
-    let m = mask_value(lp, max(length(fwidth(lp)) * 0.7071, 1e-3));
+    let aa_px = max(length(fwidth(lp)) * 0.7071, 1e-3);
+    var m = mask_value(lp, aa_px, 1.0, false);
+    if (L.matte.x > 0.5) {
+        var matte = textureSampleLevel(matte_tex, matte_samp, in.uv, 0.0).r;
+        if (L.matte.x > 1.5) {
+            matte = 1.0 - matte;
+        }
+        if (L.matte.y > 0.5) {
+            // Masks combine with the matte: an Add mask brings the background back.
+            m = mask_value(lp, aa_px, matte, true);
+        } else {
+            // Masks isolate the cut-out further.
+            m = m * matte;
+        }
+    }
 
     let a = src.a * key_alpha * m * L.opacity * aa;
     return vec4(rgb * a, a);
@@ -868,4 +894,51 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
         default: {}
     }
     return vec4(mix(orig, rgb, L.opacity * effect_mask(p.xy)), 1.0);
+}
+
+// ---------------------------------------------------------------- AI matte cleanup
+
+// One pass of erode / dilate / blur over a matte, horizontal or vertical, at the
+// matte's own resolution (core::matte::apply_pass is the CPU twin; a test compares).
+// gen[0] = (pass: 0 erode, 1 dilate, 2 blur; direction x; direction y; radius in
+// matte px), gen[1] = (matte width, matte height, _, _). Input: `backdrop`.
+const MATTE_MAX_RADIUS: f32 = 64.0;
+
+fn matte_tap(p: vec2<i32>, d: vec2<i32>, k: i32) -> f32 {
+    let size = vec2<i32>(L.gen[1].xy);
+    return textureLoad(backdrop, clamp(p + d * k, vec2<i32>(0), size - vec2<i32>(1)), 0).r;
+}
+
+@fragment
+fn fs_matte_prep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let d = vec2<i32>(L.gen[0].yz);
+    let r = clamp(L.gen[0].w, 0.0, MATTE_MAX_RADIUS);
+    let kind = u32(L.gen[0].x + 0.5);
+    if (kind == 2u) {
+        // Gaussian reaching out to r pixels.
+        let n = i32(ceil(r));
+        let sigma = max(r * 0.5, 0.5);
+        var sum = 0.0;
+        var wsum = 0.0;
+        for (var k = -n; k <= n; k = k + 1) {
+            let w = exp(-f32(k * k) / (2.0 * sigma * sigma));
+            sum = sum + matte_tap(p, d, k) * w;
+            wsum = wsum + w;
+        }
+        return vec4(sum / wsum, 0.0, 0.0, 1.0);
+    }
+    // Min (erode) or max (dilate) over r pixels; the fraction blends in the next pixel out.
+    let n = i32(floor(r));
+    let erode = kind == 0u;
+    var m0 = matte_tap(p, d, 0);
+    for (var k = 1; k <= n; k = k + 1) {
+        let a = matte_tap(p, d, k);
+        let b = matte_tap(p, d, -k);
+        m0 = select(max(m0, max(a, b)), min(m0, min(a, b)), erode);
+    }
+    let a1 = matte_tap(p, d, n + 1);
+    let b1 = matte_tap(p, d, -n - 1);
+    let m1 = select(max(m0, max(a1, b1)), min(m0, min(a1, b1)), erode);
+    return vec4(mix(m0, m1, r - f32(n)), 0.0, 0.0, 1.0);
 }

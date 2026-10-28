@@ -8,6 +8,7 @@ use crate::engine::stretch::{self, StretchCache};
 use crate::engine::preview::PreviewRenderer;
 use crate::media::cache::{Loaded, MediaCache};
 use crate::media::ffmpeg;
+use crate::media::matte::Mattes;
 use crate::media::proxy::Proxies;
 use crate::engine::export::{self, Encoder};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,8 @@ pub struct EditorApp {
     pub media: MediaCache,
     pub preview: PreviewRenderer,
     pub proxies: Proxies,
+    /// AI background removal mattes (made on request, cached).
+    pub mattes: Mattes,
     pub stretch: StretchCache,
     /// Last copied clip (also on the system clipboard as text).
     pub clipboard: Option<Clip>,
@@ -75,6 +78,7 @@ impl EditorApp {
             media: MediaCache::new(ctx.clone()),
             preview: PreviewRenderer::new(cc.wgpu_render_state.as_ref()),
             proxies: Proxies::new(ctx.clone()),
+            mattes: Mattes::new(ctx.clone()),
             stretch: StretchCache::new(ctx.clone()),
             clipboard: None,
             encoders: Arc::new(Mutex::new(vec![Encoder::X264])),
@@ -273,6 +277,7 @@ impl EditorApp {
         if self.source.as_ref().is_some_and(|s| s.asset == id) {
             self.close_source();
         }
+        self.mattes.cancel_all(id);
         self.history.checkpoint(&self.project);
         self.project.remove_asset(id);
         self.history.clear(); // Undo could bring back clips whose asset is gone.
@@ -289,6 +294,7 @@ impl EditorApp {
         self.history.clear();
         self.media.clear();
         self.proxies.clear();
+        self.mattes.clear();
         self.preview.reset();
         self.selected = None;
         self.seek(0.0);
@@ -297,6 +303,7 @@ impl EditorApp {
             if asset.path.exists() {
                 self.media.load(&asset);
                 self.proxies.request(&asset);
+                self.mattes.check(&asset);
             } else {
                 missing += 1;
             }
@@ -361,6 +368,7 @@ impl EditorApp {
                     };
                     self.media.load(&asset);
                     self.proxies.request(&asset);
+                    self.mattes.check(&asset);
                     self.project.assets.push(asset);
                 }
                 Loaded::Probed { path, result: Err(e) } => {

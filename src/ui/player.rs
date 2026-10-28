@@ -54,7 +54,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     let to_screen = |x: f32, y: f32| pos2(frame.left() + x * k, frame.top() + y * k);
 
     let ctx = ui.ctx().clone();
-    let texture = app.preview.update(&app.project, &app.media, &app.proxies, app.playhead, app.playing);
+    let texture = app.preview.update(&app.project, &app.media, &app.proxies, &app.mattes, app.playhead, app.playing);
     if app.preview.waiting && !app.playing {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -263,7 +263,7 @@ fn source_view(app: &mut EditorApp, ui: &mut Ui) {
     let k = ((area.width() - 16.0) / pw).min((area.height() - 16.0) / ph).max(0.01);
     let frame = Rect::from_center_size(area.center(), vec2(pw * k, ph * k));
     let t = app.view_time();
-    let texture = app.preview.update(project, &app.media, &app.proxies, t, app.playing);
+    let texture = app.preview.update(project, &app.media, &app.proxies, &app.mattes, t, app.playing);
     if app.preview.waiting && !app.playing {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }

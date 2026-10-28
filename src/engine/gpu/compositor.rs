@@ -5,6 +5,7 @@ use super::wgpu;
 use crate::core::geometry::Quad;
 use crate::core::grade::GradeFrame;
 use crate::core::mask::MaskFrame;
+use crate::core::matte::{self, MatteFrame, PassKind};
 use crate::core::model::BlendMode;
 use crate::engine::color::Stage;
 use std::collections::HashMap;
@@ -43,6 +44,7 @@ struct LayerUniform {
     masks: [[f32; 4]; 12],
     mask_points: [[f32; 4]; 16],
     mask_info: [f32; 4],
+    matte: [f32; 4],
 }
 
 #[repr(C)]
@@ -54,21 +56,26 @@ struct Dims {
 }
 
 /// Identifies an uploaded picture: a video stream belongs to a clip,
-/// a still image to its asset.
+/// a still image to its asset, an AI matte to the clip showing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceKey {
     Clip(u64),
     Asset(u64),
+    Matte(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SourceKind {
     Rgba,
     Yuv420,
+    /// One 8-bit channel (an AI matte), bound as the layer's matte.
+    Gray,
 }
 
 struct Source {
     kind: SourceKind,
+    /// Changes on every upload (mattes: tells the cleanup cache the picture changed).
+    generation: u64,
     /// YUV -> RGB matrix for video sources.
     yuv: Stage,
     width: u32,
@@ -163,6 +170,8 @@ impl LayerDraw {
         self.grade.flags.hash(h);
         hash_f32s(self.grade.data.iter().flatten(), h);
         hash_mask(&self.mask, h);
+        self.matte_src.hash(h);
+        hash_f32s(self.matte.values().iter(), h);
         hash_f32s(self.quad.pts.iter().flatten().chain(self.quad.w.iter()), h);
         self.stages.len().hash(h);
         hash_f32s(self.stages.iter().flatten().flatten(), h);
@@ -214,15 +223,41 @@ impl DrawItem {
 /// A recorded GPU step; `slot` is the index of its settings in the uniform buffer.
 enum Op {
     Clear,
-    Layer { slot: u32, src: Option<SourceKey>, normal: bool },
+    Layer { slot: u32, src: Option<SourceKey>, matte: Option<SourceKey>, normal: bool },
     TwoPass { slot: u32 },
     Effect { slot: u32 },
-    Transition { from: Option<(u32, Option<SourceKey>)>, to: Option<(u32, Option<SourceKey>)>, slot: u32, normal: bool },
+    Transition { from: Option<(u32, Option<SourceKey>, Option<SourceKey>)>, to: Option<(u32, Option<SourceKey>, Option<SourceKey>)>, slot: u32, normal: bool },
     BaseSave { slot: u32 },
     BaseRestore { slot: u32 },
     SumClear,
     SumAdd { slot: u32 },
     SumResolve { slot: u32 },
+}
+
+/// Format of cleaned-up mattes (16-bit float keeps feathered edges smooth).
+const MATTE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+
+/// Two ping-pong textures a matte's cleanup passes run through, and which holds the result.
+struct MattePrep {
+    size: (u32, u32),
+    views: [wgpu::TextureView; 2],
+    /// Pass inputs: the uploaded matte, or one of `views`.
+    read_src: wgpu::BindGroup,
+    read: [wgpu::BindGroup; 2],
+    /// `views` bound as a layer's matte.
+    bind: [wgpu::BindGroup; 2],
+    /// Upload generation and radii the result was made for.
+    done_for: Option<(u64, [u32; 3])>,
+    /// Which of `views` holds the cleaned matte (None: use the upload as is).
+    result: Option<usize>,
+}
+
+/// One planned cleanup pass.
+struct PrepPass {
+    key: SourceKey,
+    slot: u32,
+    read: Option<usize>,
+    write: usize,
 }
 
 /// One layer to draw.
@@ -232,6 +267,11 @@ pub struct LayerDraw {
     pub grade: GradeFrame,
     /// Where the layer shows (in its own pixels).
     pub mask: MaskFrame,
+    /// AI background removal settings; only used with `matte_src`.
+    pub matte: MatteFrame,
+    /// The uploaded matte picture (see `upload_matte`). A layer whose matte is
+    /// named but not uploaded yet waits, so it never flashes its background.
+    pub matte_src: Option<SourceKey>,
     pub quad: Quad,
     pub stages: Vec<Stage>,
     pub opacity: f32,
@@ -278,23 +318,33 @@ pub struct Compositor {
     transition_replace: wgpu::RenderPipeline,
     sum_add: wgpu::RenderPipeline,
     sum_copy: wgpu::RenderPipeline,
+    /// AI matte cleanup (erode / dilate / feather), one direction per pass.
+    matte_prep: wgpu::RenderPipeline,
     output: wgpu::RenderPipeline,
     yuv: wgpu::RenderPipeline,
     uniform_layout: wgpu::BindGroupLayout,
     /// Uniform slots the buffer currently holds.
     uniform_slots: usize,
     source_layout: wgpu::BindGroupLayout,
+    /// A layer's AI matte (group 2): texture + sampler.
+    matte_layout: wgpu::BindGroupLayout,
     pair_layout: wgpu::BindGroupLayout,
     single_layout: wgpu::BindGroupLayout,
     out_layout: wgpu::BindGroupLayout,
     /// Source bind group with blank textures, for gradients.
     blank_source: wgpu::BindGroup,
+    /// Matte bind group for layers without one.
+    blank_matte: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     uniform_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     dummy: wgpu::TextureView,
     targets: Targets,
     sources: HashMap<SourceKey, Source>,
+    /// Cleaned-up mattes, per matte source (see `schedule_matte_prep`).
+    preps: HashMap<SourceKey, MattePrep>,
+    /// Counts uploads, for `Source::generation`.
+    uploads: u64,
     /// Which accum texture holds the last rendered frame.
     last: usize,
     /// Coordinate space of layer positions (project pixels). Defaults to the output size.
@@ -380,6 +430,18 @@ impl Compositor {
                 },
             ],
         });
+        let matte_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matte"),
+            entries: &[
+                tex_entry(0, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -410,7 +472,7 @@ impl Compositor {
         let layout = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: groups, immediate_size: 0 })
         };
-        let layer_layout = layout("layer", &[Some(&uniform_layout), Some(&source_layout)]);
+        let layer_layout = layout("layer", &[Some(&uniform_layout), Some(&source_layout), Some(&matte_layout)]);
         let blend_layout = layout("blend", &[Some(&uniform_layout), Some(&pair_layout)]);
         let single_pl = layout("effect single", &[Some(&uniform_layout), Some(&single_layout)]);
         let out_pl = layout("output", &[Some(&out_layout)]);
@@ -457,6 +519,7 @@ impl Compositor {
         let sum_copy = pipeline("sum copy", &single_pl, "vs_full", "fs_weighted", WORK_FORMAT, None, list);
         let output = pipeline("output", &out_pl, "vs_full", "fs_output", OUTPUT_FORMAT, None, list);
         let yuv = pipeline("yuv", &out_pl, "vs_full", "fs_yuv", wgpu::TextureFormat::R8Unorm, None, list);
+        let matte_prep = pipeline("matte prep", &single_pl, "vs_full", "fs_matte_prep", MATTE_FORMAT, None, list);
 
         let (uniforms, uniform_group) = Self::make_uniforms(&device, &uniform_layout, INITIAL_SLOTS);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -480,6 +543,15 @@ impl Compositor {
             ],
         });
 
+        let blank_matte = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blank matte"),
+            layout: &matte_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dummy) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
         let targets = Self::make_targets(&device, &pair_layout, &single_layout, &out_layout, &sampler, width, height);
         Self {
             device,
@@ -494,21 +566,26 @@ impl Compositor {
             transition_replace,
             sum_add,
             sum_copy,
+            matte_prep,
             output,
             yuv,
             uniform_layout,
             uniform_slots: INITIAL_SLOTS,
             source_layout,
+            matte_layout,
             pair_layout,
             single_layout,
             out_layout,
             blank_source,
+            blank_matte,
             uniforms,
             uniform_group,
             sampler,
             dummy,
             targets,
             sources: HashMap::new(),
+            preps: HashMap::new(),
+            uploads: 0,
             last: 0,
             canvas: (width as f32, height as f32),
         }
@@ -663,6 +740,8 @@ impl Compositor {
     /// Frees GPU memory for sources no longer needed.
     pub fn retain_sources(&mut self, mut keep: impl FnMut(&SourceKey) -> bool) {
         self.sources.retain(|k, _| keep(k));
+        let sources = &self.sources;
+        self.preps.retain(|k, _| sources.contains_key(k));
     }
 
     fn ensure_source(&mut self, key: SourceKey, kind: SourceKind, w: u32, h: u32) -> &Source {
@@ -677,20 +756,32 @@ impl Compositor {
                     texture(&self.device, w / 2, h / 2, wgpu::TextureFormat::R8Unorm, usage, "u"),
                     texture(&self.device, w / 2, h / 2, wgpu::TextureFormat::R8Unorm, usage, "v"),
                 ],
+                SourceKind::Gray => vec![texture(&self.device, w, h, wgpu::TextureFormat::R8Unorm, usage, "matte")],
             };
             let views: Vec<wgpu::TextureView> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
             let plane = |i: usize| views.get(i).unwrap_or(&self.dummy);
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("source"),
-                layout: &self.source_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(plane(0)) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(plane(1)) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(plane(2)) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            });
-            self.sources.insert(key, Source { kind, yuv: [[0.0; 4]; 3], width: w, height: h, textures, bind_group });
+            let bind_group = if kind == SourceKind::Gray {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("matte"),
+                    layout: &self.matte_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(plane(0)) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    ],
+                })
+            } else {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("source"),
+                    layout: &self.source_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(plane(0)) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(plane(1)) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(plane(2)) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    ],
+                })
+            };
+            self.sources.insert(key, Source { kind, generation: 0, yuv: [[0.0; 4]; 3], width: w, height: h, textures, bind_group });
         }
         &self.sources[&key]
     }
@@ -725,6 +816,128 @@ impl Compositor {
         self.write_plane(&t[2], w / 2, h / 2, 1, &data[ys + cs..ys + 2 * cs]);
     }
 
+    /// Uploads an 8-bit matte (one byte per pixel; 255 = subject).
+    pub fn upload_matte(&mut self, key: SourceKey, w: u32, h: u32, data: &[u8]) {
+        self.ensure_source(key, SourceKind::Gray, w, h);
+        let tex = self.sources[&key].textures[0].clone();
+        self.write_plane(&tex, w, h, 1, &data[..(w * h) as usize]);
+        self.uploads += 1;
+        if let Some(s) = self.sources.get_mut(&key) {
+            s.generation = self.uploads;
+        }
+    }
+
+    /// The mattes the stack uses, with their cleanup radii in matte pixels.
+    /// A matte drawn several times in one frame (motion blur) uses its first settings.
+    fn collect_mattes(&self, items: &[DrawItem], out: &mut Vec<(SourceKey, [f32; 3])>) {
+        for item in items {
+            match item {
+                DrawItem::Layer(l) => self.collect_matte(l, out),
+                DrawItem::Transition(t) => {
+                    for l in t.from.iter().chain(t.to.iter()) {
+                        self.collect_matte(l, out);
+                    }
+                }
+                DrawItem::Samples { prefix, lists } => {
+                    self.collect_mattes(prefix, out);
+                    for list in lists {
+                        self.collect_mattes(list, out);
+                    }
+                }
+                DrawItem::Effect(_) => {}
+            }
+        }
+    }
+
+    fn collect_matte(&self, l: &LayerDraw, out: &mut Vec<(SourceKey, [f32; 3])>) {
+        let Some(k) = self.layer_matte(l) else { return };
+        let Some(src) = self.sources.get(&k) else { return };
+        if out.iter().any(|(o, _)| *o == k) {
+            return;
+        }
+        // Settings are in layer pixels; the matte is usually smaller than the layer.
+        let layer_w = l.mask.info[1];
+        let to_matte = if layer_w > 0.0 { src.width as f32 / layer_w } else { 1.0 };
+        out.push((k, [l.matte.erode * to_matte, l.matte.dilate * to_matte, l.matte.feather * to_matte]));
+    }
+
+    /// Plans the cleanup passes of one matte (none if its picture and settings
+    /// haven't changed since last time). Pushes their settings to `u`.
+    fn schedule_matte_prep(&mut self, key: SourceKey, radii: [f32; 3], u: &mut Vec<LayerUniform>, passes: &mut Vec<PrepPass>) {
+        let Some(src) = self.sources.get(&key) else { return };
+        let (w, h, generation) = (src.width, src.height, src.generation);
+        let steps = matte::passes(radii[0], radii[1], radii[2]);
+        if steps.is_empty() {
+            if let Some(p) = self.preps.get_mut(&key) {
+                p.result = None;
+                p.done_for = None;
+            }
+            return;
+        }
+        if self.preps.get(&key).is_none_or(|p| p.size != (w, h)) {
+            let prep = self.make_prep(key, w, h);
+            self.preps.insert(key, prep);
+        }
+        let stamp = (generation, radii.map(f32::to_bits));
+        let prep = self.preps.get_mut(&key).expect("just made");
+        if prep.done_for == Some(stamp) {
+            return;
+        }
+        for (i, (kind, horizontal, r)) in steps.iter().enumerate() {
+            let mut v: LayerUniform = bytemuck::Zeroable::zeroed();
+            let id = match kind {
+                PassKind::Erode => 0.0,
+                PassKind::Dilate => 1.0,
+                PassKind::Blur => 2.0,
+            };
+            let (dx, dy) = if *horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
+            v.extra[0] = [id, dx, dy, *r];
+            v.extra[1] = [w as f32, h as f32, 0.0, 0.0];
+            u.push(v);
+            passes.push(PrepPass { key, slot: (u.len() - 1) as u32, read: if i == 0 { None } else { Some((i - 1) % 2) }, write: i % 2 });
+        }
+        prep.result = Some((steps.len() - 1) % 2);
+        prep.done_for = Some(stamp);
+    }
+
+    fn make_prep(&self, key: SourceKey, w: u32, h: u32) -> MattePrep {
+        use wgpu::TextureUsages as U;
+        let single = |view: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matte prep input"),
+                layout: &self.single_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            })
+        };
+        let bind = |view: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cleaned matte"),
+                layout: &self.matte_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            })
+        };
+        let src_view = self.sources[&key].textures[0].create_view(&Default::default());
+        let views: [wgpu::TextureView; 2] = [0, 1].map(|i| {
+            texture(&self.device, w, h, MATTE_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING, if i == 0 { "matte prep a" } else { "matte prep b" })
+                .create_view(&Default::default())
+        });
+        MattePrep {
+            size: (w, h),
+            read_src: single(&src_view),
+            read: [single(&views[0]), single(&views[1])],
+            bind: [bind(&views[0]), bind(&views[1])],
+            views,
+            done_for: None,
+            result: None,
+        }
+    }
+
     /// The source a layer reads from, if it needs one.
     fn layer_source(&self, l: &LayerDraw) -> Option<SourceKey> {
         match &l.paint {
@@ -736,7 +949,12 @@ impl Compositor {
 
     /// Can this layer be drawn now? (Its picture may not be uploaded yet.)
     fn layer_ready(&self, l: &LayerDraw) -> bool {
-        self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k))
+        self.layer_source(l).is_none_or(|k| self.sources.contains_key(&k)) && l.matte_src.is_none_or(|k| self.sources.contains_key(&k))
+    }
+
+    /// The matte a layer uses, if it has one and it's switched on.
+    fn layer_matte(&self, l: &LayerDraw) -> Option<SourceKey> {
+        l.matte_src.filter(|_| l.matte.is_on())
     }
 
     fn uniform_for(&self, layer: &LayerDraw) -> LayerUniform {
@@ -792,6 +1010,10 @@ impl Compositor {
             masks: layer.mask.masks,
             mask_points: layer.mask.points,
             mask_info: layer.mask.info,
+            matte: match self.layer_matte(layer) {
+                Some(_) => [layer.matte.mode, if layer.matte.restore { 1.0 } else { 0.0 }, 0.0, 0.0],
+                None => [0.0; 4],
+            },
         }
     }
 
@@ -822,6 +1044,7 @@ impl Compositor {
             masks: e.mask.masks,
             mask_points: e.mask.points,
             mask_info: e.mask.info,
+            matte: [0.0; 4],
         }
     }
 
@@ -839,7 +1062,7 @@ impl Compositor {
                 DrawItem::Layer(l) => {
                     if self.layer_ready(l) {
                         let s = slot(u, self.uniform_for(l));
-                        ops.push(Op::Layer { slot: s, src: self.layer_source(l), normal: l.blend == BlendMode::Normal });
+                        ops.push(Op::Layer { slot: s, src: self.layer_source(l), matte: self.layer_matte(l), normal: l.blend == BlendMode::Normal });
                     }
                 }
                 DrawItem::Effect(e) => {
@@ -852,7 +1075,7 @@ impl Compositor {
                             // Each side is drawn on its own; the track blend mode applies to the mix.
                             let mut v = self.uniform_for(l);
                             v.blend = 0;
-                            (slot(u, v), self.layer_source(l))
+                            (slot(u, v), self.layer_source(l), self.layer_matte(l))
                         })
                     };
                     let from = side(&t.from, u);
@@ -897,6 +1120,13 @@ impl Compositor {
     /// Layers whose picture hasn't been uploaded yet are skipped.
     pub fn render(&mut self, items: &[DrawItem]) {
         let mut uniforms = Vec::new();
+        // AI matte cleanup first: the layers below read its results.
+        let mut mattes = Vec::new();
+        self.collect_mattes(items, &mut mattes);
+        let mut preps = Vec::new();
+        for (key, radii) in mattes {
+            self.schedule_matte_prep(key, radii, &mut uniforms, &mut preps);
+        }
         let mut ops = vec![Op::Clear];
         self.plan(items, &mut uniforms, &mut ops);
 
@@ -923,19 +1153,36 @@ impl Compositor {
             Some(k) => &self.sources[&k].bind_group,
             None => &self.blank_source,
         };
+        let matte_group = |m: Option<SourceKey>| match m {
+            Some(k) => match self.preps.get(&k).and_then(|p| p.result.map(|i| &p.bind[i])) {
+                Some(cleaned) => cleaned,
+                None => &self.sources[&k].bind_group,
+            },
+            None => &self.blank_matte,
+        };
         let clear_clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+
+        for pp in &preps {
+            let p = &self.preps[&pp.key];
+            let mut pass = begin_pass(&mut enc, "matte prep", &p.views[pp.write], wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            pass.set_pipeline(&self.matte_prep);
+            pass.set_bind_group(0, &self.uniform_group, &[offset(pp.slot)]);
+            pass.set_bind_group(1, pp.read.map_or(&p.read_src, |i| &p.read[i]), &[]);
+            pass.draw(0..3, 0..1);
+        }
 
         for op in &ops {
             match *op {
                 Op::Clear => {
                     drop(begin_pass(&mut enc, "clear", &t.accum[cur], wgpu::LoadOp::Clear(wgpu::Color::BLACK)));
                 }
-                Op::Layer { slot, src, normal } => {
+                Op::Layer { slot, src, matte, normal } => {
                     if normal {
                         let mut pass = begin_pass(&mut enc, "layer", &t.accum[cur], wgpu::LoadOp::Load);
                         pass.set_pipeline(&self.layer_over);
                         pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
                         pass.set_bind_group(1, source_group(src), &[]);
+                        pass.set_bind_group(2, matte_group(matte), &[]);
                         pass.draw(0..4, 0..1);
                     } else {
                         {
@@ -943,6 +1190,7 @@ impl Compositor {
                             pass.set_pipeline(&self.layer_replace);
                             pass.set_bind_group(0, &self.uniform_group, &[offset(slot)]);
                             pass.set_bind_group(1, source_group(src), &[]);
+                            pass.set_bind_group(2, matte_group(matte), &[]);
                             pass.draw(0..4, 0..1);
                         }
                         let mut pass = begin_pass(&mut enc, "blend", &t.accum[1 - cur], wgpu::LoadOp::Load);
@@ -984,10 +1232,11 @@ impl Compositor {
                     // Each side into its own texture (empty if missing), then mix.
                     for (i, side) in [from, to].into_iter().enumerate() {
                         let mut pass = begin_pass(&mut enc, "transition side", &t.trans[i], clear_clear);
-                        if let Some((s, src)) = side {
+                        if let Some((s, src, matte)) = side {
                             pass.set_pipeline(&self.layer_replace);
                             pass.set_bind_group(0, &self.uniform_group, &[offset(s)]);
                             pass.set_bind_group(1, source_group(src), &[]);
+                            pass.set_bind_group(2, matte_group(matte), &[]);
                             pass.draw(0..4, 0..1);
                         }
                     }

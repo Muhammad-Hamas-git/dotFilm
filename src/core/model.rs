@@ -5,6 +5,7 @@ use super::anim::Anim;
 use super::content::Content;
 use super::grade::{self, Grade};
 use super::mask::{self, Mask, MaskKind};
+use super::matte::{self, Matte};
 use super::transition::Transition;
 use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,8 @@ pub enum Param {
     Grade(u8),
     /// Mask number, then its i-th value (see core::mask).
     Mask(u8, u8),
+    /// The i-th AI background removal value (see core::matte::idx).
+    Matte(u8),
 }
 
 impl Param {
@@ -287,6 +290,7 @@ impl Param {
             Param::Grade(i) => grade::info(i).label,
             Param::Mask(_, i) if (i as usize) < mask::VALUES => mask::info(MaskKind::Rectangle, i).label,
             Param::Mask(_, i) => mask::point_info(i).label,
+            Param::Matte(i) => matte::info(i).label,
         }
     }
 
@@ -335,6 +339,9 @@ pub struct Clip {
     /// Masks, top first (see core/mask.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub masks: Vec<Mask>,
+    /// AI background removal settings (see core/matte.rs). None until it's first used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matte: Option<Matte>,
     /// Transition at the clip's start (see core/transition.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_in: Option<Transition>,
@@ -377,6 +384,9 @@ impl Clip {
         v.extend((0..grade::COUNT).map(|i| Param::Grade(i as u8)));
         for (m, mask) in self.masks.iter().enumerate() {
             v.extend((0..mask.anim_count()).map(|i| Param::Mask(m as u8, i as u8)));
+        }
+        if self.matte.is_some() {
+            v.extend((0..matte::COUNT).map(|i| Param::Matte(i as u8)));
         }
         v
     }
@@ -471,6 +481,7 @@ impl Clip {
             Param::Content(i) => self.content.as_ref().and_then(|c| c.anims().get(i as usize).copied()).expect("content param exists"),
             Param::Grade(i) => &self.grade.values[i as usize],
             Param::Mask(m, i) => self.masks[m as usize].anim(i),
+            Param::Matte(i) => self.matte.as_ref().expect("matte param exists").anim(i),
         }
     }
 
@@ -493,6 +504,7 @@ impl Clip {
             Param::Content(i) => self.content.as_mut().and_then(|c| c.anims_mut().into_iter().nth(i as usize)).expect("content param exists"),
             Param::Grade(i) => &mut self.grade.values[i as usize],
             Param::Mask(m, i) => self.masks[m as usize].anim_mut(i),
+            Param::Matte(i) => self.matte.as_mut().expect("matte param exists").anim_mut(i),
         }
     }
 
@@ -750,6 +762,7 @@ impl Project {
             content: asset.generator.clone(),
             grade: Grade::default(),
             masks: Vec::new(),
+            matte: None,
             transition_in: None,
             transition_out: None,
         });

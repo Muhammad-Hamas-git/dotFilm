@@ -80,6 +80,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                     font_search: &mut app.inspector.font_search,
                     grading: &mut app.inspector.grading,
                     picking: &mut app.preview.picking_key,
+                    mattes: &app.mattes,
                 };
                 clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, ctx)
             }
@@ -133,6 +134,7 @@ fn widget_for(p: Param) -> Widget {
         Param::Speed => Widget::Slider { range: crate::core::model::SPEED_RANGE, decimals: 2, log: true, suffix: "x" },
         Param::Content(_) => s(0.0..=1.0, 2),
         Param::Grade(i) => info_widget(&crate::core::grade::info(i)),
+        Param::Matte(i) => info_widget(&crate::core::matte::info(i)),
         Param::Mask(_, i) => {
             use crate::core::mask::{self, idx};
             match i {
@@ -343,6 +345,7 @@ struct ClipCtx<'a> {
     font_search: &'a mut String,
     grading: &'a mut super::grading::GradingState,
     picking: &'a mut Option<ClipId>,
+    mattes: &'a crate::media::matte::Mattes,
 }
 
 fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, ctx: ClipCtx) {
@@ -450,6 +453,9 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
             }
         });
         super::grading::section(ui, &mut c, local, tol, t, ctx.grading, ctx.picking);
+        if crate::media::matte::supports(&asset) && c.content.is_none() {
+            super::matte::section(ui, &mut c, &asset, ctx.mattes, local, tol, t);
+        }
     }
     if super::masks::supports_masks(project, &c) {
         if let Some((size, _)) = crate::engine::scene::layer_space(project, &c, playhead, ctx.text, ctx.frame_scale) {

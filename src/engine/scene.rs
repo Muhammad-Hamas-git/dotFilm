@@ -4,6 +4,7 @@ use super::color::{self, Stage};
 use super::text::{self, TextEngine, TextMask};
 use crate::core::grade::GradeFrame;
 use crate::core::mask::{self, MaskFrame};
+use crate::core::matte::MatteFrame;
 use crate::core::content::{Content, EffectKind, TextParams};
 use crate::core::geometry::Quad;
 use crate::core::model::{Asset, AssetKind, BlendMode, Clip, Project};
@@ -31,6 +32,9 @@ pub struct SceneLayer<'a> {
     pub grade: GradeFrame,
     /// Masks, in the layer's own pixels.
     pub mask: MaskFrame,
+    /// AI background removal settings (video clips only; the matte picture itself
+    /// is decoded by preview and export).
+    pub matte: MatteFrame,
     /// Seconds into the source file for this frame (media only).
     pub source_time: f64,
     pub paint: ScenePaint,
@@ -244,9 +248,14 @@ fn layer_at<'a>(
         }
         None => (ScenePaint::Media, base_size(project, clip, asset)),
     };
+    let matte = match (&clip.matte, &paint) {
+        (Some(m), ScenePaint::Media) if is_video(asset) => m.frame(l),
+        _ => MatteFrame::NONE,
+    };
     Some(SceneLayer {
         clip,
         asset,
+        matte,
         quad: project.quad_for(clip, t, base),
         stages: color::stages(&v.adjust),
         opacity: v.opacity,
@@ -313,6 +322,7 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
         l.stages.iter().flatten().flatten().for_each(|v| f(*v));
         l.grade.data.iter().flatten().for_each(|v| f(*v));
         l.mask.masks.iter().flatten().chain(l.mask.points.iter().flatten()).for_each(|v| f(*v));
+        l.matte.values().iter().for_each(|v| f(*v));
         f(l.opacity);
         match &l.paint {
             ScenePaint::Media => {}
@@ -346,7 +356,7 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
 
 /// A layer's draw settings with the given paint (see `to_draws`).
 pub fn layer_draw(l: &SceneLayer, paint: Paint) -> LayerDraw {
-    LayerDraw { paint, grade: l.grade, mask: l.mask, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }
+    LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }
 }
 
 /// Converts the scene to GPU draw items. `layer` resolves each layer's picture

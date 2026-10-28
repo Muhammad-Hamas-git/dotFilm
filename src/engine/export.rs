@@ -9,7 +9,7 @@ use super::text::TextEngine;
 use super::scene;
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
 use crate::core::transition;
-use crate::media::{ffmpeg, probe, video::SequentialStream};
+use crate::media::{ffmpeg, matte, probe, video::SequentialStream};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -255,6 +255,8 @@ pub fn run(
     // Per clip: decoder, frames per source second, source time of its first frame,
     // and the last frame index uploaded (motion blur draws a clip several times).
     let mut streams: HashMap<ClipId, (SequentialStream, f64, f64, Option<u64>)> = HashMap::new();
+    // The same for AI mattes (cached grayscale videos, see media/matte.rs).
+    let mut mattes: HashMap<ClipId, (SequentialStream, f64, f64, Option<u64>)> = HashMap::new();
     let mut images: HashSet<AssetId> = HashSet::new();
     let mut text_engine = TextEngine::default();
     let mut uploaded_text: HashMap<ClipId, u64> = HashMap::new();
@@ -266,6 +268,7 @@ pub fn run(
         // Open decoders for clips that are visible now or start soon; close finished ones.
         // Transitions can show a clip a little before its start and after its end.
         streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < transition::clip_span(project, c).1));
+        mattes.retain(|id, _| streams.contains_key(id));
         for clip in &project.clips {
             let (first, last) = transition::clip_span(project, clip);
             let soon = first <= t + PREROLL && t < last;
@@ -279,6 +282,12 @@ pub fn run(
             let from = clip.source_time(first).max(0.0);
             let s = SequentialStream::open(&asset.path, from, dw, dh, rate, asset.color.full_range, EXPORT_HWACCEL).map_err(|e| fail(e, &mut enc))?;
             streams.insert(clip.id, (s, rate, from, None));
+            if let Some((path, q)) = clip.matte.as_ref().filter(|m| m.enabled).and_then(|m| Some((matte::existing(asset, m.quality)?, m.quality))) {
+                let (mw, mh) = matte::matte_size(asset, q);
+                // Gray decodes as full-range YUV: the Y plane is the matte.
+                let m = SequentialStream::open(&path, from, mw, mh, rate, true, false).map_err(|e| fail(e, &mut enc))?;
+                mattes.insert(clip.id, (m, rate, from, None));
+            }
         }
 
         let items = scene::items_at(project, t, &mut text_engine, 1.0);
@@ -326,7 +335,22 @@ pub fn run(
                     _ => return None,
                 },
             };
-            Some(scene::layer_draw(l, paint))
+            let mut d = scene::layer_draw(l, paint);
+            if l.matte.is_on() {
+                if let Some((stream, rate, from, uploaded)) = mattes.get_mut(&l.clip.id) {
+                    let index = ((l.source_time - *from) * *rate).round().max(0.0) as u64;
+                    let key = SourceKey::Matte(l.clip.id.0);
+                    if *uploaded != Some(index) {
+                        let (mw, mh) = (stream.width, stream.height);
+                        if let Some(frame) = stream.frame(index) {
+                            comp.upload_matte(key, mw, mh, frame);
+                            *uploaded = Some(index);
+                        }
+                    }
+                    d.matte_src = Some(key);
+                }
+            }
+            Some(d)
         });
         if let Some(e) = error {
             return Err(fail(e, &mut enc));

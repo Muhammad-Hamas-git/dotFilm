@@ -183,6 +183,7 @@ mod tests {
             content: None,
             grade: Default::default(),
             masks: Vec::new(),
+            matte: None,
             transition_in: None,
             transition_out: None,
         }
