@@ -47,6 +47,7 @@ pub mod tests {
     use crate::core::model::{Adjustments, BlendMode};
     use crate::core::grade::GradeFrame;
     use crate::core::mask::MaskFrame;
+    use crate::core::tone::ToneFrame;
     use crate::core::matte::MatteFrame;
     use crate::engine::color;
 
@@ -77,7 +78,7 @@ pub mod tests {
     }
 
     fn layer(key: SourceKey, quad: geometry::Quad, blend: BlendMode, opacity: f32) -> DrawItem {
-        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity, blend })
+        DrawItem::Layer(LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity, blend, effects: vec![], tone: ToneFrame::NONE, lut: None })
     }
 
     fn effect(kind: u32, params: [f32; 4], seed: u32) -> DrawItem {
@@ -143,7 +144,7 @@ pub mod tests {
         let src = [180u8, 90, 40, 255];
         solid(&mut c, k, src);
         let adj = Adjustments { brightness: 0.05, contrast: 1.3, saturation: 1.4, hue: 35.0, value: 0.9 };
-        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal };
+        let d = LayerDraw { paint: Paint::Source(k), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: color::stages(&adj), opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None };
         c.render(&[DrawItem::Layer(d)]);
         let px = c.read_rgba();
         let mut cpu = Vec::new();
@@ -219,7 +220,7 @@ pub mod tests {
             angle_deg: 90.0,
             size: (w as f32, h as f32),
         };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(w as f32, h as f32), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
         let img = c.read_rgba();
         let (l, m, r) = (px(&img, w, 1, 10), px(&img, w, 50, 10), px(&img, w, 98, 10));
         assert!(l[0] > 240 && l[2] < 15, "left {l:?}");
@@ -241,7 +242,7 @@ pub mod tests {
         let k = SourceKey::Clip(9);
         c.upload_rgba(k, 4, 4, &mask);
         let paint = Paint::Text { mask: k, fill: [1.0, 1.0, 0.0, 1.0], outline: [0.0, 0.0, 1.0, 1.0] };
-        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint, grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(4.0, 4.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
         let img = c.read_rgba();
         assert!(close(&px(&img, 4, 0, 1), [255, 255, 0], 3), "fill {:?}", px(&img, 4, 0, 1));
         assert!(close(&px(&img, 4, 3, 1), [0, 0, 255], 3), "outline {:?}", px(&img, 4, 3, 1));
@@ -290,7 +291,7 @@ pub mod tests {
     fn graded(c: &mut Compositor, rgba: [u8; 4], grade: &crate::core::grade::Grade) -> [u8; 4] {
         let k = SourceKey::Asset(77);
         solid(c, k, rgba);
-        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: grade.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: full_frame(8.0, 8.0), stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
         let px = c.read_rgba();
         let i = (4 * 8 + 4) * 4;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -356,7 +357,7 @@ pub mod tests {
             let q = full_frame(8.0, 8.0);
             c.render(&[
                 layer(bg, q, BlendMode::Normal, 1.0),
-                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+                DrawItem::Layer(LayerDraw { paint: Paint::Source(k), grade: gr.frame(0.0), mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }),
             ]);
             px(&c.read_rgba(), 8, 4, 4)
         };
@@ -392,7 +393,7 @@ pub mod tests {
     }
 
     fn layer_draw(key: SourceKey, quad: geometry::Quad) -> LayerDraw {
-        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }
+        LayerDraw { paint: Paint::Source(key), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }
     }
 
     fn transition(from: Option<LayerDraw>, to: Option<LayerDraw>, kind: u32, progress: f32, angle_deg: f32, edge: u32) -> DrawItem {
@@ -494,7 +495,7 @@ pub mod tests {
         let base = [layer(black, q, BlendMode::Normal, 1.0), layer(white, square, BlendMode::Normal, 1.0)];
         let run = |c: &mut Compositor, extra: Option<DrawItem>| {
             let mut items: Vec<DrawItem> = base.iter().map(|d| match d {
-                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal }),
+                DrawItem::Layer(l) => DrawItem::Layer(LayerDraw { paint: l.paint.clone(), grade: NO_GRADE, mask: MaskFrame::NONE, matte: MatteFrame::NONE, matte_src: None, quad: l.quad, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None }),
                 _ => unreachable!(),
             }).collect();
             items.extend(extra);
@@ -570,7 +571,7 @@ pub mod tests {
         let masks = vec![rect, ell, tri];
 
         let frame = mask::frame(&masks, 0.0, size);
-        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(white), grade: NO_GRADE, mask: frame, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal })]);
+        c.render(&[DrawItem::Layer(LayerDraw { paint: Paint::Source(white), grade: NO_GRADE, mask: frame, matte: MatteFrame::NONE, matte_src: None, quad: q, stages: vec![], opacity: 1.0, blend: BlendMode::Normal, effects: vec![], tone: ToneFrame::NONE, lut: None })]);
         let img = c.read_rgba();
         let mut worst = 0.0f32;
         for y in (0..h).step_by(3) {
@@ -637,6 +638,9 @@ pub mod tests {
                 stages: vec![],
                 opacity: 1.0,
                 blend: BlendMode::Normal,
+                effects: vec![],
+                tone: ToneFrame::NONE,
+                lut: None,
             })]);
             c.read_rgba()
         };
@@ -677,6 +681,9 @@ pub mod tests {
             stages: vec![],
             opacity: 1.0,
             blend: BlendMode::Normal,
+            effects: vec![],
+            tone: ToneFrame::NONE,
+            lut: None,
         })]);
         compare(&c.read_rgba(), &cpu(1.5, 0.0, 0.0), "layer px to matte px");
         // Inverted keeps the background.
@@ -710,5 +717,182 @@ pub mod tests {
                 assert!(px(&img, w, 20, 30)[0] > 250, "subject inside the mask stays");
             }
         }
+    }
+
+    #[test]
+    fn clip_effects_apply_to_that_clip_only() {
+        let Some(g) = gpu() else { return };
+        let (w, h) = (64u32, 64u32);
+        let mut c = Compositor::new(g.device, g.queue, w, h);
+        let (white, blue, red) = (SourceKey::Asset(1), SourceKey::Asset(2), SourceKey::Asset(3));
+        solid(&mut c, white, [255, 255, 255, 255]);
+        solid(&mut c, blue, [0, 0, 200, 255]);
+        solid(&mut c, red, [200, 0, 0, 255]);
+        let q = full_frame(w as f32, h as f32);
+        let square = geometry::project(&Placement { cx: 32.0, cy: 32.0, width: 20.0, height: 20.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32);
+        let fx = |kind: u32, params: [f32; 4]| EffectDraw { kind, params, opacity: 1.0, seed: 0, mask: MaskFrame::NONE };
+        let clip = |effects: Vec<EffectDraw>, blend: BlendMode| {
+            DrawItem::Layer(LayerDraw { effects, blend, ..layer_draw(white, square) })
+        };
+
+        // A blurred clip over a sharp background: soft edges spread onto the blue,
+        // the background itself stays untouched far away.
+        c.render(&[layer(blue, q, BlendMode::Normal, 1.0), clip(vec![fx(0, [6.0, 0.0, 0.0, 0.0])], BlendMode::Normal)]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, w, 2, 2), [0, 0, 200], 1), "background sharp: {:?}", px(&img, w, 2, 2));
+        let edge = px(&img, w, 19, 32);
+        assert!(edge[0] > 20 && edge[2] > 150, "blurred edge mixes white over blue: {edge:?}");
+        assert!(px(&img, w, 32, 32)[0] > 240, "center still white");
+
+        // Same blur as an effect layer would blur the blue too: compare against that.
+        c.render(&[layer(red, q, BlendMode::Normal, 1.0), layer(blue, geometry::project(&Placement { cx: 48.0, cy: 32.0, width: 32.0, height: 64.0, pitch: 0.0, yaw: 0.0, roll: 0.0 }, w as f32, h as f32), BlendMode::Normal, 1.0), clip(vec![fx(0, [6.0, 0.0, 0.0, 0.0])], BlendMode::Normal)]);
+        let img = c.read_rgba();
+        let seam = px(&img, w, 33, 2);
+        assert!(close(&seam, [0, 0, 200], 1), "the red/blue seam far from the clip stays sharp: {seam:?}");
+
+        // A vignette on the clip darkens the clip's corners, not the frame around it.
+        c.render(&[layer(blue, q, BlendMode::Normal, 1.0), clip(vec![fx(1, [1.0, 0.0, 0.05, 0.0])], BlendMode::Normal)]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, w, 2, 2), [0, 0, 200], 1), "frame corners untouched by the clip's vignette");
+
+        // Effects in order, then the track blend mode applies to the result.
+        c.render(&[layer(red, q, BlendMode::Normal, 1.0), clip(vec![fx(1, [-1.0, 0.0, 0.01, 0.0])], BlendMode::Multiply)]);
+        let img = c.read_rgba();
+        assert!(close(&px(&img, w, 32, 32), [200, 0, 0], 2), "white multiplied over red is red: {:?}", px(&img, w, 32, 32));
+        assert!(close(&px(&img, w, 2, 2), [200, 0, 0], 1));
+    }
+
+    #[test]
+    fn tone_and_lut_match_the_cpu() {
+        use crate::core::anim::Anim;
+        use crate::core::tone::{self, idx, Lut3D, Tone};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let mut tn = Tone::default();
+        tn.values[idx::IN_BLACK as usize] = Anim::new(0.1);
+        tn.values[idx::GAMMA as usize] = Anim::new(1.8);
+        tn.values[idx::SHADOWS as usize] = Anim::new(0.6);
+        tn.curves.red = vec![[0.0, 0.0], [0.5, 0.7], [1.0, 1.0]];
+        let frame = tn.frame(0.0);
+        let k = SourceKey::Asset(9);
+        let draw = |c: &mut Compositor, rgba: [u8; 4], lut: Option<(u64, f32)>, tone: ToneFrame| {
+            solid(c, k, rgba);
+            c.render(&[DrawItem::Layer(LayerDraw { tone, lut, ..layer_draw(k, full_frame(8.0, 8.0)) })]);
+            px(&c.read_rgba(), 8, 4, 4)
+        };
+        // CPU reference: per-channel table, then the luma table (keeping hue).
+        let cpu = |rgb: [f32; 3]| {
+            let look = |x: f32, ch: usize| {
+                let f = x.clamp(0.0, 1.0) * 63.0;
+                let i = f.floor() as usize;
+                let j = (i + 1).min(63);
+                frame.table[i][ch] + (frame.table[j][ch] - frame.table[i][ch]) * (f - i as f32)
+            };
+            let t = [look(rgb[0], 0), look(rgb[1], 1), look(rgb[2], 2)];
+            let l = 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2];
+            let k = look(l, 3) / l;
+            t.map(|v| (v * k).clamp(0.0, 1.0) * 255.0)
+        };
+        for rgba in [[60u8, 120, 200, 255], [200, 40, 30, 255], [128, 128, 128, 255]] {
+            let got = draw(&mut c, rgba, None, frame);
+            let want = cpu([rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0, rgba[2] as f32 / 255.0]);
+            for ch in 0..3 {
+                assert!((got[ch] as f32 - want[ch]).abs() <= 2.0, "{rgba:?}: got {got:?} want {want:?}");
+            }
+        }
+        // A LUT that swaps red and blue, at full and half intensity.
+        let n = 5;
+        let mut data = Vec::new();
+        for b in 0..n {
+            for gg in 0..n {
+                for r in 0..n {
+                    let s = (n - 1) as f32;
+                    data.push([b as f32 / s, gg as f32 / s, r as f32 / s]);
+                }
+            }
+        }
+        let lut = Lut3D { size: n, data, domain: ([0.0; 3], [1.0; 3]) };
+        c.upload_lut(1, &lut);
+        let swapped = draw(&mut c, [200, 100, 20, 255], Some((1, 1.0)), ToneFrame::NONE);
+        let want = tone::sample_lut(&lut, [200.0 / 255.0, 100.0 / 255.0, 20.0 / 255.0]).map(|v| v * 255.0);
+        for ch in 0..3 {
+            assert!((swapped[ch] as f32 - want[ch]).abs() <= 2.0, "lut: got {swapped:?} want {want:?}");
+        }
+        let half = draw(&mut c, [200, 100, 20, 255], Some((1, 0.5)), ToneFrame::NONE);
+        assert!((half[0] as i32 - 110).abs() <= 2 && (half[2] as i32 - 110).abs() <= 2, "half intensity {half:?}");
+        // A layer naming a LUT that isn't uploaded just skips it.
+        let none = draw(&mut c, [200, 100, 20, 255], Some((99, 1.0)), ToneFrame::NONE);
+        assert!(close(&none, [200, 100, 20], 1));
+    }
+
+    #[test]
+    fn color_range_mask_matches_the_cpu() {
+        use crate::core::anim::Anim;
+        use crate::core::mask::{self, idx, Mask, MaskKind};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let mut m = Mask::new(MaskKind::ColorRange, (8.0, 8.0));
+        m.values[idx::HUE as usize] = Anim::new(30.0);
+        m.values[idx::HUE_RANGE as usize] = Anim::new(20.0);
+        m.values[idx::SOFTNESS as usize] = Anim::new(0.2);
+        let frame = mask::frame(&[m.clone()], 0.0, (8.0, 8.0));
+        let k = SourceKey::Asset(4);
+        for rgba in [[230u8, 120, 20, 255], [40, 200, 60, 255], [128, 128, 128, 255], [230, 160, 20, 255], [210, 40, 60, 255]] {
+            solid(&mut c, k, rgba);
+            c.render(&[DrawItem::Layer(LayerDraw { mask: frame, ..layer_draw(k, full_frame(8.0, 8.0)) })]);
+            let got = px(&c.read_rgba(), 8, 4, 4);
+            let rgb = [rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0, rgba[2] as f32 / 255.0];
+            let cov = mask::coverage_full(&[m.clone()], 0.0, (8.0, 8.0), [4.0, 4.0], None, rgb);
+            for ch in 0..3 {
+                let want = rgba[ch] as f32 * cov;
+                assert!((got[ch] as f32 - want).abs() <= 2.5, "{rgba:?}: coverage {cov}, got {got:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn baked_lut_reproduces_the_grade() {
+        use crate::core::anim::Anim;
+        use crate::core::model::{Asset, AssetId, AssetKind, Project};
+        use crate::core::{grade, tone};
+        let Some(g) = gpu() else { return };
+        let mut c = Compositor::new(g.device, g.queue, 8, 8);
+        let mut p = Project::default();
+        let mut a = Asset::test_asset(AssetKind::Image);
+        a.id = AssetId(1);
+        p.assets.push(a);
+        let id = p.add_clip(AssetId(1), 0, 0.0).unwrap();
+        let clip = p.clip_mut(id).unwrap();
+        clip.adjust.saturation = Anim::new(1.4);
+        clip.grade.values[grade::idx::TEMPERATURE as usize] = Anim::new(0.4);
+        clip.tone.values[tone::idx::GAMMA as usize] = Anim::new(1.3);
+        clip.tone.curves.blue = vec![[0.0, 0.1], [0.6, 0.5], [1.0, 1.0]];
+        let clip = clip.clone();
+        let baked = crate::engine::lut::bake(&c, &clip, 0.0, None, crate::engine::lut::EXPORT_SIZE);
+        assert_eq!(baked.data.len(), 33 * 33 * 33);
+        c.upload_lut(5, &baked);
+        let k = SourceKey::Asset(3);
+        let mut worst = 0i32;
+        for rgba in [[200u8, 80, 40, 255], [30, 140, 220, 255], [90, 90, 90, 255], [250, 240, 200, 255]] {
+            solid(&mut c, k, rgba);
+            // The clip's own grade...
+            let l = clip.local(0.0);
+            c.render(&[DrawItem::Layer(LayerDraw {
+                grade: clip.grade.frame(l),
+                stages: crate::engine::color::stages(&clip.values_at(0.0).adjust),
+                tone: clip.tone.frame(l),
+                ..layer_draw(k, full_frame(8.0, 8.0))
+            })]);
+            let direct = px(&c.read_rgba(), 8, 4, 4);
+            // ...and the same colors through the baked LUT alone.
+            c.render(&[DrawItem::Layer(LayerDraw { lut: Some((5, 1.0)), ..layer_draw(k, full_frame(8.0, 8.0)) })]);
+            let via = px(&c.read_rgba(), 8, 4, 4);
+            for ch in 0..3 {
+                worst = worst.max((direct[ch] as i32 - via[ch] as i32).abs());
+            }
+        }
+        // Within interpolation error. Where the grade clips a channel to black, a LUT
+        // (interpolating between lattice points) can't follow the kink exactly.
+        assert!(worst <= 6, "baked LUT differs from the grade by {worst}");
     }
 }

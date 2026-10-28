@@ -4,6 +4,8 @@ use super::color::{self, Stage};
 use super::text::{self, TextEngine, TextMask};
 use crate::core::grade::GradeFrame;
 use crate::core::mask::{self, MaskFrame};
+use crate::core::tone::{self, ToneFrame};
+use std::path::PathBuf;
 use crate::core::matte::MatteFrame;
 use crate::core::content::{Content, EffectKind, TextParams};
 use crate::core::geometry::Quad;
@@ -38,6 +40,12 @@ pub struct SceneLayer<'a> {
     /// Seconds into the source file for this frame (media only).
     pub source_time: f64,
     pub paint: ScenePaint,
+    /// The clip's own effects (applied to this layer only), in order.
+    pub effects: Vec<SceneEffect>,
+    /// Levels, shadows / highlights and curves.
+    pub tone: ToneFrame,
+    /// LUT file and intensity (loaded and uploaded by preview / export).
+    pub lut: Option<(PathBuf, f32)>,
 }
 
 pub struct SceneEffect {
@@ -101,6 +109,7 @@ fn base_size(project: &Project, clip: &Clip, asset: &Asset) -> (f32, f32) {
 /// Where a clip's corners land at `t` (None for audio and effects).
 /// Use this rather than `Project::clip_quad`, which can't measure text.
 pub fn clip_quad(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine, frame_scale: f32) -> Option<Quad> {
+    let t = clip.chop(t);
     let asset = project.asset(clip.asset)?;
     match &clip.content {
         Some(Content::Effect(_)) => None,
@@ -116,6 +125,7 @@ pub fn clip_quad(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine
 /// Size of a clip's layer in its own pixels (what masks are measured in), and its
 /// on-screen outline. Effect layers cover the frame.
 pub fn layer_space(project: &Project, clip: &Clip, t: f64, engine: &mut TextEngine, frame_scale: f32) -> Option<((f32, f32), Quad)> {
+    let t = clip.chop(t);
     let asset = project.asset(clip.asset)?;
     let frame = (project.width as f32, project.height as f32);
     match &clip.content {
@@ -157,7 +167,7 @@ fn build<'a>(project: &'a Project, t: f64, source_t: f64, upto: usize, motion_bl
                     if asset.kind == AssetKind::Audio {
                         continue;
                     }
-                    let l = clip.local(t);
+                    let l = clip.local(clip.chop(t));
                     let opacity = clip.opacity.eval(l);
                     if opacity <= 0.0 {
                         continue;
@@ -218,6 +228,8 @@ fn layer_at<'a>(
     engine: &mut TextEngine,
     frame_scale: f32,
 ) -> Option<SceneLayer<'a>> {
+    // Frame chopping: the clip only changes at its own frame rate.
+    let (t, source_t) = (clip.chop(t), clip.chop(source_t));
     let l = clip.local(t);
     let v = clip.values_at(t);
     if v.opacity <= 0.0 {
@@ -264,7 +276,21 @@ fn layer_at<'a>(
         mask: mask::frame(&clip.masks, l, base),
         source_time: clip.source_time(source_t),
         paint,
+        effects: clip_effects(clip, l),
+        tone: clip.tone.frame(l),
+        lut: clip.tone.lut.clone().map(|p| (p, clip.tone.values[tone::idx::LUT_INTENSITY as usize].eval(l).clamp(0.0, 1.0))),
     })
+}
+
+/// A clip's own enabled effects at clip time `l`. Motion blur needs the stack around
+/// the clip, so it only works as an effect layer.
+fn clip_effects(clip: &Clip, l: f64) -> Vec<SceneEffect> {
+    clip.effects
+        .iter()
+        .filter(|e| e.enabled && e.effect.kind != EffectKind::MotionBlur)
+        .map(|e| SceneEffect { kind: e.effect.kind, params: [0, 1, 2, 3].map(|i| e.effect.p[i].eval(l)), opacity: e.mix.eval(l).clamp(0.0, 1.0), mask: MaskFrame::NONE })
+        .filter(|e| e.opacity > 0.0)
+        .collect()
 }
 
 /// Replaces the stack built so far (tracks below `track`) with motion blur samples:
@@ -324,6 +350,16 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
         l.mask.masks.iter().flatten().chain(l.mask.points.iter().flatten()).for_each(|v| f(*v));
         l.matte.values().iter().for_each(|v| f(*v));
         f(l.opacity);
+        if l.tone.active {
+            l.tone.table.iter().flatten().for_each(|v| f(*v));
+        }
+        if let Some((_, i)) = &l.lut {
+            f(*i);
+        }
+        for e in &l.effects {
+            f(e.kind.shader_id() as f32);
+            e.params.iter().chain([&e.opacity]).for_each(|v| f(*v));
+        }
         match &l.paint {
             ScenePaint::Media => {}
             ScenePaint::Gradient { colors, positions, angle_deg, .. } => {
@@ -355,8 +391,9 @@ fn fingerprint(items: &[SceneItem]) -> Vec<u32> {
 }
 
 /// A layer's draw settings with the given paint (see `to_draws`).
-pub fn layer_draw(l: &SceneLayer, paint: Paint) -> LayerDraw {
-    LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend }
+pub fn layer_draw(l: &SceneLayer, paint: Paint, seed: u32) -> LayerDraw {
+    let effects = l.effects.iter().map(|e| EffectDraw { kind: e.kind.shader_id(), params: e.params, opacity: e.opacity, seed, mask: e.mask }).collect();
+    LayerDraw { paint, grade: l.grade, mask: l.mask, matte: l.matte, matte_src: None, quad: l.quad, stages: l.stages.clone(), opacity: l.opacity, blend: l.blend, effects, tone: l.tone, lut: None }
 }
 
 /// Converts the scene to GPU draw items. `layer` resolves each layer's picture
@@ -490,14 +527,17 @@ mod tests {
         let first = p.add_clip(id, 0, 0.0).unwrap();
         p.clip_mut(first).unwrap().duration = 2.0;
         let second = p.add_clip(id, 0, 2.0).unwrap();
-        p.clip_mut(second).unwrap().transition_in = Some(Transition::new(TransitionKind::Wipe));
+        p.clip_mut(second).unwrap().duration = 2.0;
+        crate::core::transition::set_start(&mut p, second, Some(Transition::new(TransitionKind::Wipe)));
         let mut text = TextEngine::default();
-        let items = items_at(&p, 2.0, &mut text, 1.0);
+        // The second clip now starts at 1.5 s, overlapping the first until 2.0 s.
+        let items = items_at(&p, 1.75, &mut text, 1.0);
         let [SceneItem::Transition(t)] = &items[..] else { panic!("expected a transition") };
         assert_eq!(t.from.as_ref().unwrap().clip.id, first);
         assert_eq!(t.to.as_ref().unwrap().clip.id, second);
         assert!((t.progress - 0.5).abs() < 1e-3);
-        // The incoming clip shows footage from before its start (held for images).
-        assert!(t.to.as_ref().unwrap().source_time < 0.0 + 1e-9);
+        // Both play their own footage: the incoming clip is 0.25 s into its source.
+        let to = t.to.as_ref().unwrap();
+        assert!((to.source_time - to.clip.source_in - 0.25).abs() < 1e-9);
     }
 }

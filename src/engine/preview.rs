@@ -11,7 +11,6 @@ use super::text::TextEngine;
 use super::gpu::wgpu;
 use super::{color, scene};
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
-use crate::core::transition;
 use crate::media::cache::MediaCache;
 use crate::media::matte::{self, Mattes};
 use crate::media::proxy::{self, Proxies};
@@ -56,6 +55,10 @@ pub struct PreviewRenderer {
     pub waiting: bool,
     /// Index into QUALITIES.
     pub quality: usize,
+    /// Extra resolution while the player is zoomed in (1 = none). Capped at the project size.
+    pub detail: f32,
+    /// LUT files in use.
+    pub luts: super::lut::LutCache,
     /// Clip whose chroma key is switched off in the preview while its key color is picked.
     pub picking_key: Option<ClipId>,
 }
@@ -79,6 +82,8 @@ impl PreviewRenderer {
             last_signature: 0,
             waiting: false,
             picking_key: None,
+            detail: 1.0,
+            luts: Default::default(),
             quality: DEFAULT_QUALITY,
         }
     }
@@ -118,6 +123,13 @@ impl PreviewRenderer {
         (n > 0).then(|| sum.map(|s| (s / n) as u8))
     }
 
+    /// Bakes a clip's color at timeline time `t` into a LUT (see `lut::bake`).
+    pub fn bake_lut(&mut self, clip: &crate::core::model::Clip, t: f64) -> Option<crate::core::tone::Lut3D> {
+        let own = clip.tone.lut.as_ref().and_then(|p| self.luts.get(p));
+        let gpu = self.gpu.as_ref()?;
+        Some(super::lut::bake(&gpu.compositor, clip, t, own.as_ref().map(|(k, l)| (*k, l.as_ref())), super::lut::EXPORT_SIZE))
+    }
+
     pub fn frame_scale(&self, project: &Project) -> f32 {
         self.preview_size(project).0 as f32 / project.width as f32
     }
@@ -126,7 +138,7 @@ impl PreviewRenderer {
     pub fn preview_size(&self, project: &Project) -> (u32, u32) {
         let max_side = QUALITIES.get(self.quality).map_or(1280, |q| q.1);
         let (w, h) = (project.width as f32, project.height as f32);
-        let k = if max_side == 0 { 1.0 } else { (max_side as f32 / w.max(h)).min(1.0) };
+        let k = if max_side == 0 { 1.0 } else { (max_side as f32 * self.detail.max(1.0) / w.max(h)).min(1.0) };
         (((w * k).round() as u32).max(2), ((h * k).round() as u32).max(2))
     }
 
@@ -146,8 +158,7 @@ impl PreviewRenderer {
         // Pre-roll upcoming video clips so they start without a gap.
         if playing {
             for clip in &project.clips {
-                // Transitions can show a clip a little before its start.
-                let first = transition::clip_span(project, clip).0;
+                let first = clip.start;
                 if first > t && first <= t + PREROLL {
                     if let Some(asset) = project.asset(clip.asset).filter(|a| scene::is_video(a)) {
                         let (path, native) = source_for(asset, proxies);
@@ -176,6 +187,8 @@ impl PreviewRenderer {
         let uploaded_text = &mut self.uploaded_text;
         let uploaded_images = &mut self.uploaded_images;
         let compositor = &mut gpu.compositor;
+        let luts = &mut self.luts;
+        let mut keep_luts: HashSet<u64> = HashSet::new();
         let mut waiting = false;
 
         let draws = scene::to_draws(&items, seed, &mut |l: &scene::SceneLayer| {
@@ -224,7 +237,16 @@ impl PreviewRenderer {
                     _ => return None,
                 },
             };
-            let mut d = scene::layer_draw(l, paint);
+            let mut d = scene::layer_draw(l, paint, seed);
+            if let Some((path, intensity)) = &l.lut {
+                if let Some((key, lut)) = luts.get(path) {
+                    if !compositor.has_lut(key) {
+                        compositor.upload_lut(key, &lut);
+                    }
+                    keep_luts.insert(key);
+                    d.lut = Some((key, *intensity));
+                }
+            }
             // The AI matte: decoded like a video, from the cached grayscale file.
             if l.matte.is_on() {
                 let quality = l.clip.matte.as_ref().map(|m| m.quality).unwrap_or_default();
@@ -267,6 +289,7 @@ impl PreviewRenderer {
         self.uploaded_text.retain(|id, _| keep_text.contains(id));
         let live_assets: HashSet<u64> = project.assets.iter().map(|a| a.id.0).collect();
         self.uploaded_images.retain(|a| live_assets.contains(&a.0));
+        gpu.compositor.retain_luts(|k| keep_luts.contains(&k));
         gpu.compositor.retain_sources(|k| match k {
             SourceKey::Clip(c) => keep_streams.contains(&ClipId(*c)) || keep_text.contains(&ClipId(*c)),
             SourceKey::Asset(a) => live_assets.contains(a),

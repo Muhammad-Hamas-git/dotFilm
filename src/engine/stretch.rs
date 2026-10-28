@@ -184,6 +184,9 @@ mod tests {
             grade: Default::default(),
             masks: Vec::new(),
             matte: None,
+            tone: Default::default(),
+            effects: Vec::new(),
+            frame_rate: None,
             transition_in: None,
             transition_out: None,
         }

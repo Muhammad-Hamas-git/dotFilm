@@ -204,6 +204,45 @@ pub struct EffectParams {
     pub p: [Anim; 4],
 }
 
+/// An effect applied to one clip only (its own effect stack), instead of an effect
+/// layer that changes every track below it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClipEffect {
+    pub effect: EffectParams,
+    /// Mix with the clip without this effect, 0..1. Keyframeable.
+    #[serde(default = "full_mix")]
+    pub mix: Anim,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+}
+
+fn full_mix() -> Anim {
+    Anim::new(1.0)
+}
+
+fn enabled() -> bool {
+    true
+}
+
+/// Keyframeable values of a clip effect: the 4 effect settings, then the mix.
+pub const CLIP_EFFECT_VALUES: usize = 5;
+pub const CLIP_EFFECT_MIX: u8 = 4;
+
+impl ClipEffect {
+    pub fn new(kind: EffectKind) -> Self {
+        let Content::Effect(effect) = Content::effect(kind) else { unreachable!() };
+        Self { effect, mix: full_mix(), enabled: true }
+    }
+
+    pub fn anim(&self, i: u8) -> &Anim {
+        if i == CLIP_EFFECT_MIX { &self.mix } else { &self.effect.p[i as usize] }
+    }
+
+    pub fn anim_mut(&mut self, i: u8) -> &mut Anim {
+        if i == CLIP_EFFECT_MIX { &mut self.mix } else { &mut self.effect.p[i as usize] }
+    }
+}
+
 /// How to show one parameter in the UI.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParamInfo {

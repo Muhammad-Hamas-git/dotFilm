@@ -8,7 +8,6 @@ use super::gpu::{self, compositor::{Compositor, Paint, SourceKey}};
 use super::text::TextEngine;
 use super::scene;
 use crate::core::model::{AssetId, AssetKind, ClipId, Project};
-use crate::core::transition;
 use crate::media::{ffmpeg, matte, probe, video::SequentialStream};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -260,17 +259,17 @@ pub fn run(
     let mut images: HashSet<AssetId> = HashSet::new();
     let mut text_engine = TextEngine::default();
     let mut uploaded_text: HashMap<ClipId, u64> = HashMap::new();
+    let mut luts = super::lut::LutCache::default();
     let started = Instant::now();
 
     for i in 0..frames {
         let t = i as f64 / fps as f64;
 
         // Open decoders for clips that are visible now or start soon; close finished ones.
-        // Transitions can show a clip a little before its start and after its end.
-        streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < transition::clip_span(project, c).1));
+        streams.retain(|id, _| project.clip(*id).is_some_and(|c| t < c.end()));
         mattes.retain(|id, _| streams.contains_key(id));
         for clip in &project.clips {
-            let (first, last) = transition::clip_span(project, clip);
+            let (first, last) = (clip.start, clip.end());
             let soon = first <= t + PREROLL && t < last;
             let shown = project.tracks.get(clip.track).is_some_and(|tr| !tr.hidden);
             if !soon || !shown || streams.contains_key(&clip.id) {
@@ -335,7 +334,15 @@ pub fn run(
                     _ => return None,
                 },
             };
-            let mut d = scene::layer_draw(l, paint);
+            let mut d = scene::layer_draw(l, paint, seed);
+            if let Some((path, intensity)) = &l.lut {
+                if let Some((key, lut)) = luts.get(path) {
+                    if !comp.has_lut(key) {
+                        comp.upload_lut(key, &lut);
+                    }
+                    d.lut = Some((key, *intensity));
+                }
+            }
             if l.matte.is_on() {
                 if let Some((stream, rate, from, uploaded)) = mattes.get_mut(&l.clip.id) {
                     let index = ((l.source_time - *from) * *rate).round().max(0.0) as u64;
@@ -408,7 +415,7 @@ fn write_mix(project: &Project, audio: &HashMap<AssetId, Arc<Vec<i16>>>, total: 
             }
         };
         let stretched = stretch::needed(c).then(|| Arc::new(stretch::stretch(&pcm, c)));
-        clips.push(audio_clip(c, pcm, stretched));
+        clips.push(audio_clip(c, pcm, stretched, crate::core::transition::audio_fades(project, c)));
     }
 
     let frames = (total * rate as f64).ceil() as u64;

@@ -12,6 +12,8 @@ use crate::engine::scene;
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 // ----- Values you can tune -----
+const ZOOM_RANGE: (f32, f32) = (0.25, 32.0); // player zoom limits, relative to "fit"
+const ZOOM_STEP: f32 = 1.0; // how fast Ctrl+scroll zooms (1 = egui's default speed)
 const HANDLE_SIZE: f32 = 10.0; // corner handle size, screen pixels
 const CENTER_SNAP_PX: f32 = 8.0; // snap to frame center within this distance
 
@@ -24,6 +26,10 @@ enum Drag {
 #[derive(Default)]
 pub struct PlayerState {
     drag: Option<Drag>,
+    /// Player zoom as a power of two (0 = fit the frame in the panel).
+    pub zoom_log: f32,
+    /// Offset of the zoomed frame from the panel center, screen pixels.
+    pub pan: egui::Vec2,
     /// Mask being edited on the player.
     pub masks: super::masks::MaskUi,
     /// Shown while a moved clip is snapped to the center.
@@ -47,11 +53,15 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     let area = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(area, Sense::click_and_drag());
 
-    // Fit the output frame into the panel.
+    // Fit the output frame into the panel, then apply zoom and pan.
     let (pw, ph) = (app.project.width as f32, app.project.height as f32);
-    let k = ((area.width() - 16.0) / pw).min((area.height() - 16.0) / ph).max(0.01);
-    let frame = Rect::from_center_size(area.center(), vec2(pw * k, ph * k));
+    zoom_and_pan(app, ui, &response, area);
+    let fit = ((area.width() - 16.0) / pw).min((area.height() - 16.0) / ph).max(0.01);
+    let k = fit * zoom_factor(app);
+    let frame = Rect::from_center_size(area.center() + app.player.pan, vec2(pw * k, ph * k));
     let to_screen = |x: f32, y: f32| pos2(frame.left() + x * k, frame.top() + y * k);
+    // Zoomed in, the preview renders sharper (up to the project's own size).
+    app.preview.detail = zoom_factor(app).max(1.0);
 
     let ctx = ui.ctx().clone();
     let texture = app.preview.update(&app.project, &app.media, &app.proxies, &app.mattes, app.playhead, app.playing);
@@ -106,7 +116,9 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
             if response.hover_pos().is_some_and(|p| frame.contains(p)) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             }
-            painter.text(frame.center_top() + vec2(0.0, 14.0), Align2::CENTER_TOP, "Click the background color to remove (Esc cancels)", FontId::proportional(14.0), Color32::WHITE);
+            let pick_mask = app.player.masks.pick;
+            let hint = if pick_mask.is_some() { "Click the color to isolate (Esc cancels)" } else { "Click the background color to remove (Esc cancels)" };
+            painter.text(frame.center_top() + vec2(0.0, 14.0), Align2::CENTER_TOP, hint, FontId::proportional(14.0), Color32::WHITE);
             if response.clicked() {
                 if let Some(p) = response.interact_pointer_pos().filter(|p| frame.contains(*p)) {
                     let (u, v) = ((p.x - frame.left()) / frame.width(), (p.y - frame.top()) / frame.height());
@@ -114,14 +126,24 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
                         app.history.checkpoint(&app.project);
                         if let Some(c) = app.project.clip_mut(id) {
                             let l = c.local(t.clamp(c.start, c.end() - 1e-6));
-                            for (k, v) in rgb.iter().enumerate() {
-                                c.param_mut(Param::Grade(crate::core::grade::idx::KEY_COLOR + k as u8)).set(l, *v as f32 / 255.0, tol);
+                            match pick_mask.filter(|m| *m < c.masks.len()) {
+                                // A color range mask: centre it on the picked hue.
+                                Some(m) => {
+                                    let hsl = crate::core::mask::rgb_to_hsl(rgb.map(|v| v as f32 / 255.0));
+                                    c.param_mut(Param::Mask(m as u8, crate::core::mask::idx::HUE)).set(l, hsl[0], tol);
+                                }
+                                None => {
+                                    for (k, v) in rgb.iter().enumerate() {
+                                        c.param_mut(Param::Grade(crate::core::grade::idx::KEY_COLOR + k as u8)).set(l, *v as f32 / 255.0, tol);
+                                    }
+                                    c.grade.chroma_key = true;
+                                }
                             }
-                            c.grade.chroma_key = true;
                         }
                     }
                 }
                 app.preview.picking_key = None;
+                app.player.masks.pick = None;
             }
             return;
         }
@@ -133,7 +155,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     }
 
     // --- start drag: corner of the selected clip, or the topmost picture under the cursor ---
-    if response.drag_started() {
+    if response.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
         app.player.drag = match selected_shape {
             Some(s) if corner_hit(s, origin) => {
@@ -154,7 +176,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     }
 
     // --- dragging ---
-    if response.dragged() {
+    if response.dragged_by(egui::PointerButton::Primary) {
         if let (Some(drag), Some(p)) = (app.player.drag, response.interact_pointer_pos()) {
             match drag {
                 Drag::Move { clip, press, start_x, start_y } => {
@@ -186,7 +208,7 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
             }
         }
     }
-    if response.drag_stopped() {
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         app.player.drag = None;
         app.player.guides = (false, false);
     }
@@ -289,6 +311,34 @@ fn source_view(app: &mut EditorApp, ui: &mut Ui) {
     }
 }
 
+fn zoom_factor(app: &EditorApp) -> f32 {
+    2f32.powf(app.player.zoom_log)
+}
+
+/// Ctrl+scroll zooms at the cursor, middle-button drag pans.
+fn zoom_and_pan(app: &mut EditorApp, ui: &Ui, response: &egui::Response, area: Rect) {
+    if let Some(cursor) = response.hover_pos() {
+        let z = ui.input(|i| i.zoom_delta());
+        if (z - 1.0).abs() > 1e-4 {
+            let old = zoom_factor(app);
+            let (lo, hi) = (ZOOM_RANGE.0.log2(), ZOOM_RANGE.1.log2());
+            app.player.zoom_log = (app.player.zoom_log + z.log2() * ZOOM_STEP).clamp(lo, hi);
+            let s = zoom_factor(app) / old;
+            // Keep the point under the cursor in place.
+            let center = area.center() + app.player.pan;
+            let new_center = cursor - (cursor - center) * s;
+            app.player.pan = new_center - area.center();
+        }
+    }
+    if response.dragged_by(egui::PointerButton::Middle) {
+        app.player.pan += response.drag_delta();
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    }
+    if app.player.zoom_log.abs() < 1e-3 && app.player.pan.length() < 0.5 {
+        app.player.pan = egui::Vec2::ZERO;
+    }
+}
+
 fn transport(app: &mut EditorApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         if ui.button("|<").on_hover_text("Go to start (Home)").clicked() {
@@ -310,6 +360,18 @@ fn transport(app: &mut EditorApp, ui: &mut Ui) {
         ui.monospace(format!("{} / {}", format_time(app.view_time()), format_time(app.view_project().duration())));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let full = if app.fullscreen { "Exit full screen" } else { "Full screen" };
+            if ui.button(full).on_hover_text("F11 (Esc leaves)").clicked() {
+                let on = !app.fullscreen;
+                app.set_fullscreen(ui.ctx(), on);
+            }
+            let zoomed = app.player.zoom_log.abs() > 1e-3 || app.player.pan != egui::Vec2::ZERO;
+            let label = if zoomed { format!("{:.0}%", zoom_factor(app) * 100.0) } else { "Fit".to_string() };
+            if ui.add_enabled(zoomed, egui::Button::new(label)).on_hover_text("Ctrl + scroll to zoom, middle-drag to pan. Click to fit.").clicked() {
+                app.player.zoom_log = 0.0;
+                app.player.pan = egui::Vec2::ZERO;
+            }
+            ui.separator();
             ui.label(egui::RichText::new(format!("{} x {}  {} fps", app.project.width, app.project.height, app.project.fps)).weak());
             ui.separator();
             egui::ComboBox::from_id_salt("preview-quality")

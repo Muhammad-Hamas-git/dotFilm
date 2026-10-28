@@ -39,6 +39,7 @@ pub struct InspectorState {
     /// Filter typed into the font list.
     font_search: String,
     grading: super::grading::GradingState,
+    tone: super::tone::ToneUi,
 }
 
 /// Collects what the widgets did this frame.
@@ -70,21 +71,26 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
         let before = app.project.clone();
         let mut t = Tracker::default();
 
+        let mut tone_action = None;
         match app.selected.filter(|id| app.project.clip(*id).is_some()) {
             Some(id) => {
                 let frame_scale = app.preview.frame_scale(&app.project);
                 let ctx = ClipCtx {
                     frame_scale,
-                    mask_edit: &mut app.player.masks.edit,
+                    masks: &mut app.player.masks,
                     text: &mut app.preview.text,
                     font_search: &mut app.inspector.font_search,
                     grading: &mut app.inspector.grading,
+                    tone: &mut app.inspector.tone,
                     picking: &mut app.preview.picking_key,
                     mattes: &app.mattes,
                 };
-                clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, ctx)
+                tone_action = clip_inspector(ui, &mut app.project, id, app.playhead, &mut t, ctx);
             }
             None => project_inspector(ui, &mut app.project, &mut t),
+        }
+        if let (Some(super::tone::ToneAction::ExportLut), Some(id)) = (tone_action, app.selected) {
+            export_lut(app, id);
         }
 
         if t.changed && !app.inspector.editing {
@@ -135,6 +141,8 @@ fn widget_for(p: Param) -> Widget {
         Param::Content(_) => s(0.0..=1.0, 2),
         Param::Grade(i) => info_widget(&crate::core::grade::info(i)),
         Param::Matte(i) => info_widget(&crate::core::matte::info(i)),
+        Param::ClipEffect(..) => Widget::Slider { range: 0.0..=1.0, decimals: 2, log: false, suffix: "" },
+        Param::Tone(i) => info_widget(&crate::core::tone::info(i)),
         Param::Mask(_, i) => {
             use crate::core::mask::{self, idx};
             match i {
@@ -168,6 +176,45 @@ fn content_param(content: Option<&Content>, i: u8) -> (&'static str, Widget) {
     }
 }
 
+/// A parameter's name and value widget, as shown for this clip.
+fn label_and_widget(clip: &Clip, p: Param) -> (&'static str, Widget) {
+    match p {
+        Param::Content(i) => content_param(clip.content.as_ref(), i),
+        Param::Opacity if clip.content.as_ref().is_some_and(|c| c.is_effect()) => ("Mix", widget_for(p)),
+        Param::Mask(m, i) if (i as usize) < crate::core::mask::VALUES => (crate::core::mask::info(clip.masks[m as usize].kind, i).label, widget_for(p)),
+        Param::ClipEffect(_, crate::core::content::CLIP_EFFECT_MIX) => ("Mix", widget_for(p)),
+        Param::ClipEffect(e, i) => match clip.effects[e as usize].effect.kind.params().get(i as usize).copied().flatten() {
+            Some(info) => (info.label, info_widget(&info)),
+            None => ("Value", widget_for(p)),
+        },
+        _ => (p.label(), widget_for(p)),
+    }
+}
+
+/// A parameter's full name for lists (the keyframe table): its group, then its name.
+pub(super) fn param_title(clip: &Clip, p: Param) -> String {
+    let name = label_and_widget(clip, p).0;
+    let group = match p {
+        Param::X | Param::Y | Param::Scale | Param::Opacity => "Transform",
+        Param::Pitch | Param::Yaw | Param::Roll => "3D",
+        Param::Brightness | Param::Contrast | Param::Saturation | Param::Hue | Param::Value => "Color",
+        Param::Volume => "Audio",
+        Param::Speed => "Speed",
+        Param::Content(_) => match &clip.content {
+            Some(crate::core::content::Content::Effect(e)) => e.kind.label(),
+            Some(crate::core::content::Content::Text(_)) => "Text",
+            Some(crate::core::content::Content::Gradient(_)) => "Gradient",
+            _ => "Fill",
+        },
+        Param::Grade(_) => "Grade",
+        Param::Mask(m, _) => return format!("Mask {} {}", m + 1, name),
+        Param::Matte(_) => "Background removal",
+        Param::ClipEffect(e, _) => return format!("{} {}", clip.effects.get(e as usize).map_or("Effect", |x| x.effect.kind.label()), name),
+        Param::Tone(_) => "Tone",
+    };
+    format!("{group} {name}")
+}
+
 /// One row: keyframe diamond, name, value widget.
 pub(super) fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol: f64, t: &mut Tracker) {
     let anim = clip.param(p);
@@ -176,12 +223,7 @@ pub(super) fn param_row(ui: &mut Ui, clip: &mut Clip, p: Param, local: f64, tol:
         clip.param_mut(p).toggle_key(local, tol);
         t.changed = true;
     }
-    let (label, widget) = match p {
-        Param::Content(i) => content_param(clip.content.as_ref(), i),
-        Param::Opacity if clip.content.as_ref().is_some_and(|c| c.is_effect()) => ("Mix", widget_for(p)),
-        Param::Mask(m, i) if (i as usize) < crate::core::mask::VALUES => (crate::core::mask::info(clip.masks[m as usize].kind, i).label, widget_for(p)),
-        _ => (p.label(), widget_for(p)),
-    };
+    let (label, widget) = label_and_widget(clip, p);
     ui.label(label);
     let mut v = clip.param(p).eval(local);
     let r = match widget {
@@ -340,19 +382,21 @@ fn param_grid(ui: &mut Ui, id: &str, clip: &mut Clip, params: &[Param], local: f
 /// Editor state the clip inspector needs besides the project.
 struct ClipCtx<'a> {
     frame_scale: f32,
-    mask_edit: &'a mut Option<super::masks::MaskEdit>,
+    masks: &'a mut super::masks::MaskUi,
     text: &'a mut TextEngine,
     font_search: &'a mut String,
     grading: &'a mut super::grading::GradingState,
+    tone: &'a mut super::tone::ToneUi,
     picking: &'a mut Option<ClipId>,
     mattes: &'a crate::media::matte::Mattes,
 }
 
-fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, ctx: ClipCtx) {
+fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64, t: &mut Tracker, ctx: ClipCtx) -> Option<super::tone::ToneAction> {
+    let mut tone_action = None;
     let tol = project.key_tolerance();
     let (pw, ph) = (project.width as f32, project.height as f32);
-    let Some(mut c) = project.clip(id).cloned() else { return };
-    let Some(asset) = project.asset(c.asset).cloned() else { return };
+    let Some(mut c) = project.clip(id).cloned() else { return None };
+    let Some(asset) = project.asset(c.asset).cloned() else { return None };
     let fit = project.fit_size(&asset);
     // Keyframes live in source time; clamp so editing works with the playhead outside the clip.
     let local = c.local(playhead.clamp(c.start, c.end() - 1e-6));
@@ -406,6 +450,21 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
                 timing_changed = true;
             }
             ui.end_row();
+            // Frame chopping: the clip changes only at its own frame rate.
+            ui.label("Frame rate");
+            ui.horizontal(|ui| {
+                let mut own = c.frame_rate.is_some();
+                if ui.checkbox(&mut own, "Own").on_hover_text("Play this clip at a lower frame rate than the project (choppy, stop-motion look)").changed() {
+                    c.frame_rate = own.then_some((project.fps as f32 / 2.0).max(1.0));
+                    timing_changed = true;
+                }
+                if let Some(fps) = c.frame_rate.as_mut() {
+                    let r = ui.add(egui::DragValue::new(fps).speed(0.1).range(1.0..=project.fps as f32).max_decimals(2).suffix(" fps"));
+                    t.add(&r);
+                    timing_changed |= user_edit(&r);
+                }
+            });
+            ui.end_row();
         });
     });
     t.changed |= timing_changed;
@@ -453,16 +512,20 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
             }
         });
         super::grading::section(ui, &mut c, local, tol, t, ctx.grading, ctx.picking);
+        tone_action = super::tone::section(ui, &mut c, local, tol, t, ctx.tone);
         if crate::media::matte::supports(&asset) && c.content.is_none() {
             super::matte::section(ui, &mut c, &asset, ctx.mattes, local, tol, t);
         }
     }
+    if asset.kind != AssetKind::Audio && !is_effect {
+        super::clip_effects::section(ui, &mut c, local, tol, t);
+    }
     if super::masks::supports_masks(project, &c) {
         if let Some((size, _)) = crate::engine::scene::layer_space(project, &c, playhead, ctx.text, ctx.frame_scale) {
-            super::masks::section(ui, &mut c, size, local, tol, t, ctx.mask_edit);
+            super::masks::section(ui, &mut c, size, local, tol, t, ctx.masks, ctx.picking);
         }
     }
-    super::transitions::section(ui, project, &mut c, t);
+    let transition_change = super::transitions::section(ui, project, &c, t);
     if asset.kind == AssetKind::Video || asset.kind == AssetKind::Audio {
         egui::CollapsingHeader::new("Speed").default_open(true).show(ui, |ui| {
             let before = c.speed.clone();
@@ -534,6 +597,26 @@ fn clip_inspector(ui: &mut Ui, project: &mut Project, id: ClipId, playhead: f64,
         if let Some(target) = project.clip_mut(id) {
             *target = c;
         }
+    }
+    // Applied after the clip itself: a cut transition moves this and later clips.
+    if let Some(change) = transition_change {
+        change.apply(project, id);
+    }
+    tone_action
+}
+
+/// Saves a clip's color (at the playhead) as a .cube LUT.
+fn export_lut(app: &mut EditorApp, id: ClipId) {
+    let Some(clip) = app.project.clip(id).cloned() else { return };
+    let name = app.project.asset(clip.asset).map(|a| a.name.clone()).unwrap_or_else(|| "grade".into());
+    let stem = std::path::Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(name);
+    let Some(path) = rfd::FileDialog::new().add_filter("LUT", &["cube"]).set_file_name(format!("{stem}.cube")).save_file() else { return };
+    match app.preview.bake_lut(&clip, app.playhead) {
+        Some(lut) => match std::fs::write(&path, crate::core::tone::write_cube(&lut, &stem)) {
+            Ok(()) => app.set_status(format!("LUT saved: {}", path.display())),
+            Err(e) => app.set_status(format!("Couldn't save the LUT: {e}")),
+        },
+        None => app.set_status("Exporting a LUT needs the GPU preview."),
     }
 }
 

@@ -1,12 +1,13 @@
 //! Transitions on clip edges.
 //!
 //! A clip can have a transition at its start (`transition_in`) and its end
-//! (`transition_out`). Where two clips touch on the same track (a cut), the
-//! transition plays *across* the cut: centered on it, using footage just past the
-//! outgoing clip's end and just before the incoming clip's start (the edge frame is
-//! held when the file has none). At a cut the incoming clip's `transition_in` is
-//! used, else the outgoing clip's `transition_out`. On a free edge the clip fades,
-//! wipes, etc. in from (or out to) whatever is below it.
+//! (`transition_out`). Between two clips on the same track (a cut) it works like
+//! CapCut: the incoming clip really overlaps the outgoing one by the transition's
+//! length. The incoming clip starts playing from its first frame when the
+//! transition starts, while the outgoing one plays out its last frames. Adding,
+//! lengthening or removing a cut transition moves the incoming clip and every clip
+//! after it on that track (see `set_start` / `set_end`). On a free edge the clip
+//! fades, wipes, etc. in from (or out to) whatever is below it.
 
 use super::anim::Ease;
 use super::model::{AssetKind, Clip, ClipId, Project};
@@ -132,20 +133,29 @@ pub fn supports_transitions(project: &Project, clip: &Clip) -> bool {
     !is_effect && project.asset(clip.asset).is_some_and(|a| a.kind != AssetKind::Audio)
 }
 
-/// The clip that ends exactly where `clip` starts, on the same track.
-pub fn previous_touching<'a>(project: &'a Project, clip: &Clip) -> Option<&'a Clip> {
+/// The clip just before `clip` on its track that touches or overlaps its start.
+pub fn previous_partner<'a>(project: &'a Project, clip: &Clip) -> Option<&'a Clip> {
     project
         .clips
         .iter()
-        .find(|c| c.id != clip.id && c.track == clip.track && (c.end() - clip.start).abs() < CUT_TOLERANCE && supports_transitions(project, c))
+        .filter(|c| c.id != clip.id && c.track == clip.track && supports_transitions(project, c))
+        .filter(|c| c.start < clip.start - CUT_TOLERANCE && c.end() > clip.start - CUT_TOLERANCE && c.end() < clip.end())
+        .max_by(|a, b| a.end().total_cmp(&b.end()))
 }
 
-/// The clip that starts exactly where `clip` ends, on the same track.
-pub fn next_touching<'a>(project: &'a Project, clip: &Clip) -> Option<&'a Clip> {
+/// The clip just after `clip` on its track that touches or overlaps its end.
+pub fn next_partner<'a>(project: &'a Project, clip: &Clip) -> Option<&'a Clip> {
     project
         .clips
         .iter()
-        .find(|c| c.id != clip.id && c.track == clip.track && (c.start - clip.end()).abs() < CUT_TOLERANCE && supports_transitions(project, c))
+        .filter(|c| c.id != clip.id && c.track == clip.track && supports_transitions(project, c))
+        .filter(|c| c.start > clip.start + CUT_TOLERANCE && c.start < clip.end() + CUT_TOLERANCE && c.end() > clip.end())
+        .min_by(|a, b| a.start.total_cmp(&b.start))
+}
+
+/// How far `clip` reaches back into the previous clip (0 when they just touch).
+pub fn overlap(prev: &Clip, clip: &Clip) -> f64 {
+    (prev.end() - clip.start).max(0.0)
 }
 
 /// Every transition on one track, in time order.
@@ -154,27 +164,19 @@ pub fn windows_on_track(project: &Project, track: usize) -> Vec<Window> {
     clips.sort_by(|a, b| a.start.total_cmp(&b.start));
     let mut out = Vec::new();
     for c in &clips {
-        let prev = previous_touching(project, c);
-        let next = next_touching(project, c);
-        // Start edge.
-        match prev {
-            Some(p) => {
-                // Cuts are emitted once, from the incoming clip's side.
-                if let Some(tr) = c.transition_in.or(p.transition_out) {
-                    let d = tr.duration.min(p.duration).min(c.duration).max(MIN_DURATION);
-                    out.push(Window { from: Some(p.id), to: Some(c.id), edge: Edge::Cut, start: c.start - d / 2.0, end: c.start + d / 2.0, transition: tr });
-                }
-            }
-            None => {
-                if let Some(tr) = c.transition_in {
+        let prev = previous_partner(project, c);
+        if let Some(tr) = c.transition_in {
+            match prev.filter(|p| overlap(p, c) > CUT_TOLERANCE) {
+                // A cut: exactly the overlap.
+                Some(p) => out.push(Window { from: Some(p.id), to: Some(c.id), edge: Edge::Cut, start: c.start, end: p.end(), transition: tr }),
+                None => {
                     let d = tr.duration.min(c.duration).max(MIN_DURATION);
                     out.push(Window { from: None, to: Some(c.id), edge: Edge::In, start: c.start, end: c.start + d, transition: tr });
                 }
             }
         }
-        // End edge (cuts are handled by the next clip).
-        if next.is_none() {
-            if let Some(tr) = c.transition_out {
+        if let Some(tr) = c.transition_out {
+            if next_partner(project, c).is_none() {
                 let d = tr.duration.min(c.duration).max(MIN_DURATION);
                 out.push(Window { from: Some(c.id), to: None, edge: Edge::Out, start: c.end() - d, end: c.end(), transition: tr });
             }
@@ -182,6 +184,109 @@ pub fn windows_on_track(project: &Project, track: usize) -> Vec<Window> {
     }
     out.sort_by(|a, b| a.start.total_cmp(&b.start));
     out
+}
+
+/// Longest cut transition between `prev` and `clip`: both keep at least `MIN_CLIP` of their own.
+fn max_overlap(prev: &Clip, clip: &Clip) -> f64 {
+    (prev.duration.min(clip.duration) - crate::core::model::MIN_CLIP).max(MIN_DURATION)
+}
+
+/// Sets (or removes, with None) the transition at a clip's start. At a cut this
+/// slides the clip and everything after it on the track so it overlaps the previous
+/// clip by the transition's length.
+pub fn set_start(project: &mut Project, id: ClipId, tr: Option<Transition>) {
+    let Some(clip) = project.clip(id).cloned() else { return };
+    let mut tr = tr;
+    if let Some(prev) = previous_partner(project, &clip).cloned() {
+        let old = overlap(&prev, &clip);
+        let new = match &mut tr {
+            Some(t) => {
+                t.duration = t.duration.clamp(MIN_DURATION, max_overlap(&prev, &clip));
+                t.duration
+            }
+            None => 0.0,
+        };
+        let delta = new - old;
+        if delta.abs() > 1e-9 {
+            for c in project.clips.iter_mut().filter(|c| c.track == clip.track && c.start >= clip.start - CUT_TOLERANCE && c.id != prev.id) {
+                c.start -= delta;
+            }
+        }
+    }
+    if let Some(c) = project.clip_mut(id) {
+        c.transition_in = tr;
+    }
+}
+
+/// Sets the transition at a clip's end. At a cut it becomes the next clip's start
+/// transition (one transition per cut).
+pub fn set_end(project: &mut Project, id: ClipId, tr: Option<Transition>) {
+    let Some(clip) = project.clip(id).cloned() else { return };
+    match next_partner(project, &clip).map(|n| n.id) {
+        Some(next) => {
+            if let Some(c) = project.clip_mut(id) {
+                c.transition_out = None;
+            }
+            set_start(project, next, tr);
+        }
+        None => {
+            if let Some(c) = project.clip_mut(id) {
+                c.transition_out = tr;
+            }
+        }
+    }
+}
+
+/// After clips were dragged or trimmed by hand: each cut transition's length becomes
+/// its actual overlap.
+pub fn sync_durations(project: &mut Project) {
+    let fixes: Vec<(ClipId, f64)> = project
+        .clips
+        .iter()
+        .filter(|c| c.transition_in.is_some())
+        .filter_map(|c| previous_partner(project, c).map(|p| (c.id, overlap(p, c))))
+        .filter(|(_, ov)| *ov > CUT_TOLERANCE)
+        .collect();
+    for (id, ov) in fixes {
+        if let Some(tr) = project.clip_mut(id).and_then(|c| c.transition_in.as_mut()) {
+            tr.duration = ov;
+        }
+    }
+}
+
+/// Sound fades (in, out) in seconds: across a cut transition both clips play, so the
+/// outgoing sound fades out while the incoming one fades in.
+pub fn audio_fades(project: &Project, clip: &Clip) -> (f64, f64) {
+    let fade_in = if clip.transition_in.is_some() { previous_partner(project, clip).map_or(0.0, |p| overlap(p, clip)) } else { 0.0 };
+    let fade_out = next_partner(project, clip).filter(|n| n.transition_in.is_some()).map_or(0.0, |n| overlap(clip, n));
+    (fade_in, fade_out)
+}
+
+/// The transition shown for a clip's end: its own, or the next clip's start transition at a cut.
+pub fn end_transition(project: &Project, clip: &Clip) -> Option<Transition> {
+    match next_partner(project, clip) {
+        Some(n) => n.transition_in,
+        None => clip.transition_out,
+    }
+}
+
+/// Converts cut transitions saved before overlaps existed (centered on a cut between
+/// touching clips) to overlaps.
+pub fn upgrade_centered_cuts(project: &mut Project) {
+    let mut ids: Vec<(usize, f64, ClipId)> = project.clips.iter().map(|c| (c.track, c.start, c.id)).collect();
+    ids.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    for (_, _, id) in ids {
+        let Some(clip) = project.clip(id).cloned() else { continue };
+        let Some(prev) = previous_partner(project, &clip).cloned() else { continue };
+        if overlap(&prev, &clip) > CUT_TOLERANCE {
+            continue;
+        }
+        let Some(tr) = clip.transition_in.or(prev.transition_out) else { continue };
+        if let Some(p) = project.clip_mut(prev.id) {
+            p.transition_out = None;
+        }
+        set_start(project, id, Some(tr));
+    }
 }
 
 /// What a track shows at time `t`.
@@ -210,84 +315,105 @@ pub fn track_at(project: &Project, track: usize, t: f64) -> Vec<TrackShow<'_>> {
     shows
 }
 
-/// The timeline range a clip is drawn in, including transitions that reach past its edges.
-pub fn clip_span(project: &Project, clip: &Clip) -> (f64, f64) {
-    let (mut a, mut b) = (clip.start, clip.end());
-    if supports_transitions(project, clip) {
-        for w in windows_on_track(project, clip.track) {
-            if w.edge == Edge::Cut && (w.from == Some(clip.id) || w.to == Some(clip.id)) {
-                a = a.min(w.start);
-                b = b.max(w.end);
-            }
-        }
-    }
-    (a, b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::model::{Asset, AssetId, AssetKind, Project};
 
-    fn project_with_two_clips() -> (Project, ClipId, ClipId) {
+    /// Three 2 s clips touching on track 0: A 0-2, B 2-4, C 4-6.
+    fn project_with_three_clips() -> (Project, ClipId, ClipId, ClipId) {
         let mut p = Project::default();
         let mut asset = Asset::test_asset(AssetKind::Image);
         asset.id = AssetId(1);
         p.assets.push(asset);
-        let a = p.add_clip(AssetId(1), 0, 0.0).unwrap();
-        p.clip_mut(a).unwrap().duration = 2.0;
-        let b = p.add_clip(AssetId(1), 0, 2.0).unwrap();
-        p.clip_mut(b).unwrap().duration = 2.0;
-        (p, a, b)
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = p.add_clip(AssetId(1), 0, i as f64 * 2.0).unwrap();
+            p.clip_mut(id).unwrap().duration = 2.0;
+            ids.push(id);
+        }
+        (p, ids[0], ids[1], ids[2])
     }
 
     #[test]
-    fn cut_transition_is_centered_on_the_cut() {
-        let (mut p, a, b) = project_with_two_clips();
-        p.clip_mut(b).unwrap().transition_in = Some(Transition::new(TransitionKind::Crossfade));
+    fn cut_transition_overlaps_and_ripples() {
+        let (mut p, a, b, c) = project_with_three_clips();
+        set_start(&mut p, b, Some(Transition::new(TransitionKind::Crossfade)));
+        // B moved back into A by the transition length; C followed.
+        assert!((p.clip(b).unwrap().start - 1.5).abs() < 1e-9);
+        assert!((p.clip(c).unwrap().start - 3.5).abs() < 1e-9);
         let w = windows_on_track(&p, 0);
         assert_eq!(w.len(), 1);
         assert_eq!((w[0].from, w[0].to, w[0].edge), (Some(a), Some(b), Edge::Cut));
-        assert!((w[0].start - 1.75).abs() < 1e-9 && (w[0].end - 2.25).abs() < 1e-9);
-        // Before the window: only A. Inside: one transition, no plain clips. After: only B.
-        assert!(matches!(track_at(&p, 0, 1.5)[..], [TrackShow::Clip(c)] if c.id == a));
-        assert!(matches!(track_at(&p, 0, 1.9)[..], [TrackShow::Transition { .. }]));
-        assert!(matches!(track_at(&p, 0, 2.1)[..], [TrackShow::Transition { .. }]));
-        assert!(matches!(track_at(&p, 0, 2.3)[..], [TrackShow::Clip(c)] if c.id == b));
-        // A is drawn a little past its end, B a little before its start.
-        let ca = p.clip(a).unwrap().clone();
-        let cb = p.clip(b).unwrap().clone();
-        assert!((clip_span(&p, &ca).1 - 2.25).abs() < 1e-9);
-        assert!((clip_span(&p, &cb).0 - 1.75).abs() < 1e-9);
+        assert!((w[0].start - 1.5).abs() < 1e-9 && (w[0].end - 2.0).abs() < 1e-9);
+        // B plays from its first frame when the transition starts.
+        let cb = p.clip(b).unwrap();
+        assert!((cb.source_time(1.5) - cb.source_in).abs() < 1e-9);
+        // Before: only A. Inside: the transition. After: only B.
+        assert!(matches!(track_at(&p, 0, 1.4)[..], [TrackShow::Clip(x)] if x.id == a));
+        assert!(matches!(track_at(&p, 0, 1.8)[..], [TrackShow::Transition { .. }]));
+        assert!(matches!(track_at(&p, 0, 2.1)[..], [TrackShow::Clip(x)] if x.id == b));
+        // Longer, then removed: everything slides back.
+        let mut tr = Transition::new(TransitionKind::Wipe);
+        tr.duration = 1.0;
+        set_start(&mut p, b, Some(tr));
+        assert!((p.clip(b).unwrap().start - 1.0).abs() < 1e-9 && (p.clip(c).unwrap().start - 3.0).abs() < 1e-9);
+        set_start(&mut p, b, None);
+        assert!((p.clip(b).unwrap().start - 2.0).abs() < 1e-9 && (p.clip(c).unwrap().start - 4.0).abs() < 1e-9);
+        assert!(windows_on_track(&p, 0).is_empty());
     }
 
     #[test]
-    fn outgoing_transition_works_at_a_cut_and_on_a_free_end() {
-        let (mut p, a, b) = project_with_two_clips();
-        p.clip_mut(a).unwrap().transition_out = Some(Transition::new(TransitionKind::Wipe));
-        p.clip_mut(b).unwrap().transition_out = Some(Transition::new(TransitionKind::FadeBlack));
+    fn end_transition_at_a_cut_belongs_to_the_next_clip() {
+        let (mut p, a, b, c) = project_with_three_clips();
+        set_end(&mut p, a, Some(Transition::new(TransitionKind::FadeBlack)));
+        assert!(p.clip(a).unwrap().transition_out.is_none());
+        assert_eq!(p.clip(b).unwrap().transition_in.unwrap().kind, TransitionKind::FadeBlack);
+        assert_eq!(end_transition(&p, p.clip(a).unwrap()).unwrap().kind, TransitionKind::FadeBlack);
+        // The last clip's end is free: a fade out inside the clip.
+        set_end(&mut p, c, Some(Transition::new(TransitionKind::Crossfade)));
         let w = windows_on_track(&p, 0);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].edge, Edge::Cut);
-        assert_eq!(w[0].transition.kind, TransitionKind::Wipe);
-        assert_eq!((w[1].from, w[1].to, w[1].edge), (Some(b), None, Edge::Out));
-        assert!((w[1].start - 3.5).abs() < 1e-9 && (w[1].end - 4.0).abs() < 1e-9);
+        let out = w.iter().find(|w| w.edge == Edge::Out).unwrap();
+        let cc = p.clip(c).unwrap();
+        assert!((out.end - cc.end()).abs() < 1e-9 && (out.start - (cc.end() - 0.5)).abs() < 1e-9);
     }
 
     #[test]
     fn transitions_never_outgrow_their_clips() {
-        let (mut p, a, b) = project_with_two_clips();
-        p.clip_mut(a).unwrap().duration = 0.3;
-        p.clip_mut(b).unwrap().start = 0.3;
+        let (mut p, a, b, _) = project_with_three_clips();
+        p.clip_mut(a).unwrap().duration = 0.5;
+        p.clip_mut(b).unwrap().start = 0.5;
         let mut tr = Transition::new(TransitionKind::Crossfade);
         tr.duration = 5.0;
-        p.clip_mut(b).unwrap().transition_in = Some(tr);
-        let w = windows_on_track(&p, 0);
-        assert!((w[0].end - w[0].start - 0.3).abs() < 1e-9);
+        set_start(&mut p, b, Some(tr));
+        let ov = overlap(p.clip(a).unwrap(), p.clip(b).unwrap());
+        assert!(ov > 0.0 && ov < 0.5, "overlap {ov}");
+        assert!((p.clip(b).unwrap().transition_in.unwrap().duration - ov).abs() < 1e-9);
         // A free start fades in within the clip.
-        p.clip_mut(b).unwrap().start = 1.0;
-        let w = windows_on_track(&p, 0);
+        let mut q = Project::default();
+        let mut asset = Asset::test_asset(AssetKind::Image);
+        asset.id = AssetId(1);
+        q.assets.push(asset);
+        let lone = q.add_clip(AssetId(1), 0, 1.0).unwrap();
+        q.clip_mut(lone).unwrap().duration = 2.0;
+        set_start(&mut q, lone, Some(tr));
+        let w = windows_on_track(&q, 0);
         assert_eq!((w[0].edge, w[0].start, w[0].end), (Edge::In, 1.0, 3.0));
+        assert!((q.clip(lone).unwrap().start - 1.0).abs() < 1e-9, "a free edge doesn't move the clip");
+    }
+
+    #[test]
+    fn old_centered_cuts_become_overlaps() {
+        let (mut p, a, b, c) = project_with_three_clips();
+        // The old format: touching clips, transition stored on either side.
+        p.clip_mut(b).unwrap().transition_in = Some(Transition::new(TransitionKind::Crossfade));
+        p.clip_mut(b).unwrap().transition_out = Some(Transition::new(TransitionKind::Wipe));
+        upgrade_centered_cuts(&mut p);
+        assert!((p.clip(b).unwrap().start - 1.5).abs() < 1e-9);
+        assert_eq!(p.clip(c).unwrap().transition_in.unwrap().kind, TransitionKind::Wipe);
+        assert!(p.clip(b).unwrap().transition_out.is_none());
+        assert!((p.clip(c).unwrap().start - 3.0).abs() < 1e-9);
+        let _ = a;
     }
 
     #[test]

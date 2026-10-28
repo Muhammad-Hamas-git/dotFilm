@@ -16,6 +16,9 @@ pub struct AudioClip {
     pub duration: f64,
     /// Keyframes are in clip time.
     pub volume: Anim,
+    /// Linear fade at the start and end, seconds (cut transitions crossfade the sound).
+    pub fade_in: f64,
+    pub fade_out: f64,
     pub source: AudioSource,
 }
 
@@ -36,12 +39,12 @@ pub enum SpeedMap {
 
 /// Builds the mixer's view of a timeline clip. `stretched` is the pitch-kept
 /// audio when the clip needs it and it's ready; otherwise the file is read directly.
-pub fn audio_clip(clip: &crate::core::model::Clip, pcm: Arc<Vec<i16>>, stretched: Option<Arc<Vec<i16>>>) -> AudioClip {
+pub fn audio_clip(clip: &crate::core::model::Clip, pcm: Arc<Vec<i16>>, stretched: Option<Arc<Vec<i16>>>, fades: (f64, f64)) -> AudioClip {
     let source = match stretched {
         Some(pcm) => AudioSource::Stretched { pcm },
         None => AudioSource::Direct { source_in: clip.source_in, speed: SpeedMap::for_clip(clip), pcm },
     };
-    AudioClip { start: clip.start, duration: clip.duration, volume: clip.volume.clone(), source }
+    AudioClip { start: clip.start, duration: clip.duration, volume: clip.volume.clone(), fade_in: fades.0, fade_out: fades.1, source }
 }
 
 /// Resolution of the speed lookup table, seconds.
@@ -222,7 +225,14 @@ pub fn mix_clips(clips: &[AudioClip], pos: u64, rate: f64, mix: &mut [f32]) {
                 continue;
             }
             let local = t - clip.start;
-            let gain = if clip.volume.is_animated() { clip.volume.eval(local) } else { clip.volume.value }.max(0.0);
+            let mut gain = if clip.volume.is_animated() { clip.volume.eval(local) } else { clip.volume.value }.max(0.0);
+            if clip.fade_in > 0.0 && local < clip.fade_in {
+                gain *= (local / clip.fade_in) as f32;
+            }
+            let left = clip.duration - local;
+            if clip.fade_out > 0.0 && left < clip.fade_out {
+                gain *= (left / clip.fade_out) as f32;
+            }
             if gain <= 0.0 {
                 continue;
             }

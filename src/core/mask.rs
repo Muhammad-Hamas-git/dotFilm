@@ -27,10 +27,17 @@ pub enum MaskKind {
     Mirror,
     /// A shape drawn point by point.
     Shape,
+    /// Pixels of a color (hue range, saturation, brightness), wherever they are.
+    ColorRange,
 }
 
 impl MaskKind {
-    pub const ALL: [MaskKind; 5] = [MaskKind::Rectangle, MaskKind::Ellipse, MaskKind::Linear, MaskKind::Mirror, MaskKind::Shape];
+    pub const ALL: [MaskKind; 6] = [MaskKind::Rectangle, MaskKind::Ellipse, MaskKind::Linear, MaskKind::Mirror, MaskKind::Shape, MaskKind::ColorRange];
+
+    /// Has a position and outline (edited in the player); color ranges don't.
+    pub fn is_shape(self) -> bool {
+        self != MaskKind::ColorRange
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -39,6 +46,7 @@ impl MaskKind {
             MaskKind::Linear => "Linear",
             MaskKind::Mirror => "Mirror",
             MaskKind::Shape => "Shape (draw)",
+            MaskKind::ColorRange => "Color range",
         }
     }
 
@@ -50,6 +58,7 @@ impl MaskKind {
             MaskKind::Linear => 2,
             MaskKind::Mirror => 3,
             MaskKind::Shape => 4,
+            MaskKind::ColorRange => 5,
         }
     }
 
@@ -62,6 +71,7 @@ impl MaskKind {
             MaskKind::Linear => &[CENTER_X, CENTER_Y, ROTATION, FEATHER, OPACITY],
             MaskKind::Mirror => &[CENTER_X, CENTER_Y, HEIGHT, ROTATION, FEATHER, OPACITY],
             MaskKind::Shape => &[FEATHER, EXPANSION, OPACITY],
+            MaskKind::ColorRange => &[HUE, HUE_RANGE, MIN_SATURATION, LUMA_LOW, LUMA_HIGH, SOFTNESS, OPACITY],
         }
     }
 }
@@ -115,11 +125,35 @@ pub mod idx {
     pub const EXPANSION: u8 = 7;
     /// How strongly the mask applies, 0..1.
     pub const OPACITY: u8 = 8;
+
+    // Color range masks reuse the slots: no position, size or rotation there.
+    /// Hue in the middle of the range, degrees.
+    pub const HUE: u8 = CENTER_X;
+    /// How far either side of the hue counts, degrees (180 = every hue).
+    pub const HUE_RANGE: u8 = CENTER_Y;
+    /// Grays below this saturation are left out.
+    pub const MIN_SATURATION: u8 = WIDTH;
+    /// Brightness range kept.
+    pub const LUMA_LOW: u8 = HEIGHT;
+    pub const LUMA_HIGH: u8 = ROTATION;
+    /// Soft falloff at the range's edges.
+    pub const SOFTNESS: u8 = FEATHER;
 }
 
 /// How to show mask value `i` (shape points use `point_info`).
 pub fn info(kind: MaskKind, i: u8) -> ParamInfo {
     let p = |label, min, max, default, decimals, suffix| ParamInfo { label, min, max, default, decimals, suffix, log: false };
+    if kind == MaskKind::ColorRange {
+        return match i {
+            idx::HUE => p("Hue", 0.0, 360.0, 0.0, 0, " deg"),
+            idx::HUE_RANGE => p("Hue range", 0.0, 180.0, 25.0, 0, " deg"),
+            idx::MIN_SATURATION => p("Min saturation", 0.0, 1.0, 0.15, 2, ""),
+            idx::LUMA_LOW => p("Darkest", 0.0, 1.0, 0.0, 2, ""),
+            idx::LUMA_HIGH => p("Brightest", 0.0, 1.0, 1.0, 2, ""),
+            idx::SOFTNESS => p("Softness", 0.0, 1.0, 0.15, 2, ""),
+            _ => p("Opacity", 0.0, 1.0, 1.0, 2, ""),
+        };
+    }
     match i {
         idx::CENTER_X => p("Center X", -0.5, 1.5, 0.5, 3, ""),
         idx::CENTER_Y => p("Center Y", -0.5, 1.5, 0.5, 3, ""),
@@ -157,6 +191,9 @@ impl Mask {
     /// A new mask sized for a layer of `size` (layer pixels).
     pub fn new(kind: MaskKind, size: (f32, f32)) -> Self {
         let mut values: Vec<Anim> = (0..VALUES as u8).map(|i| Anim::new(info(kind, i).default)).collect();
+        if kind == MaskKind::ColorRange {
+            return Mask { kind, mode: MaskMode::Add, invert: false, values, points: Vec::new() };
+        }
         let short = size.0.min(size.1).max(2.0);
         values[idx::WIDTH as usize] = Anim::new(match kind {
             MaskKind::Ellipse => short * 0.6,
@@ -243,6 +280,12 @@ pub fn frame(masks: &[Mask], t: f64, size: (f32, f32)) -> MaskFrame {
             }
             f.masks[row] = [used as f32, count as f32, 0.0, 0.0];
             used += count;
+        } else if m.kind == MaskKind::ColorRange {
+            f.masks[row] = [v(idx::HUE), v(idx::HUE_RANGE).max(0.0), v(idx::MIN_SATURATION), v(idx::LUMA_LOW)];
+            f.masks[row + 1] = [v(idx::LUMA_HIGH), v(idx::SOFTNESS).max(0.0), 0.0, 0.0];
+            f.masks[row + 2] = [m.kind.shader_id() as f32, if m.invert { 1.0 } else { 0.0 }, m.mode.shader_id(), v(idx::OPACITY).clamp(0.0, 1.0)];
+            n += 1;
+            continue;
         } else {
             f.masks[row] = [v(idx::CENTER_X) * size.0, v(idx::CENTER_Y) * size.1, v(idx::WIDTH).max(0.0), v(idx::HEIGHT).max(0.0)];
         }
@@ -258,6 +301,9 @@ pub fn frame(masks: &[Mask], t: f64, size: (f32, f32)) -> MaskFrame {
 /// The CPU twin of the shader's `mask_distance`; the player uses it, tests compare.
 pub fn distance(m: &Mask, t: f64, size: (f32, f32), p: [f32; 2]) -> f32 {
     let v = |i: u8| m.value(i, t);
+    if m.kind == MaskKind::ColorRange {
+        return f32::MIN; // Not about position: see `color_distance`.
+    }
     let d = if m.kind == MaskKind::Shape {
         let pts: Vec<[f32; 2]> = m.points_at(t).iter().map(|q| [q[0] * size.0, q[1] * size.1]).collect();
         polygon_distance(&pts, p)
@@ -280,11 +326,51 @@ pub fn distance(m: &Mask, t: f64, size: (f32, f32), p: [f32; 2]) -> f32 {
             }
             MaskKind::Linear => -q[1],
             MaskKind::Mirror => q[1].abs() - hh,
-            MaskKind::Shape => unreachable!(),
+            MaskKind::Shape | MaskKind::ColorRange => unreachable!(),
         }
     };
     d - v(idx::EXPANSION)
 }
+
+/// Hue (degrees), saturation and lightness of a color, like the shader's `rgb_to_hsl`.
+pub fn rgb_to_hsl(c: [f32; 3]) -> [f32; 3] {
+    let c = c.map(|v| v.clamp(0.0, 1.0));
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    let l = (mx + mn) * 0.5;
+    let d = mx - mn;
+    if d < 1e-5 {
+        return [0.0, 0.0, l];
+    }
+    let s = (d / (1.0 - (2.0 * l - 1.0).abs() + 1e-6)).clamp(0.0, 1.0);
+    let h = if mx == c[0] {
+        let h = (c[1] - c[2]) / d;
+        if h < 0.0 { h + 6.0 } else { h }
+    } else if mx == c[1] {
+        (c[2] - c[0]) / d + 2.0
+    } else {
+        (c[0] - c[1]) / d + 4.0
+    };
+    [h * 60.0, s, l]
+}
+
+/// How far a color is outside a color range mask (negative inside), in units where
+/// the softness applies (matches the shader's `color_distance`; tests compare).
+#[cfg(test)]
+pub fn color_distance(m: &Mask, t: f64, rgb: [f32; 3]) -> f32 {
+    let v = |i: u8| m.value(i, t);
+    let [h, s, l] = rgb_to_hsl(rgb);
+    let dh = (h - v(idx::HUE)).abs() % 360.0;
+    let dh = dh.min(360.0 - dh);
+    let hue = (dh - v(idx::HUE_RANGE).max(0.0)) / HUE_SPAN;
+    let sat = v(idx::MIN_SATURATION) - s;
+    let lum = (v(idx::LUMA_LOW) - l).max(l - v(idx::LUMA_HIGH));
+    hue.max(sat).max(lum)
+}
+
+/// Degrees of hue that count as one unit of color distance (so softness 0.1 fades over 9 degrees).
+#[cfg(test)]
+pub const HUE_SPAN: f32 = 90.0;
 
 /// Signed distance to a closed polygon (negative inside).
 pub fn polygon_distance(pts: &[[f32; 2]], p: [f32; 2]) -> f32 {
@@ -334,12 +420,20 @@ pub fn coverage_with_matte(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2]
 /// "everything": the masks then add to, cut from or limit the matte.
 #[cfg(test)]
 pub fn coverage_over(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base: Option<f32>) -> f32 {
+    coverage_full(masks, t, size, p, base, [0.5; 3])
+}
+
+/// Like `coverage_over`, for a pixel of color `rgb` (what color range masks look at).
+#[cfg(test)]
+pub fn coverage_full(masks: &[Mask], t: f64, size: (f32, f32), p: [f32; 2], base: Option<f32>, rgb: [f32; 3]) -> f32 {
     let usable: Vec<&Mask> = masks.iter().take(MAX_MASKS).filter(|m| m.kind != MaskKind::Shape || m.points.len() >= 3).collect();
     let Some(first) = usable.first() else { return base.unwrap_or(1.0) };
     let mut acc = base.unwrap_or(if first.mode == MaskMode::Add { 0.0 } else { 1.0 });
     for m in usable {
-        let d = distance(m, t, size, p);
-        let f = m.value(idx::FEATHER, t).max(1.0);
+        let (d, f) = match m.kind {
+            MaskKind::ColorRange => (color_distance(m, t, rgb), m.value(idx::SOFTNESS, t).max(1e-3)),
+            _ => (distance(m, t, size, p), m.value(idx::FEATHER, t).max(1.0)),
+        };
         let s = ((d + f * 0.5) / f).clamp(0.0, 1.0);
         let mut c = 1.0 - s * s * (3.0 - 2.0 * s);
         if m.invert {
@@ -446,6 +540,24 @@ mod tests {
         // With restore, the same mask brings the background back inside it.
         assert_eq!(coverage_with_matte(&[rect], 0.0, SIZE, inside, 0.0, true), 1.0);
         assert_eq!(coverage_with_matte(&[], 0.0, SIZE, inside, 0.4, false), 0.4);
+    }
+
+    #[test]
+    fn color_range_picks_hues() {
+        let mut m = Mask::new(MaskKind::ColorRange, SIZE);
+        m.values[idx::HUE as usize] = Anim::new(120.0); // green
+        m.values[idx::HUE_RANGE as usize] = Anim::new(30.0);
+        m.values[idx::SOFTNESS as usize] = Anim::new(0.05);
+        let at = |rgb: [f32; 3]| coverage_full(&[m.clone()], 0.0, SIZE, [0.0, 0.0], None, rgb);
+        assert_eq!(at([0.1, 0.8, 0.1]), 1.0, "green");
+        assert_eq!(at([0.8, 0.1, 0.1]), 0.0, "red");
+        assert_eq!(at([0.5, 0.5, 0.5]), 0.0, "gray (no saturation)");
+        assert!(at([0.4, 0.8, 0.1]) > 0.9, "yellow-green, 98 deg, inside the range");
+        // Position doesn't matter, and it packs for the shader.
+        assert_eq!(coverage_full(&[m.clone()], 0.0, SIZE, [900.0, 400.0], None, [0.1, 0.8, 0.1]), 1.0);
+        let f = frame(&[m], 0.0, SIZE);
+        assert_eq!(f.masks[0], [120.0, 30.0, 0.15, 0.0]);
+        assert_eq!(f.masks[2][0], 5.0);
     }
 
     #[test]

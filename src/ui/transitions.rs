@@ -2,7 +2,7 @@
 
 use super::inspector::Tracker;
 use crate::core::anim::Ease;
-use crate::core::model::{Clip, Project};
+use crate::core::model::{Clip, ClipId, Project};
 use crate::core::transition::{self, Transition, TransitionKind, MIN_DURATION};
 use egui::{vec2, Color32, Painter, Rect, Stroke, Ui};
 
@@ -19,48 +19,57 @@ enum Side {
     Out,
 }
 
-fn slot(c: &mut Clip, side: Side) -> &mut Option<Transition> {
-    match side {
-        Side::In => &mut c.transition_in,
-        Side::Out => &mut c.transition_out,
+/// A transition edit from the Adjustments panel, applied by the caller to the project
+/// (a cut transition moves clips, so it can't be applied to the panel's copy of one clip).
+pub(super) enum Change {
+    Start(Option<Transition>),
+    End(Option<Transition>),
+}
+
+impl Change {
+    pub(super) fn apply(self, project: &mut Project, id: ClipId) {
+        match self {
+            Change::Start(tr) => transition::set_start(project, id, tr),
+            Change::End(tr) => transition::set_end(project, id, tr),
+        }
     }
 }
 
-pub(super) fn section(ui: &mut Ui, project: &Project, c: &mut Clip, t: &mut Tracker) {
+pub(super) fn section(ui: &mut Ui, project: &Project, c: &Clip, t: &mut Tracker) -> Option<Change> {
     if !transition::supports_transitions(project, c) {
-        return;
+        return None;
     }
+    let mut change = None;
     egui::CollapsingHeader::new("Transitions").default_open(true).show(ui, |ui| {
-        let prev = transition::previous_touching(project, c).map(|p| p.clone());
-        let next = transition::next_touching(project, c).map(|n| n.clone());
-        side_ui(ui, c, Side::In, prev.as_ref(), None, t);
+        let has_prev = transition::previous_partner(project, c).is_some();
+        let has_next = transition::next_partner(project, c).is_some();
+        if let Some(tr) = side_ui(ui, c.transition_in, Side::In, has_prev, t) {
+            change = Some(Change::Start(tr));
+        }
         ui.separator();
-        // At a cut, the next clip's "in" transition takes over the cut.
-        let taken = next.as_ref().filter(|n| n.transition_in.is_some());
-        side_ui(ui, c, Side::Out, next.as_ref(), taken, t);
+        if let Some(tr) = side_ui(ui, transition::end_transition(project, c), Side::Out, has_next, t) {
+            change = Some(Change::End(tr));
+        }
     });
+    change
 }
 
-fn side_ui(ui: &mut Ui, c: &mut Clip, side: Side, neighbor: Option<&Clip>, taken_by: Option<&Clip>, t: &mut Tracker) {
+/// One side's controls. Returns the new transition if the person changed it.
+fn side_ui(ui: &mut Ui, current: Option<Transition>, side: Side, neighbor: bool, t: &mut Tracker) -> Option<Option<Transition>> {
     let title = match side {
         Side::In => "Start",
         Side::Out => "End",
     };
     let note = match (side, neighbor) {
-        (Side::In, Some(_)) => "plays across the cut with the clip before",
-        (Side::Out, Some(_)) => "plays across the cut with the next clip",
-        (Side::In, None) => "fades in from what's below",
-        (Side::Out, None) => "fades out to what's below",
+        (Side::In, true) => "slides into the clip before",
+        (Side::Out, true) => "the next clip slides in",
+        (Side::In, false) => "fades in from what's below",
+        (Side::Out, false) => "fades out to what's below",
     };
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong());
         ui.label(egui::RichText::new(note).weak());
     });
-    if taken_by.is_some() {
-        ui.label(egui::RichText::new("The next clip's start transition is used for this cut.").weak().italics());
-        return;
-    }
-    let current = *slot(c, side);
     let mut kind = current.map(|tr| tr.kind);
     egui::ComboBox::from_id_salt(("transition kind", side == Side::In))
         .selected_text(kind.map_or("None", |k| k.label()))
@@ -71,10 +80,10 @@ fn side_ui(ui: &mut Ui, c: &mut Clip, side: Side, neighbor: Option<&Clip>, taken
             }
         });
     if kind != current.map(|tr| tr.kind) {
-        *slot(c, side) = kind.map(|k| Transition { kind: k, ..current.unwrap_or(Transition::new(k)) });
         t.changed = true;
+        return Some(kind.map(|k| Transition { kind: k, ..current.unwrap_or(Transition::new(k)) }));
     }
-    let Some(mut tr) = *slot(c, side) else { return };
+    let mut tr = current?;
 
     egui::Grid::new(("transition grid", side == Side::In)).num_columns(2).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
         ui.label("Length");
@@ -88,7 +97,6 @@ fn side_ui(ui: &mut Ui, c: &mut Clip, side: Side, neighbor: Option<&Clip>, taken
             for (l, e) in Ease::PRESETS.iter().filter(|(_, e)| *e != Ease::Hold) {
                 if ui.selectable_label(tr.ease == *e, *l).clicked() {
                     tr.ease = *e;
-                    t.changed = true;
                 }
             }
         });
@@ -97,12 +105,11 @@ fn side_ui(ui: &mut Ui, c: &mut Clip, side: Side, neighbor: Option<&Clip>, taken
         if tr.kind.has_direction() {
             ui.label("Direction");
             ui.horizontal(|ui| {
-                let current = DIRECTIONS.iter().find(|(_, a)| (tr.angle.rem_euclid(360.0) - a).abs() < 0.5).map_or("Custom angle", |(l, _)| *l);
-                egui::ComboBox::from_id_salt(("transition dir", side == Side::In)).selected_text(current).show_ui(ui, |ui| {
+                let shown = DIRECTIONS.iter().find(|(_, a)| (tr.angle.rem_euclid(360.0) - a).abs() < 0.5).map_or("Custom angle", |(l, _)| *l);
+                egui::ComboBox::from_id_salt(("transition dir", side == Side::In)).selected_text(shown).show_ui(ui, |ui| {
                     for (l, a) in DIRECTIONS {
-                        if ui.selectable_label(current == l, l).clicked() {
+                        if ui.selectable_label(shown == l, l).clicked() {
                             tr.angle = a;
-                            t.changed = true;
                         }
                     }
                 });
@@ -118,10 +125,11 @@ fn side_ui(ui: &mut Ui, c: &mut Clip, side: Side, neighbor: Option<&Clip>, taken
             ui.end_row();
         }
     });
-    if Some(tr) != *slot(c, side) {
-        *slot(c, side) = Some(tr);
+    if Some(tr) != current {
         t.changed = true;
+        return Some(Some(tr));
     }
+    None
 }
 
 /// Marks every transition on the timeline: a shaded band with a bow-tie, like most editors.
@@ -142,7 +150,7 @@ pub(super) fn draw_overlays(project: &Project, painter: &Painter, rect_for: &dyn
 }
 
 /// "Start transition" / "End transition" submenus for the clip menu.
-pub(super) fn menu(ui: &mut Ui, project: &mut Project, history: &mut crate::core::history::History, id: crate::core::model::ClipId) {
+pub(super) fn menu(ui: &mut Ui, project: &mut Project, history: &mut crate::core::history::History, id: ClipId) {
     let Some(clip) = project.clip(id) else { return };
     if !transition::supports_transitions(project, clip) {
         return;
@@ -152,7 +160,7 @@ pub(super) fn menu(ui: &mut Ui, project: &mut Project, history: &mut crate::core
         ui.menu_button(label, |ui| {
             let current = project.clip(id).and_then(|c| match side {
                 Side::In => c.transition_in,
-                Side::Out => c.transition_out,
+                Side::Out => transition::end_transition(project, c),
             });
             let mut pick: Option<Option<TransitionKind>> = None;
             if ui.selectable_label(current.is_none(), "None").clicked() {
@@ -165,10 +173,12 @@ pub(super) fn menu(ui: &mut Ui, project: &mut Project, history: &mut crate::core
             }
             if let Some(kind) = pick {
                 history.checkpoint(project);
-                if let Some(c) = project.clip_mut(id) {
-                    let s = slot(c, side);
-                    *s = kind.map(|k| Transition { kind: k, ..s.unwrap_or(Transition::new(k)) });
+                let tr = kind.map(|k| Transition { kind: k, ..current.unwrap_or(Transition::new(k)) });
+                match side {
+                    Side::In => Change::Start(tr),
+                    Side::Out => Change::End(tr),
                 }
+                .apply(project, id);
                 ui.close();
             }
         });

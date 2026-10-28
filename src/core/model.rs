@@ -2,17 +2,19 @@
 //! Everything the user edits lives here, and the whole thing saves to JSON.
 
 use super::anim::Anim;
-use super::content::Content;
+use super::content::{ClipEffect, Content, CLIP_EFFECT_MIX, CLIP_EFFECT_VALUES};
 use super::grade::{self, Grade};
+use super::marker::Marker;
 use super::mask::{self, Mask, MaskKind};
 use super::matte::{self, Matte};
+use super::tone::{self, Tone};
 use super::transition::Transition;
 use super::geometry::{self, Placement, Quad};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Current project file version. Older files are upgraded in `Project::load`.
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AssetId(pub u64);
@@ -250,6 +252,10 @@ pub enum Param {
     Mask(u8, u8),
     /// The i-th AI background removal value (see core::matte::idx).
     Matte(u8),
+    /// Clip effect number, then its i-th value (4 effect settings, then the mix).
+    ClipEffect(u8, u8),
+    /// The i-th tone value: levels, shadows / highlights, LUT intensity (see core::tone::idx).
+    Tone(u8),
 }
 
 impl Param {
@@ -291,6 +297,9 @@ impl Param {
             Param::Mask(_, i) if (i as usize) < mask::VALUES => mask::info(MaskKind::Rectangle, i).label,
             Param::Mask(_, i) => mask::point_info(i).label,
             Param::Matte(i) => matte::info(i).label,
+            Param::ClipEffect(_, CLIP_EFFECT_MIX) => "Mix",
+            Param::ClipEffect(..) => "Value",
+            Param::Tone(i) => tone::info(i).label,
         }
     }
 
@@ -336,6 +345,16 @@ pub struct Clip {
     /// White balance, color wheels, HSL per color, chroma key.
     #[serde(default, skip_serializing_if = "Grade::is_default")]
     pub grade: Grade,
+    /// Levels, shadows / highlights, curves and LUT (see core/tone.rs).
+    #[serde(default, skip_serializing_if = "Tone::is_default")]
+    pub tone: Tone,
+    /// Effects on this clip only, applied in order (see content::ClipEffect).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<ClipEffect>,
+    /// Own frame rate ("frame chopping"): the clip updates only this many times a
+    /// second, whatever the project's frame rate. None = every project frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<f32>,
     /// Masks, top first (see core/mask.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub masks: Vec<Mask>,
@@ -388,7 +407,19 @@ impl Clip {
         if self.matte.is_some() {
             v.extend((0..matte::COUNT).map(|i| Param::Matte(i as u8)));
         }
+        v.extend((0..tone::COUNT).map(|i| Param::Tone(i as u8)));
+        for e in 0..self.effects.len() {
+            v.extend((0..CLIP_EFFECT_VALUES).map(|i| Param::ClipEffect(e as u8, i as u8)));
+        }
         v
+    }
+
+    /// Timeline time snapped to this clip's own frame rate (frame chopping).
+    pub fn chop(&self, t: f64) -> f64 {
+        match self.frame_rate {
+            Some(fps) if fps > 0.0 => self.start + ((t - self.start) * fps as f64 + 1e-6).floor() / fps as f64,
+            _ => t,
+        }
     }
 
     /// Timeline time -> clip time (what keyframes use).
@@ -482,6 +513,8 @@ impl Clip {
             Param::Grade(i) => &self.grade.values[i as usize],
             Param::Mask(m, i) => self.masks[m as usize].anim(i),
             Param::Matte(i) => self.matte.as_ref().expect("matte param exists").anim(i),
+            Param::ClipEffect(e, i) => self.effects[e as usize].anim(i),
+            Param::Tone(i) => &self.tone.values[i as usize],
         }
     }
 
@@ -505,6 +538,8 @@ impl Clip {
             Param::Grade(i) => &mut self.grade.values[i as usize],
             Param::Mask(m, i) => self.masks[m as usize].anim_mut(i),
             Param::Matte(i) => self.matte.as_mut().expect("matte param exists").anim_mut(i),
+            Param::ClipEffect(e, i) => self.effects[e as usize].anim_mut(i),
+            Param::Tone(i) => &mut self.tone.values[i as usize],
         }
     }
 
@@ -564,6 +599,9 @@ pub struct Project {
     pub tracks: Vec<Track>,
     pub clips: Vec<Clip>,
     pub next_id: u64,
+    /// Timeline markers, sorted by time (see core/marker.rs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
 }
 
 /// Shortest clip you can trim to, seconds.
@@ -585,6 +623,7 @@ impl Default for Project {
             tracks: (1..=3).map(Track::named).collect(),
             clips: Vec::new(),
             next_id: 1,
+            markers: Vec::new(),
         }
     }
 }
@@ -633,11 +672,17 @@ impl Project {
     }
 
     /// Start of the next clip on the same track after this one (or infinity).
+    /// Where `clip` must end at the latest: the next clip's start, or for a clip that
+    /// slides into this one with a cut transition, the end of that overlap.
     pub fn next_start(&self, clip: &Clip) -> f64 {
+        let tol = super::transition::CUT_TOLERANCE;
         self.clips
             .iter()
-            .filter(|c| c.id != clip.id && c.track == clip.track && c.start >= clip.end() - 1e-6)
-            .map(|c| c.start)
+            .filter(|c| c.id != clip.id && c.track == clip.track && c.start > clip.start + 1e-6)
+            .map(|c| match c.transition_in {
+                Some(tr) if c.start < clip.end() + tol && c.end() > clip.end() => c.start + tr.duration,
+                _ => c.start,
+            })
             .fold(f64::INFINITY, f64::min)
     }
 
@@ -706,9 +751,22 @@ impl Project {
     }
 
     /// Would a clip with this span overlap anything else on the track?
+    /// Is `start..end` on `track` free for a clip? `ignore` is the clip being moved: it may
+    /// overlap its neighbors by its own cut transitions (see core/transition.rs), nothing more.
     pub fn is_free(&self, track: usize, start: f64, end: f64, ignore: Option<ClipId>) -> bool {
         const EPS: f64 = 1e-6;
-        !self.clips.iter().any(|c| Some(c.id) != ignore && c.track == track && c.start < end - EPS && c.end() > start + EPS)
+        let me = ignore.and_then(|id| self.clip(id));
+        let tol = super::transition::CUT_TOLERANCE;
+        !self.clips.iter().any(|c| {
+            if Some(c.id) == ignore || c.track != track || c.start >= end - EPS || c.end() <= start + EPS {
+                return false;
+            }
+            // `c` is before: the moving clip's start transition may reach back into it.
+            let into_prev = me.and_then(|m| m.transition_in).is_some_and(|tr| c.start < start && c.end() - start <= tr.duration + tol && c.end() < end);
+            // `c` is after: its start transition may reach back into the moving clip.
+            let into_next = c.transition_in.is_some_and(|tr| c.start > start && end - c.start <= tr.duration + tol && c.end() > end);
+            !(into_prev || into_next)
+        })
     }
 
     /// Visual clips under the playhead, bottom track first (draw order).
@@ -763,6 +821,9 @@ impl Project {
             grade: Grade::default(),
             masks: Vec::new(),
             matte: None,
+            tone: Tone::default(),
+            effects: Vec::new(),
+            frame_rate: None,
             transition_in: None,
             transition_out: None,
         });
@@ -868,6 +929,10 @@ impl Project {
                 }
             }
         }
+        if self.version < 4 {
+            // Version 3 centered cut transitions on touching clips; now clips overlap (CapCut style).
+            super::transition::upgrade_centered_cuts(self);
+        }
         self.version = PROJECT_VERSION;
     }
 }
@@ -882,6 +947,19 @@ fn scale_anim(a: &mut Anim, k: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_chopping_holds_frames() {
+        let (mut p, a) = project_with_video();
+        let c = p.add_clip(a, 0, 1.0).unwrap();
+        let clip = p.clip_mut(c).unwrap();
+        assert_eq!(clip.chop(1.37), 1.37, "no own frame rate: unchanged");
+        clip.frame_rate = Some(4.0);
+        // 4 fps from the clip start: 1.0, 1.25, 1.5, ...
+        assert!((clip.chop(1.37) - 1.25).abs() < 1e-9);
+        assert!((clip.chop(1.5) - 1.5).abs() < 1e-9);
+        assert!((clip.chop(1.49999) - 1.25).abs() < 1e-9);
+    }
 
     #[test]
     fn split_keeps_outer_transitions() {

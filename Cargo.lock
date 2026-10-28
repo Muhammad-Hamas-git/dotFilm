@@ -960,6 +960,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "half",
  "image",
  "ort",
  "pollster 0.4.0",

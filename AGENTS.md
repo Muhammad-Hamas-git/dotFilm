@@ -22,11 +22,26 @@ Read README.md first for the folder layout.
   far and write the other accumulation texture. Get on-screen outlines from `engine::scene::clip_quad`.
 - Grading (white balance, wheels, HSL, chroma key) lives in `clip.grade` (`core/grade.rs`), addressed as
   `Param::Grade(i)` (see `grade::idx`). `Grade::frame` packs it for the shader; flag bits skip unused
-  parts. Shader order: source, chroma key, white balance, basic color stages, wheels, HSL.
-  Layer uniforms are padded to `UNIFORM_STRIDE` (768); grow it if `LayerUniform` grows past that.
-- Transitions live on clip edges (`transition_in`, `transition_out`, see `core/transition.rs`).
-  `transition::track_at` decides what a track shows at a time; `transition::clip_span` is the range a clip
-  is drawn in (wider than the clip at cuts), so decoders must be opened for that range, not just the clip.
+  parts. Shader order: source, chroma key, white balance, basic color stages, wheels, HSL, tone, LUT.
+  Layer uniforms are padded to `UNIFORM_STRIDE` (2304); grow it if `LayerUniform` grows past that.
+- Levels, shadows / highlights and curves live in `clip.tone` (`core/tone.rs`, `Param::Tone(i)`).
+  `Tone::frame` bakes them on the CPU into a 64-entry table in the uniform; the shader only looks it up
+  (`apply_tone`). LUTs are 3D textures in bind group 3, cached by path hash (`engine/lut.rs`, compositor
+  `upload_lut` / `retain_luts`); layers without a LUT bind a blank one. LUT export renders a lattice image
+  through the real compositor (`Compositor::sibling`), so it always matches the shader.
+- Per-clip effects (`clip.effects`, `Param::ClipEffect(effect, i)`) draw the layer alone into the `iso`
+  textures, run the effect passes there, then composite the result (`encode_isolated`). Effect shaders
+  work on unpremultiplied color for color effects and premultiplied RGBA for spatial ones, so they're
+  correct on transparent layers.
+- A clip's own frame rate (`clip.frame_rate`) goes through `Clip::chop`; use it wherever a clip's time is
+  sampled for drawing (scene, `clip_quad`, player hit-testing).
+- Transitions live on clip edges (`transition_in`, `transition_out`, see `core/transition.rs`). At a cut
+  they work like CapCut: the incoming clip **overlaps** the previous one by the transition length
+  (B.start = A.end - d), and the window is that overlap. Change lengths only through `transition::set_start`
+  / `set_end`, which ripple later clips; `Project::is_free` and `next_start` allow exactly that overlap.
+  An end transition at a cut belongs to the next clip's start. `transition::track_at` decides what a track
+  shows at a time, `audio_fades` gives the matching audio crossfade, and `sync_durations` fixes lengths after
+  timeline drags. Project version 4 converted the old centered cuts (`upgrade_centered_cuts`).
   The compositor draws each side into its own texture and mixes them in `fs_transition`.
 - Motion blur is not a shader effect: `engine/scene.rs` rebuilds the stack below it at several times
   (`SceneItem::Samples`). Video frames and text masks stay at the frame's own time; items identical in every
@@ -37,7 +52,12 @@ Read README.md first for the folder layout.
 - Masks live in `clip.masks` (`core/mask.rs`), addressed as `Param::Mask(mask, i)`. They're in the layer's
   own pixels (effect layers: project pixels), so the shader evaluates them on the layer's UV. `mask::distance`
   is the CPU twin of the shader's `mask_distance`; a GPU test compares them, keep them in step. The player
-  edits masks through `Quad::homography`, the same projective map the GPU uses.
+  edits masks through `Quad::homography`, the same projective map the GPU uses. `MaskKind::ColorRange`
+  isn't a shape: it reuses the value slots (see `mask::idx` aliases) and keys on the clip's own source color
+  (on effect layers, the backdrop); `mask::coverage_full` is its CPU twin.
+- Markers (`project.markers`, `core/marker.rs`) are part of undo snapshots. Timeline snapping includes them.
+- The timeline's keyframe table (`ui/keyframes.rs`) lists every animated `Param` of the selected clip from
+  `Clip::params()`; anything that edits keys on the timeline must use `params()`, not `Param::ALL`.
 - The asset preview (`app.source`) is a separate one-clip `Project` rendered by the same preview renderer.
   Transport functions (`seek`, `toggle_play`, ...) act on whatever `view_project` / `view_time` return.
 - Widgets in the inspector only count as edits through `user_edit()`: sliders report "changed" when

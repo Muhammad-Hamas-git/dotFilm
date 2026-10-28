@@ -53,6 +53,8 @@ pub struct EditorApp {
     pub playing: bool,
     /// When set, the player shows this asset instead of the timeline.
     pub source: Option<SourceView>,
+    /// The player fills the whole window (and the screen).
+    pub fullscreen: bool,
     pub selected: Option<ClipId>,
     /// Asset currently being dragged from the assets panel.
     pub dragged_asset: Option<AssetId>,
@@ -86,6 +88,7 @@ impl EditorApp {
             playhead: 0.0,
             playing: false,
             source: None,
+            fullscreen: false,
             selected: None,
             dragged_asset: None,
             timeline: Default::default(),
@@ -200,6 +203,11 @@ impl EditorApp {
         self.source = Some(SourceView { asset: id, project: p, time: 0.0 });
         self.audio_signature = 0;
         self.audio.seek(0.0);
+    }
+
+    pub fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.fullscreen = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
     /// Back to the timeline in the player.
@@ -454,8 +462,17 @@ impl EditorApp {
         if pressed(Modifiers::NONE, Key::End) {
             self.seek(self.last_frame());
         }
+        if pressed(Modifiers::NONE, Key::M) {
+            super::markers::add_at_playhead(self);
+        }
+        if pressed(Modifiers::NONE, Key::F11) {
+            let on = !self.fullscreen;
+            self.set_fullscreen(ctx, on);
+        }
         if pressed(Modifiers::NONE, Key::Escape) {
-            if self.source.is_some() {
+            if self.fullscreen {
+                self.set_fullscreen(ctx, false);
+            } else if self.source.is_some() {
                 self.close_source();
             } else if self.preview.picking_key.is_some() {
                 self.preview.picking_key = None;
@@ -528,7 +545,7 @@ impl EditorApp {
             } else {
                 None
             };
-            clips.push(audio_clip(c, pcm, stretched));
+            clips.push(audio_clip(c, pcm, stretched, crate::core::transition::audio_fades(project, c)));
         }
         self.stretch.retain(&keys);
         self.audio.set_clips(clips);
@@ -701,6 +718,10 @@ impl eframe::App for EditorApp {
         self.sync_audio();
         self.update_title(&ctx);
 
+        if self.fullscreen {
+            egui::CentralPanel::default().show(ui, |ui| player::show(self, ui));
+            return;
+        }
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("timeline").resizable(true).default_size(300.0).min_size(160.0).show(ui, |ui| {
             timeline::show(self, ui);

@@ -19,12 +19,31 @@ A desktop video editor written in Rust, rendered on the GPU.
   Everything keyframeable. Masks stick to the clip as it moves, scales and turns in 3D. Edit them right in
   the player: drag the center, corners, edges, the round rotation handle, the inside, or shape points.
   On an **effect layer** a mask limits the effect to that area (blur just a face, glow just the sky).
+  **Color range** masks select by color instead of shape: click **Pick** and then a color in the player, then
+  widen the hue range, minimum saturation, brightness range and softness. Blur only the blue sky, desaturate
+  everything but the red coat.
 - **Transitions**: crossfade, fade through black or white, wipe (any direction, soft edge), push and zoom,
   with adjustable length and easing. Set them on a clip's start or end (Adjustments panel, or right-click
-  the clip). Between two touching clips the transition plays across the cut; on a free edge the clip
-  fades, wipes or pushes in from (or out to) what's below.
+  the clip). Between two touching clips it works like CapCut: the next clip slides back over the end of
+  the previous one by the transition length and starts playing from its first frame when the transition
+  starts. Everything after it on the track moves back too, so the timeline gets shorter. The audio
+  crossfades over the same overlap. On a free edge the clip fades, wipes or pushes in from (or out to)
+  what's below.
+- **Per-clip effects**: any effect (except motion blur) can be added to one clip in its **Effects** section.
+  It changes only that clip, with a Mix amount, on/off switch and order. Effect layers on the timeline
+  still change every track below them.
+- **Frame rate per clip**: tick **Own** next to Frame rate in Timing to play a clip at e.g. 12 fps for a
+  choppy, stop-motion look. Keyframed movement steps at that rate too.
+- **Levels, shadows / highlights, curves**: input and output black / white points and gamma; shadows and
+  highlights recovery; curves for RGB together, R, G, B or brightness only (click to add a point, drag it,
+  double-click to remove it). All keyframeable except the curve shapes.
+- **LUTs**: load any 3D `.cube` LUT on a clip with an intensity slider, and **export** a clip's
+  whole color grade (adjustments, white balance, wheels, HSL, levels, curves, LUT) as a `.cube` file to use
+  on other clips or in other programs.
 - **Player**: plays the timeline. Click a picture to select it, drag to move it, drag a corner to resize it.
   Hit-testing follows the real 3D outline of rotated layers. Snaps to the frame center.
+  **Ctrl + wheel** zooms in at the cursor (up to 32x; the preview renders sharper while zoomed), the middle
+  mouse button pans, the zoom button goes back to Fit. **Full screen** (F11) shows only the player.
 - **Adjustments panel**: position, scale, opacity, **3D rotation (pitch, yaw, roll)**, brightness, contrast,
   saturation, hue, value, volume, **speed** (0.1x to 10x, with or without changing audio pitch).
   **Every value can be keyframed**, with an easing curve editor (linear, ease in/out, hold, or a
@@ -49,6 +68,12 @@ A desktop video editor written in Rust, rendered on the GPU.
 - **Timeline**: multiple tracks (Track 1 is the bottom layer), **blend mode per track** (18 modes: multiply,
   screen, overlay, soft light, difference, hue, color, luminosity...), drag/trim/split clips, snapping, zoom,
   hide/mute tracks, keyframe diamonds you can drag, click or right-click.
+- **Markers**: press M (or the Marker button) to drop a marker at the playhead. Drag them on the ruler,
+  click to jump, right-click to name, color or delete. **Markers > Beat markers from BPM** fills the timeline
+  with beat (or bar) ticks from the playhead on. Clips snap to markers and beats.
+- **Keyframe table**: the **Keyframes** button swaps the tracks for the selected clip's animated values,
+  one row each. Drag keys sideways to retime, and edit the curve of the chosen row in the graph below:
+  drag points up and down for the value, and the white handles for bezier easing.
 - **Project**: any resolution up to 8192 x 8192 and any frame rate from 1 to 240 fps.
 - **Export**: MP4 rendered by the same GPU code as the preview. Constant quality or target bitrate.
   Uses your GPU's video encoder (NVIDIA, AMD, Intel) when available.
@@ -100,6 +125,8 @@ dotFilm doesn't start without it.
    Drag the two white handles for a custom curve.
 5. On the timeline, the selected clip's keyframes show as diamonds:
    drag to retime, click to jump there, right-click for easing presets or delete.
+6. For more control, click **Keyframes** in the timeline toolbar: every animated value gets its own row,
+   and the graph shows the selected row's curve with bezier handles.
 
 Keyframes are stored relative to the clip's start, so they move with it; trimming and splitting keep them
 on the same moment of the footage. Right-click a clip, or use **Clear** in the Adjustments panel, to remove all its keyframes.
@@ -113,12 +140,15 @@ on the same moment of the footage. Right-click a clip, or use **Clear** in the A
 | Home / End | Start / last frame |
 | S | Split at playhead (selected clip, or all clips under the playhead) |
 | Delete | Delete selected clip |
-| Esc | Back from an asset preview / stop picking a key color / stop editing a mask / deselect |
+| M | Add a marker at the playhead |
+| F11 | Full screen player on / off |
+| Esc | Leave full screen / back from an asset preview / stop picking a color / stop editing a mask / deselect |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clip at the playhead |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S, Ctrl+O, Ctrl+I, Ctrl+E | Save, open, import, export |
 | Ctrl + wheel | Zoom timeline at the cursor |
 | Shift + wheel | Scroll timeline |
+| Ctrl + wheel on the player | Zoom the player at the cursor (middle mouse button pans) |
 
 ## How it's built
 
@@ -130,7 +160,9 @@ src/
     anim.rs            keyframes and easing curves
     content.rs         colors, gradients, text and effect settings of generated layers
     grade.rs           white balance, color wheels, HSL per color, chroma key settings
-    transition.rs      transitions on clip edges and where they play on the timeline
+    transition.rs      transitions on clip edges, the overlap at cuts, and where they play on the timeline
+    tone.rs            levels, shadows / highlights, curves, and .cube LUT reading / writing
+    marker.rs          timeline markers and beat markers
     mask.rs            mask shapes, their math, and packing for the GPU
     matte.rs           AI background removal settings (quality, erode/dilate/feather, mask mode)
     geometry.rs        3D rotation and perspective of a layer
@@ -148,12 +180,14 @@ src/
     gpu/shaders.wgsl   all per-pixel work: YUV to RGB, color, blend modes, YUV packing
     gpu/compositor.rs  runs the shaders, manages GPU textures
     color.rs           color adjustments as matrices
+    lut.rs             loads LUT files for the GPU, bakes a clip's grade into a LUT
     preview.rs         the player picture
     text.rs            text layout and rasterizing (cosmic-text, system fonts)
     audio.rs           audio mixing and playback (also used for export)
     stretch.rs         time-stretching: speed changes without pitch changes (WSOLA)
     export.rs          renders every frame and streams it into the encoder
-  ui/                the window: app.rs, assets, player, inspector (+ grading, matte, masks, transitions), timeline, export_dialog
+  ui/                the window: app.rs, assets, player, inspector (+ grading, tone, clip_effects, matte, masks,
+                     transitions), timeline (+ markers, keyframes), export_dialog
 ```
 
 The key rule: **the UI only edits the project data; preview and export both render it through
@@ -200,7 +234,7 @@ Example: a new animatable parameter "blur radius".
 | Color wheel strength | `WHEEL_TINT`, `WHEEL_LUM` in `gpu/shaders.wgsl` |
 | Chroma key reach (how far similarity 1.0 goes) | `KEY_REACH` in `gpu/shaders.wgsl` |
 | Color wheel size, key color picker area | `WHEEL_SIZE` in `ui/grading.rs`, `PICK_RADIUS` in `engine/preview.rs` |
-| Transition default length, what counts as touching clips | `DEFAULT_DURATION`, `CUT_TOLERANCE` in `core/transition.rs` |
+| Transition default length, shortest, what counts as touching clips | `DEFAULT_DURATION`, `MIN_DURATION`, `CUT_TOLERANCE` in `core/transition.rs` |
 | Transition length limit in the UI, timeline marker color | `MAX_DURATION`, `OVERLAY` in `ui/transitions.rs` |
 | Zoom transition strength | `ZOOM_AMOUNT` in `gpu/shaders.wgsl` |
 | Blur quality (taps per pass) | `BLUR_TAPS`, `BLOOM_TAPS`, `LENS_MIN_TAPS`, `LENS_MAX_TAPS`, `RADIAL_TAPS` in `gpu/shaders.wgsl` |
@@ -218,6 +252,15 @@ Example: a new animatable parameter "blur radius".
 | Text sharpness limits | `MAX_RASTER_PX`, `MIN_RASTER_PX` in `engine/text.rs` |
 | Speed range | `SPEED_RANGE` in `core/model.rs` |
 | Time-stretch quality (chunk size, alignment search) | `WINDOW`, `SEEK` in `engine/stretch.rs` |
+| Levels / shadows / highlights ranges and defaults | `info` in `core/tone.rs` |
+| Shadows / highlights strength | `SH_STRENGTH` in `core/tone.rs` |
+| Curve editor size, grab distance, most points | `CURVE_EDITOR_SIZE`, `GRAB_PX`, `MAX_POINTS` in `ui/tone.rs` |
+| Biggest LUT accepted, size of exported LUTs | `MAX_LUT_SIZE` in `core/tone.rs`, `EXPORT_SIZE` in `engine/lut.rs` (33 is standard, 65 is finer) |
+| Color range mask: how wide hue range 1.0 is | `HUE_SPAN` in `core/mask.rs` and `MASK_HUE_SPAN` in `gpu/shaders.wgsl` (keep in step) |
+| Player zoom limits and Ctrl+wheel speed | `ZOOM_RANGE`, `ZOOM_STEP` in `ui/player.rs` |
+| Marker colors | `COLORS` in `core/marker.rs` |
+| Marker grab distance, most beat markers at once | `GRAB_PX`, `MAX_BEATS` in `ui/markers.rs` |
+| Keyframe table row height, table vs graph split, key size, snapping | `ROW_H`, `ROWS_SHARE`, `KEY_R`, `SNAP_PX` in `ui/keyframes.rs` |
 
 ## Known limits
 
@@ -225,7 +268,10 @@ Example: a new animatable parameter "blur radius".
 - The first proxy of a long 4K file takes a while to build; you can edit meanwhile (from the original).
 - Motion blur blurs keyframed movement only. Movement inside the footage itself (a car driving past in
   the video) is not detected.
-- Transitions mix pictures only; audio at a cut stays a hard cut.
+- Curve shapes aren't keyframeable (their strength can be faded with keyframed Levels or a second clip).
+- Exported LUTs capture color only: per-clip effects, masks and chroma key are not part of a LUT.
+- A clip's own frame rate holds frames; it doesn't blend or interpolate them.
+- 1D `.cube` LUTs are not supported yet (3D ones are, which is nearly all of them).
 - Odd frame sizes get one black pixel row/column on MP4 export (H.264 requires even sizes).
 - AI background removal works on video clips (not still images yet). It finds the most prominent subject;
   with several people it may pick the wrong one or all of them, so use Intersect or Subtract masks.

@@ -56,6 +56,13 @@ struct Layer {
     // 0 = masks isolate the cut-out; _, _). Erode/dilate/feather already happened
     // in fs_matte_prep.
     matte: vec4<f32>,
+    // Levels, shadows / highlights and curves as one table (core::tone::ToneFrame):
+    // 64 samples of (red, green, blue, luma) out.
+    tone: array<vec4<f32>, 64>,
+    // (tone table on, LUT intensity, LUT size, LUT on)
+    tone_info: vec4<f32>,
+    // LUT input range: low, high.
+    lut_domain: array<vec4<f32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> L: Layer;
@@ -290,6 +297,22 @@ fn sd_polygon(p: vec2<f32>, first: u32, n: u32) -> f32 {
     return s * sqrt(d);
 }
 
+// Degrees of hue per unit of color distance (core::mask::HUE_SPAN).
+const MASK_HUE_SPAN: f32 = 90.0;
+
+// How far a color is outside color range mask i (negative inside). Matches core::mask::color_distance.
+fn color_distance(i: u32, col: vec3<f32>) -> f32 {
+    let v0 = L.masks[i * 3u];
+    let v1 = L.masks[i * 3u + 1u];
+    let hsl = rgb_to_hsl(clamp(col, vec3(0.0), vec3(1.0)));
+    var dh = abs(hsl.x - v0.x) % 360.0;
+    dh = min(dh, 360.0 - dh);
+    let hue = (dh - v0.y) / MASK_HUE_SPAN;
+    let sat = v0.z - hsl.y;
+    let lum = max(v0.w - hsl.z, hsl.z - v1.x);
+    return max(hue, max(sat, lum));
+}
+
 // Distance from p (layer px) to mask i's edge, negative inside. Matches core::mask::distance.
 fn mask_distance(i: u32, p: vec2<f32>) -> f32 {
     let v0 = L.masks[i * 3u];
@@ -327,7 +350,8 @@ fn mask_distance(i: u32, p: vec2<f32>) -> f32 {
 // How much of the layer shows at p (layer px), 0..1. `aa` = layer px per output px,
 // so hard edges stay smooth. With `has_base` the masks start from `base` (the AI
 // matte) and add to, cut from or limit it. Matches core::mask::coverage_over.
-fn mask_value(p: vec2<f32>, aa: f32, base: f32, has_base: bool) -> f32 {
+// `col` is the pixel's color, for color range masks.
+fn mask_value(p: vec2<f32>, aa: f32, base: f32, has_base: bool, col: vec3<f32>) -> f32 {
     let n = u32(L.mask_info.x + 0.5);
     if (n == 0u) {
         return select(1.0, base, has_base);
@@ -339,8 +363,15 @@ fn mask_value(p: vec2<f32>, aa: f32, base: f32, has_base: bool) -> f32 {
     for (var i = 0u; i < n; i = i + 1u) {
         let v1 = L.masks[i * 3u + 1u];
         let v2 = L.masks[i * 3u + 2u];
-        let f = max(v1.y, aa);
-        var c = 1.0 - smoothstep(-0.5 * f, 0.5 * f, mask_distance(i, p));
+        var f = max(v1.y, aa);
+        var d = 0.0;
+        if (u32(v2.x + 0.5) == 5u) {
+            f = max(v1.y, 1e-3);
+            d = color_distance(i, col);
+        } else {
+            d = mask_distance(i, p);
+        }
+        var c = 1.0 - smoothstep(-0.5 * f, 0.5 * f, d);
         if (v2.y > 0.5) {
             c = 1.0 - c;
         }
@@ -364,7 +395,43 @@ fn effect_mask(xy: vec2<f32>) -> f32 {
     }
     let size = out_size();
     let k = L.mask_info.y / size.x;
-    return mask_value(xy / size * L.mask_info.yz, k, 1.0, false);
+    // Color ranges look at the picture below the effect layer.
+    let below = unpremul(textureLoad(backdrop, vec2<i32>(xy), 0));
+    return mask_value(xy / size * L.mask_info.yz, k, 1.0, false, below);
+}
+
+// ---------------------------------------------------------------- tone and LUT
+
+@group(3) @binding(0) var lut_tex: texture_3d<f32>;
+@group(3) @binding(1) var lut_samp: sampler;
+
+fn tone_lookup(x: f32, ch: u32) -> f32 {
+    let f = clamp(x, 0.0, 1.0) * 63.0;
+    let i = u32(floor(f));
+    let j = min(i + 1u, 63u);
+    return mix(L.tone[i][ch], L.tone[j][ch], f - f32(i));
+}
+
+// Matches core::tone: color curves per channel, then the brightness curve (keeps hue).
+fn apply_tone(c: vec3<f32>) -> vec3<f32> {
+    let t = vec3(tone_lookup(c.r, 0u), tone_lookup(c.g, 1u), tone_lookup(c.b, 2u));
+    let l = luma(t);
+    let l2 = tone_lookup(l, 3u);
+    if (l < 1e-4) {
+        return t + vec3(l2);
+    }
+    return clamp(t * (l2 / l), vec3(0.0), vec3(1.0));
+}
+
+fn apply_lut(c: vec3<f32>) -> vec3<f32> {
+    let n = L.tone_info.z;
+    let lo = L.lut_domain[0].xyz;
+    let hi = L.lut_domain[1].xyz;
+    let u = clamp((c - lo) / max(hi - lo, vec3(1e-6)), vec3(0.0), vec3(1.0));
+    // Sample texel centers: 0 -> first entry, 1 -> last.
+    let uvw = u * ((n - 1.0) / n) + vec3(0.5 / n);
+    let graded = textureSampleLevel(lut_tex, lut_samp, uvw, 0.0).rgb;
+    return mix(c, graded, L.tone_info.y);
 }
 
 @fragment
@@ -408,6 +475,12 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     if ((L.grade_flags & 4u) != 0u) {
         rgb = hsl_adjust(rgb);
     }
+    if (L.tone_info.x > 0.5) {
+        rgb = apply_tone(rgb);
+    }
+    if (L.tone_info.w > 0.5) {
+        rgb = apply_lut(rgb);
+    }
 
     // Soft 1-pixel edge so rotated layers don't look jagged.
     let fw = max(fwidth(in.uv), vec2(1e-6));
@@ -417,7 +490,9 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     // Masks, in the layer's own pixels so they move with it.
     let lp = in.uv * L.mask_info.yz;
     let aa_px = max(length(fwidth(lp)) * 0.7071, 1e-3);
-    var m = mask_value(lp, aa_px, 1.0, false);
+    // Color ranges look at the clip's own color, before grading.
+    let own = src.rgb;
+    var m = mask_value(lp, aa_px, 1.0, false, own);
     if (L.matte.x > 0.5) {
         var matte = textureSampleLevel(matte_tex, matte_samp, in.uv, 0.0).r;
         if (L.matte.x > 1.5) {
@@ -425,7 +500,7 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
         }
         if (L.matte.y > 0.5) {
             // Masks combine with the matte: an Add mask brings the background back.
-            m = mask_value(lp, aa_px, matte, true);
+            m = mask_value(lp, aa_px, matte, true, own);
         } else {
             // Masks isolate the cut-out further.
             m = m * matte;
@@ -667,10 +742,11 @@ fn fs_blur_v(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let blurred = blur_dir(layer_tex, p.xy / size, vec2(0.0, 1.0 / size.y), false);
     let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0);
     if (L.kind == 4u) {
-        // Bloom adds the glow on top.
-        return vec4(orig.rgb + blurred.rgb * L.gen[0].y * L.opacity * effect_mask(p.xy), 1.0);
+        // Bloom adds the glow on top (on a single clip the glow also adds coverage).
+        let g = blurred.rgb * L.gen[0].y * L.opacity * effect_mask(p.xy);
+        return vec4(orig.rgb + g, clamp(orig.a + max(g.r, max(g.g, g.b)), 0.0, 1.0));
     }
-    return vec4(mix(orig.rgb, blurred.rgb, L.opacity * effect_mask(p.xy)), 1.0);
+    return mix(orig, blurred, L.opacity * effect_mask(p.xy));
 }
 
 // ---------------------------------------------------------------- motion blur samples
@@ -794,14 +870,24 @@ fn grain(pos: vec2<f32>, seed: u32, channel: u32, amount: f32) -> f32 {
     return mix(mix(a00, a10, s.x), mix(a01, a11, s.x), s.y);
 }
 
+// Straight (not premultiplied) color of a premultiplied pixel.
+fn unpremul(c: vec4<f32>) -> vec3<f32> {
+    return select(vec3(0.0), c.rgb / c.a, c.a > 1e-5);
+}
+
+// Effects keep transparency intact, so the same passes work on the whole frame
+// (opaque) and on a single clip drawn on its own (per-clip effects). Color effects
+// work on straight color; spatial ones average premultiplied pixels, alpha included.
 @fragment
 fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let size = out_size();
     let uv = p.xy / size;
     let k = L.gen[1].x;
-    let orig = textureLoad(backdrop, vec2<i32>(p.xy), 0).rgb;
+    let o4 = textureLoad(backdrop, vec2<i32>(p.xy), 0);
+    let a0 = o4.a;
+    let orig = unpremul(o4);
     let e = L.gen[0];
-    var rgb = orig;
+    var res = o4;
     switch L.kind {
         case 1u: {
             // Vignette: e = (amount, size, softness, roundness).
@@ -810,11 +896,11 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             let circle_d = length((uv - 0.5) * vec2(aspect, 1.0)) / length(vec2(aspect, 1.0) * 0.5);
             let d = mix(frame_d, circle_d, e.w);
             let v = smoothstep(e.y, e.y + e.z, d);
-            if (e.x >= 0.0) {
-                rgb = orig * (1.0 - e.x * v);
-            } else {
-                rgb = mix(orig, vec3(1.0), -e.x * v);
+            var c = orig * (1.0 - e.x * v);
+            if (e.x < 0.0) {
+                c = mix(orig, vec3(1.0), -e.x * v);
             }
+            res = vec4(c * a0, a0);
         }
         case 2u: {
             // Film grain: e = (size px, intensity, amount, color). New pattern every frame.
@@ -826,16 +912,16 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             // Strongest in the midtones, like real film.
             let lum = dot(orig, vec3(0.2126, 0.7152, 0.0722));
             let w = 1.0 - pow(abs(lum * 2.0 - 1.0), 2.0) * 0.7;
-            rgb = clamp(orig + n * e.y * 0.5 * w, vec3(0.0), vec3(1.0));
+            res = vec4(clamp(orig + n * e.y * 0.5 * w, vec3(0.0), vec3(1.0)) * a0, a0);
         }
         case 3u: {
             // Chromatic aberration: e = (amount px, angle deg, radial, _).
             let ang = radians(e.y);
             let dir = mix(vec2(cos(ang), sin(ang)), (uv - 0.5) * 2.0, e.z);
             let off = dir * e.x * k / size;
-            let r = textureSampleLevel(backdrop, lin, uv + off, 0.0).r;
-            let b = textureSampleLevel(backdrop, lin, uv - off, 0.0).b;
-            rgb = vec3(r, orig.g, b);
+            let r = textureSampleLevel(backdrop, lin, uv + off, 0.0);
+            let b = textureSampleLevel(backdrop, lin, uv - off, 0.0);
+            res = vec4(r.r, o4.g, b.b, max(a0, max(r.a, b.a)));
         }
         case 5u: {
             // Lens blur: average over a disc (golden-angle spiral). Bright spots weigh
@@ -845,18 +931,18 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
                 let n = u32(clamp(r * r * 0.8, LENS_MIN_TAPS, LENS_MAX_TAPS));
                 // A per-pixel turn of the spiral trades visible patterns for fine noise.
                 let turn = hash3(vec3(u32(p.x), u32(p.y), 17u)) * 6.2831853;
-                var sum = vec3(0.0);
+                var sum = vec4(0.0);
                 var wsum = 0.0;
                 for (var i = 0u; i < n; i = i + 1u) {
                     let fi = f32(i) + 0.5;
                     let rad = sqrt(fi / f32(n)) * r;
                     let ang = fi * 2.3999632 + turn;
-                    let c = textureSampleLevel(backdrop, lin, uv + vec2(cos(ang), sin(ang)) * rad / size, 0.0).rgb;
-                    let w = 1.0 + e.y * 12.0 * smoothstep(0.55, 1.0, dot(c, LUMA));
+                    let c = textureSampleLevel(backdrop, lin, uv + vec2(cos(ang), sin(ang)) * rad / size, 0.0);
+                    let w = 1.0 + e.y * 12.0 * smoothstep(0.55, 1.0, dot(c.rgb, LUMA));
                     sum = sum + c * w;
                     wsum = wsum + w;
                 }
-                rgb = sum / wsum;
+                res = sum / wsum;
             }
         }
         case 6u, 7u: {
@@ -865,7 +951,7 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             let c = e.yz;
             let dpx = (uv - c) * size;
             let jit = hash3(vec3(u32(p.x), u32(p.y), 29u));
-            var sum = vec3(0.0);
+            var sum = vec4(0.0);
             for (var i = 0u; i < RADIAL_TAPS; i = i + 1u) {
                 let f = (f32(i) + jit) / f32(RADIAL_TAPS);
                 var q = dpx;
@@ -875,9 +961,9 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
                     let ang = radians(e.x) * (f - 0.5);
                     q = vec2(dpx.x * cos(ang) - dpx.y * sin(ang), dpx.x * sin(ang) + dpx.y * cos(ang));
                 }
-                sum = sum + textureSampleLevel(backdrop, lin, c + q / size, 0.0).rgb;
+                sum = sum + textureSampleLevel(backdrop, lin, c + q / size, 0.0);
             }
-            rgb = sum / f32(RADIAL_TAPS);
+            res = sum / f32(RADIAL_TAPS);
         }
         case 8u: {
             // Double exposure: a shifted, scaled copy screen-blended on top.
@@ -885,15 +971,15 @@ fn fs_effect(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
             let off = e.xy * k / size;
             let uv2 = 0.5 + (uv - 0.5 - off) / max(e.z, 0.05);
             if (all(uv2 >= vec2(0.0)) && all(uv2 <= vec2(1.0))) {
-                let ghost = clamp(textureSampleLevel(backdrop, lin, uv2, 0.0).rgb, vec3(0.0), vec3(1.0));
-                let base = clamp(orig, vec3(0.0), vec3(1.0));
-                let screen = 1.0 - (1.0 - base) * (1.0 - ghost);
-                rgb = mix(orig, screen, e.w);
+                let ghost = clamp(textureSampleLevel(backdrop, lin, uv2, 0.0), vec4(0.0), vec4(1.0));
+                let base = clamp(o4, vec4(0.0), vec4(1.0));
+                // Screen works on premultiplied color and alpha alike.
+                res = mix(o4, base + ghost - base * ghost, e.w);
             }
         }
         default: {}
     }
-    return vec4(mix(orig, rgb, L.opacity * effect_mask(p.xy)), 1.0);
+    return mix(o4, res, L.opacity * effect_mask(p.xy));
 }
 
 // ---------------------------------------------------------------- AI matte cleanup

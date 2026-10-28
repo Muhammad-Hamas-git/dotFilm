@@ -50,6 +50,8 @@ enum Handle {
 pub struct MaskUi {
     pub edit: Option<MaskEdit>,
     drag: Option<Drag>,
+    /// A color range mask whose hue is being picked in the player.
+    pub pick: Option<usize>,
 }
 
 struct Drag {
@@ -69,7 +71,8 @@ pub fn supports_masks(project: &crate::core::model::Project, clip: &Clip) -> boo
 
 // ---------------------------------------------------------------- inspector
 
-pub(super) fn section(ui: &mut Ui, c: &mut Clip, size: (f32, f32), local: f64, tol: f64, t: &mut Tracker, edit: &mut Option<MaskEdit>) {
+pub(super) fn section(ui: &mut Ui, c: &mut Clip, size: (f32, f32), local: f64, tol: f64, t: &mut Tracker, state: &mut MaskUi, picking: &mut Option<ClipId>) {
+    let edit = &mut state.edit;
     let open = !c.masks.is_empty();
     egui::CollapsingHeader::new("Masks").default_open(open).show(ui, |ui| {
         if c.content.as_ref().is_some_and(|x| x.is_effect()) {
@@ -92,9 +95,11 @@ pub(super) fn section(ui: &mut Ui, c: &mut Clip, size: (f32, f32), local: f64, t
             ui.separator();
             let kind = c.masks[m].kind;
             ui.horizontal(|ui| {
-                let editing = edit.is_some_and(|e| e.clip == c.id && e.mask == m);
-                if ui.selectable_label(editing, "Edit").on_hover_text("Show handles in the player").clicked() {
-                    *edit = if editing { None } else { Some(MaskEdit { clip: c.id, mask: m, drawing: false }) };
+                if kind.is_shape() {
+                    let editing = edit.is_some_and(|e| e.clip == c.id && e.mask == m);
+                    if ui.selectable_label(editing, "Edit").on_hover_text("Show handles in the player").clicked() {
+                        *edit = if editing { None } else { Some(MaskEdit { clip: c.id, mask: m, drawing: false }) };
+                    }
                 }
                 ui.label(egui::RichText::new(format!("{} {}", m + 1, kind.label())).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -126,9 +131,25 @@ pub(super) fn section(ui: &mut Ui, c: &mut Clip, size: (f32, f32), local: f64, t
             if kind == MaskKind::Shape {
                 shape_rows(ui, c, m, local, tol, t, edit);
             }
+            if kind == MaskKind::ColorRange {
+                ui.horizontal(|ui| {
+                    hue_strip(ui, &c.masks[m], local);
+                    let picking_this = *picking == Some(c.id) && state.pick == Some(m);
+                    if ui.selectable_label(picking_this, if picking_this { "Click the player..." } else { "Pick" }).on_hover_text("Click a color in the player to isolate it").clicked() {
+                        if picking_this {
+                            *picking = None;
+                            state.pick = None;
+                        } else {
+                            *picking = Some(c.id);
+                            state.pick = Some(m);
+                        }
+                    }
+                });
+            }
         }
         if let Some(m) = remove {
             c.masks.remove(m);
+            state.pick = None;
             if edit.is_some_and(|e| e.clip == c.id && e.mask >= m) {
                 *edit = None;
             }
@@ -172,7 +193,7 @@ fn shape_rows(ui: &mut Ui, c: &mut Clip, m: usize, local: f64, tol: f64, t: &mut
 /// Draws and edits the mask being edited. Returns true if it took over the player's input.
 pub(super) fn player(app: &mut EditorApp, ui: &Ui, response: &Response, painter: &Painter, to_screen: &dyn Fn(f32, f32) -> Pos2, to_project: &dyn Fn(Pos2) -> (f32, f32)) -> bool {
     let Some(edit) = app.player.masks.edit else { return false };
-    let valid = app.selected == Some(edit.clip) && app.project.clip(edit.clip).is_some_and(|c| edit.mask < c.masks.len());
+    let valid = app.selected == Some(edit.clip) && app.project.clip(edit.clip).is_some_and(|c| edit.mask < c.masks.len() && c.masks[edit.mask].kind.is_shape());
     if !valid || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.player.masks.edit = None;
         app.player.masks.drag = None;
@@ -325,7 +346,7 @@ pub(super) fn player(app: &mut EditorApp, ui: &Ui, response: &Response, painter:
     }
 
     // --- drags ---
-    if response.drag_started() {
+    if response.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
         let handle = grab(origin).or_else(|| layer(origin).filter(|lp| mask::distance(m, local, size, *lp) < 0.0).map(|_| Handle::Body));
         if let (Some(handle), Some(start)) = (handle, layer(origin)) {
@@ -338,14 +359,14 @@ pub(super) fn player(app: &mut EditorApp, ui: &Ui, response: &Response, painter:
         }
     }
     // The release frame carries the final pointer position too.
-    if response.dragged() || response.drag_stopped() {
+    if response.dragged_by(egui::PointerButton::Primary) || response.drag_stopped_by(egui::PointerButton::Primary) {
         if let (Some(drag), Some(lp)) = (app.player.masks.drag.as_ref(), response.interact_pointer_pos().and_then(layer)) {
             if let Some(cm) = app.project.clip_mut(edit.clip) {
                 apply_drag(&mut cm.masks[edit.mask], drag, lp, c, rot, size, local, tol);
             }
         }
     }
-    if response.drag_stopped() {
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         app.player.masks.drag = None;
     }
     true
@@ -392,6 +413,33 @@ fn apply_drag(m: &mut Mask, drag: &Drag, lp: [f32; 2], c: [f32; 2], rot: f32, si
         }
         Handle::Center => {}
     }
+}
+
+/// The hues a color range mask keeps, as a strip (dimmed outside the range).
+fn hue_strip(ui: &mut Ui, m: &Mask, local: f64) {
+    let (rect, _) = ui.allocate_exact_size(vec2(150.0, 14.0), egui::Sense::hover());
+    let hue = m.value(idx::HUE, local);
+    let range = m.value(idx::HUE_RANGE, local);
+    let n = 60;
+    let painter = ui.painter();
+    for i in 0..n {
+        let h = i as f32 / n as f32 * 360.0;
+        let d = (h - hue).abs() % 360.0;
+        let inside = d.min(360.0 - d) <= range;
+        let c = hue_rgb(h);
+        let c = if inside { c } else { c.gamma_multiply(0.25) };
+        let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+        let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1 + 0.5, rect.bottom())), 0.0, c);
+    }
+    let x = rect.left() + rect.width() * (hue.rem_euclid(360.0) / 360.0);
+    painter.line_segment([egui::pos2(x, rect.top() - 2.0), egui::pos2(x, rect.bottom() + 2.0)], Stroke::new(2.0, Color32::WHITE));
+}
+
+fn hue_rgb(deg: f32) -> Color32 {
+    let x = (deg / 360.0).rem_euclid(1.0);
+    let ch = |o: f32| (((x + o).fract() * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
+    Color32::from_rgb((ch(0.0) * 255.0) as u8, (ch(2.0 / 3.0) * 255.0) as u8, (ch(1.0 / 3.0) * 255.0) as u8)
 }
 
 /// Outline of a rounded rectangle centered at 0, corner radius `r`.

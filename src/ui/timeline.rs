@@ -4,7 +4,7 @@
 
 use super::app::EditorApp;
 use crate::core::anim::Ease;
-use crate::core::model::{AssetKind, BlendMode, ClipId, Param, MIN_CLIP};
+use crate::core::model::{AssetKind, BlendMode, ClipId, MIN_CLIP};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui};
 
 // ----- Layout values you can tune -----
@@ -47,11 +47,25 @@ pub struct TimelineState {
     move_blocked: bool,
     /// Keyframe that was right-clicked (clip, source time), for the context menu.
     menu_key: Option<(ClipId, f64)>,
+    pub markers: super::markers::MarkerUi,
+    /// Showing the selected clip's keyframe table instead of the tracks.
+    pub keyframes: bool,
+    pub key_table: super::keyframes::KeyTable,
 }
 
 impl Default for TimelineState {
     fn default() -> Self {
-        Self { pps: 60.0, scroll: 0.0, snapping: true, drag: None, move_blocked: false, menu_key: None }
+        Self {
+            pps: 60.0,
+            scroll: 0.0,
+            snapping: true,
+            drag: None,
+            move_blocked: false,
+            menu_key: None,
+            markers: Default::default(),
+            keyframes: false,
+            key_table: Default::default(),
+        }
     }
 }
 
@@ -63,17 +77,17 @@ impl TimelineState {
 
 /// Maps between time and screen x for the lanes area.
 #[derive(Clone, Copy)]
-struct View {
-    left: f32,
-    pps: f32,
-    scroll: f64,
+pub(super) struct View {
+    pub left: f32,
+    pub pps: f32,
+    pub scroll: f64,
 }
 
 impl View {
-    fn x(&self, t: f64) -> f32 {
+    pub fn x(&self, t: f64) -> f32 {
         self.left + ((t - self.scroll) as f32) * self.pps
     }
-    fn t(&self, x: f32) -> f64 {
+    pub fn t(&self, x: f32) -> f64 {
         self.scroll + ((x - self.left) / self.pps) as f64
     }
 }
@@ -94,6 +108,16 @@ pub fn show(app: &mut EditorApp, ui: &mut Ui) {
     let ruler_rect = Rect::from_min_max(pos2(lanes_left, full.top()), pos2(full.right(), full.top() + RULER_H));
     ruler(app, ui, ruler_rect, view);
     ui.allocate_rect(Rect::from_min_max(full.min, pos2(full.right(), full.top() + RULER_H)), Sense::hover());
+
+    // Keyframe table of the selected clip, in place of the tracks.
+    let table_clip = app.selected.filter(|id| app.timeline.keyframes && app.project.clip(*id).is_some());
+    if let Some(id) = table_clip {
+        let area = ui.available_rect_before_wrap();
+        ui.allocate_rect(area, Sense::hover());
+        super::keyframes::show(app, ui, id, area, HEADER_W, view);
+        handle_wheel(app, ui, full, lanes_left);
+        return;
+    }
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let height = (app.project.tracks.len() as f32 * TRACK_H).max(ui.available_height());
@@ -123,6 +147,11 @@ fn toolbar(app: &mut EditorApp, ui: &mut Ui) {
             app.project.add_track();
         }
         ui.toggle_value(&mut app.timeline.snapping, "Snap");
+        ui.separator();
+        super::markers::toolbar(app, ui);
+        ui.add_enabled_ui(app.selected.is_some(), |ui| {
+            ui.toggle_value(&mut app.timeline.keyframes, "Keyframes").on_hover_text("Show the selected clip's keyframes, one row per value, with a curve graph");
+        });
         ui.separator();
         if ui.button("-").on_hover_text("Zoom out").clicked() {
             app.timeline.zoom(0.8);
@@ -167,7 +196,8 @@ fn ruler(app: &mut EditorApp, ui: &mut Ui, rect: Rect, view: View) {
     }
 
     let response = ui.interact(rect, ui.scope_id().with("ruler"), Sense::click_and_drag());
-    if response.clicked() || response.dragged() {
+    let on_marker = super::markers::ruler(app, ui, rect, &response, &|t| view.x(t), &|x| view.t(x));
+    if !on_marker && (response.clicked() || response.dragged()) {
         if let Some(pos) = response.interact_pointer_pos() {
             if app.playing {
                 app.toggle_play();
@@ -260,7 +290,10 @@ fn hit_test(app: &EditorApp, view: View, lanes: Rect, p: Pos2) -> Option<(ClipId
         return Some((id, DragKind::Keyframe { current: k }));
     }
     let n = app.project.tracks.len();
-    for clip in app.project.clips.iter().rev() {
+    // Where clips overlap (a cut transition) the later one is on top.
+    let mut clips: Vec<&crate::core::model::Clip> = app.project.clips.iter().collect();
+    clips.sort_by(|a, b| b.start.total_cmp(&a.start));
+    for clip in clips {
         let r = clip_rect(view, lanes, n, clip.track, clip.start, clip.end());
         if !r.contains(p) {
             continue;
@@ -293,6 +326,9 @@ fn snap_target(app: &EditorApp, t: f64, ignore: Option<ClipId>, pps: f32) -> Opt
     };
     consider(0.0);
     consider(app.playhead);
+    for m in &app.project.markers {
+        consider(m.time);
+    }
     for c in &app.project.clips {
         if Some(c.id) != ignore {
             consider(c.start);
@@ -356,6 +392,10 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                 }
             }
         }
+        if app.timeline.drag.is_some_and(|(id, _)| id.is_some()) {
+            // Hand-made overlaps define the cut transitions' length.
+            crate::core::transition::sync_durations(&mut app.project);
+        }
         app.timeline.drag = None;
         app.timeline.move_blocked = false;
     }
@@ -390,7 +430,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                     app.history.checkpoint(&app.project);
                     let tol = app.project.key_tolerance();
                     if let Some(c) = app.project.clip_mut(id) {
-                        for p in Param::ALL {
+                        for p in c.params() {
                             c.param_mut(p).set_ease_at(k, ease, tol);
                         }
                     }
@@ -401,7 +441,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
                 app.history.checkpoint(&app.project);
                 let tol = app.project.key_tolerance();
                 if let Some(c) = app.project.clip_mut(id) {
-                    for p in Param::ALL {
+                    for p in c.params() {
                         c.param_mut(p).remove_key_at(k, tol);
                     }
                 }
@@ -478,6 +518,7 @@ fn lanes_ui(app: &mut EditorApp, ui: &mut Ui, lanes: Rect, view: View) {
         }
     }
 
+    super::markers::lane_lines(app, &painter, lanes, &|t| view.x(t));
     draw_clips(app, ui, &painter, lanes, view);
 
     // Playhead line.
@@ -492,9 +533,24 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
     let is_image = app.project.asset(clip.asset).is_some_and(|a| a.kind == AssetKind::Image);
     let track_count = app.project.tracks.len();
 
-    // Nearest neighbors on the same track limit how far edges can go.
-    let prev_end = app.project.clips.iter().filter(|c| c.id != id && c.track == clip.track && c.end() <= clip.start + 1e-6).map(|c| c.end()).fold(0.0, f64::max);
-    let next_start = app.project.clips.iter().filter(|c| c.id != id && c.track == clip.track && c.start >= clip.end() - 1e-6).map(|c| c.start).fold(f64::INFINITY, f64::min);
+    // Nearest neighbors on the same track limit how far edges can go. A clip a cut
+    // transition overlaps limits only by its own length (the overlap can change).
+    let prev = crate::core::transition::previous_partner(&app.project, &clip).filter(|_| clip.transition_in.is_some()).map(|p| p.id);
+    let next = crate::core::transition::next_partner(&app.project, &clip).filter(|n| n.transition_in.is_some()).map(|n| n.id);
+    let prev_end = app
+        .project
+        .clips
+        .iter()
+        .filter(|c| c.id != id && c.track == clip.track && c.start < clip.start)
+        .map(|c| if Some(c.id) == prev { c.start + MIN_CLIP } else { c.end() })
+        .fold(0.0, f64::max);
+    let next_start = app
+        .project
+        .clips
+        .iter()
+        .filter(|c| c.id != id && c.track == clip.track && c.start > clip.start)
+        .map(|c| if Some(c.id) == next { c.end() - MIN_CLIP } else { c.start })
+        .fold(f64::INFINITY, f64::min);
 
     match kind {
         DragKind::Move { grab_offset, .. } => {
@@ -521,7 +577,8 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
             let tol = app.project.key_tolerance();
             if (to - current).abs() > 1e-9 {
                 if let Some(c) = app.project.clip_mut(id) {
-                    for p in Param::ALL {
+                    // Every animated value keyed there moves together.
+                    for p in c.params() {
                         c.param_mut(p).move_key(current, to, tol);
                     }
                 }
@@ -562,7 +619,10 @@ fn drag_clip(app: &mut EditorApp, id: ClipId, kind: DragKind, view: View, lanes:
 fn draw_clips(app: &EditorApp, ui: &Ui, painter: &egui::Painter, lanes: Rect, view: View) {
     let n = app.project.tracks.len();
     let tol = app.project.key_tolerance();
-    for clip in &app.project.clips {
+    // Later clips on top, so a clip sliding into the previous one (cut transition) shows.
+    let mut clips: Vec<&crate::core::model::Clip> = app.project.clips.iter().collect();
+    clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+    for clip in clips {
         let Some(asset) = app.project.asset(clip.asset) else { continue };
         let r = clip_rect(view, lanes, n, clip.track, clip.start, clip.end());
         if !r.intersects(lanes) {
